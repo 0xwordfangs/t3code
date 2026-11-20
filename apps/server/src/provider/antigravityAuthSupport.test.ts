@@ -717,6 +717,54 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       }),
   );
 
+  it.effect.skipIf(!symlinksSupported)(
+    "links the user's global plugins directory when present without touching real content",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(temporaryDirectory, "home");
+        const profileDirectory = path.join(temporaryDirectory, "profile");
+        const userPlugins = path.join(userHome, ".gemini", "config", "plugins");
+        const profilePlugins = path.join(profileDirectory, "config", "plugins");
+        const isLink = (link: string) =>
+          fs.readLink(link).pipe(
+            Effect.as(true),
+            Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(false)),
+          );
+
+        // Skips linking when ~/.gemini/config/plugins does not exist.
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* isLink(profilePlugins)).toBe(false);
+
+        // Replaces an empty placeholder directory once ~/.gemini/config/plugins exists.
+        yield* fs.makeDirectory(profilePlugins, { recursive: true });
+        yield* fs.makeDirectory(path.join(userPlugins, "global-rules"), { recursive: true });
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* fs.readLink(profilePlugins)).toBe(userPlugins);
+        expect(yield* fs.exists(path.join(profilePlugins, "global-rules"))).toBe(true);
+
+        // Removes the dangling link if ~/.gemini/config/plugins is removed.
+        yield* fs.remove(userPlugins, { recursive: true });
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* isLink(profilePlugins)).toBe(false);
+
+        // Preserves a non-empty real directory in the profile.
+        yield* fs.makeDirectory(path.join(userPlugins, "global-rules"), { recursive: true });
+        yield* fs.makeDirectory(path.join(profilePlugins, "profile-only"), { recursive: true });
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect((yield* fs.stat(profilePlugins)).type).toBe("Directory");
+        expect(
+          yield* fs.readLink(profilePlugins).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          ),
+        ).toBe(false);
+        expect(yield* fs.exists(path.join(profilePlugins, "profile-only"))).toBe(true);
+      }),
+  );
+
   it.effect("rewrites the GCP block on every launch and never stores the API key", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

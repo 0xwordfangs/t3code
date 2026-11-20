@@ -264,7 +264,7 @@ class AntigravitySkillLinkError extends Schema.TaggedError<AntigravitySkillLinkE
   }
 }
 
-/** Private GEMINI_HOME isolates credentials/hooks/MCP; link global skills from the real ~/.gemini. */
+/** Private GEMINI_HOME isolates credentials/MCP; link global skills and plugins from the real ~/.gemini. */
 const linkAntigravityUserSkills = Effect.fn("linkAntigravityUserSkills")(function* (input: {
   readonly profileDirectory: string;
   readonly userHome: string;
@@ -272,13 +272,19 @@ const linkAntigravityUserSkills = Effect.fn("linkAntigravityUserSkills")(functio
 }): Effect.fn.Return<void, never, FileSystem.FileSystem | Path.Path> {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const userGeminiHome = path.resolve(input.userHome, ".gemini");
   const links = antigravityUserSkillDirectories(path, input.profileDirectory);
-  const targets = antigravityUserSkillDirectories(path, path.join(input.userHome, ".gemini"));
+  const targets = antigravityUserSkillDirectories(path, userGeminiHome);
   for (const [link, target] of [
     [links[0], targets[0]],
     [links[1], targets[1]],
+    [
+      path.join(input.profileDirectory, "config", "plugins"),
+      path.join(userGeminiHome, "config", "plugins"),
+    ],
   ] as const) {
     yield* Effect.gen(function* () {
+      if (path.resolve(link) === path.resolve(target)) return;
       // The harness creates these folders itself, and mkdir fails on a dangling link.
       if (!(yield* fs.exists(target))) {
         const linked = yield* fs.readLink(link).pipe(
