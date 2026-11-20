@@ -161,6 +161,12 @@ Open **Usage > Limits** to see the remaining Gemini and shared Claude/GPT allowa
 for Google sign-ins. Each group has separate five-hour and weekly limits and reset
 times. Limits refresh with provider status and include usage outside T3 Code.
 
+Antigravity 1.5 and later keeps its Google sign-in in your system keyring (Keychain on
+macOS, Credential Manager on Windows, Secret Service on Linux). **Usage > Limits** reads
+that sign-in (and ignores legacy `acp_token.json` files from older runtimes), so your
+keyring may ask you to allow access the first time. Antigravity renews the sign-in only
+while it runs, so limits update when an Antigravity session starts.
+
 A server restart keeps your Google sign-in. The provider shows the saved account
 until a session, a refresh, or a sign-out reports something new.
 

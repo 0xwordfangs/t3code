@@ -33,6 +33,7 @@ import * as ModelManifest from "../ModelManifest.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { AntigravityDriver } from "./AntigravityDriver.ts";
+import { AntigravityKeyringSecretOverride } from "../antigravityUsageLimits.ts";
 import * as ProviderHostLive from "../ProviderHostLive.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 
@@ -283,6 +284,7 @@ const layerDeps = ServerConfig.layerTest(process.cwd(), {
       HttpClient.make(() => Effect.die("Unexpected quota request")),
     ),
   ),
+  Layer.provideMerge(Layer.succeed(AntigravityKeyringSecretOverride, Effect.undefined)),
   Layer.provideMerge(ServerSettings.layerTest()),
   Layer.provideMerge(
     Layer.mock(BackgroundPolicy.BackgroundPolicy)({

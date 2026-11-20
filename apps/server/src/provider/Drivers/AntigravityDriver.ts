@@ -443,13 +443,13 @@ export const AntigravityDriver: ProviderDriver<
       Effect.provideService(Path.Path, path),
       Effect.provideService(Digest.Digest, digest),
       Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
     const provider = yield* makeAntigravityProvider(settings, {
       environment: processEnvironment,
       stampIdentity: classifyModels,
       probe,
       probeUsage: usage.probe,
-      clearUsage: usage.clear,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
