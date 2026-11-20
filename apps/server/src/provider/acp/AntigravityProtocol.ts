@@ -507,3 +507,17 @@ export function antigravitySubagentOutput(toolCall: AcpToolCallState): string | 
   const output = toolCall.data.rawOutput;
   return typeof output === "string" && output.trim() ? boundText(output.trim()) : undefined;
 }
+
+/** True for native Antigravity shell commands (`run_command`), excluding MCP tool calls. */
+export function isAntigravityBackgroundCommandTool(toolCall: AcpToolCallState): boolean {
+  if (toolCall.kind !== "execute") return false;
+  const meta = toolCall.data.meta;
+  return !(Predicate.isObject(meta) && meta.is_mcp_tool_call === true);
+}
+
+/** True when `run_command` was explicitly launched as a daemon (dev server, watcher, tunnel). */
+export function isAntigravityPersistentBackgroundTool(toolCall: AcpToolCallState): boolean {
+  const rawInput = toolCall.data.rawInput;
+  if (!Predicate.isObject(rawInput)) return false;
+  return rawInput.IsDaemon === true || rawInput.isDaemon === true || rawInput.is_daemon === true;
+}

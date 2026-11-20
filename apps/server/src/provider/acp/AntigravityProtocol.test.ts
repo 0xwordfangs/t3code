@@ -8,6 +8,8 @@ import {
   antigravityApprovalOptions,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
+  isAntigravityBackgroundCommandTool,
+  isAntigravityPersistentBackgroundTool,
   isAntigravityUserInputRequest,
   makeAntigravityUserInputResponse,
   normalizeAntigravitySessionUpdate,
@@ -621,5 +623,52 @@ describe("Antigravity served reads", () => {
       toolCallId: "call_current",
       status: "completed",
     });
+  });
+});
+
+describe("Antigravity background command classification", () => {
+  it("recognizes native execute commands and excludes MCP or non-execute tools", () => {
+    expect(
+      isAntigravityBackgroundCommandTool({
+        toolCallId: "call_1",
+        kind: "execute",
+        data: {},
+      }),
+    ).toBe(true);
+    expect(
+      isAntigravityBackgroundCommandTool({
+        toolCallId: "call_mcp",
+        kind: "execute",
+        data: { meta: { is_mcp_tool_call: true } },
+      }),
+    ).toBe(false);
+    expect(
+      isAntigravityBackgroundCommandTool({
+        toolCallId: "call_read",
+        kind: "read",
+        data: {},
+      }),
+    ).toBe(false);
+  });
+
+  it("identifies daemon commands from rawInput flags", () => {
+    for (const rawInput of [{ IsDaemon: true }, { isDaemon: true }, { is_daemon: true }]) {
+      expect(
+        isAntigravityPersistentBackgroundTool({
+          toolCallId: "call_daemon",
+          kind: "execute",
+          data: { rawInput },
+        }),
+      ).toBe(true);
+    }
+    for (const rawInput of [{}, { IsDaemon: false }, { CommandLine: "vp test" }, undefined]) {
+      expect(
+        isAntigravityPersistentBackgroundTool({
+          toolCallId: "call_normal",
+          kind: "execute",
+          data: rawInput === undefined ? {} : { rawInput },
+        }),
+      ).toBe(false);
+    }
   });
 });

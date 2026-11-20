@@ -476,3 +476,75 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
     catch: (cause) => new AntigravityChildWorkReadError({ cause }),
   });
 });
+
+const decodeStepToolCallId = safely((payload): string | undefined => {
+  const id = text(message(message(payload, STEP_METADATA), METADATA_TOOL_CALL), 1);
+  return id !== undefined && id.length > 0 ? id : undefined;
+});
+
+/**
+ * Resolves a batch of Antigravity background task ids (`<sessionId>/task-<stepIdx>`) to their
+ * ACP `toolCallId`s using a single read-only handle to this session's unlinked SQLite database.
+ */
+export const resolveAntigravityBackgroundTaskToolCallIds = Effect.fn(
+  "resolveAntigravityBackgroundTaskToolCallIds",
+)(function* (input: {
+  readonly profileDirectory: string;
+  readonly sessionId: string;
+  readonly taskIds: ReadonlyArray<string>;
+}): Effect.fn.Return<ReadonlyMap<string, string>> {
+  if (!NATIVE_ID.test(input.sessionId) || input.taskIds.length === 0) {
+    return new Map<string, string>();
+  }
+  const stepByTaskId: Array<readonly [rawTaskId: string, stepIdx: number]> = [];
+  for (const rawTaskId of input.taskIds) {
+    const match = /^([A-Za-z0-9-]{1,64})\/task-(\d+)$/.exec(rawTaskId.trim());
+    if (match === null || match[1] !== input.sessionId) continue;
+    const stepIdx = Number(match[2]);
+    if (!Number.isSafeInteger(stepIdx) || stepIdx < 0) continue;
+    stepByTaskId.push([rawTaskId, stepIdx]);
+  }
+  if (stepByTaskId.length === 0) {
+    return new Map<string, string>();
+  }
+  return yield* Effect.tryPromise({
+    try: async () => {
+      const resolved = new Map<string, string>();
+      const profileRoot = await antigravityProfileRoot(input.profileDirectory);
+      const databasePath =
+        profileRoot === undefined
+          ? undefined
+          : (
+              await antigravityManagedPath(
+                profileRoot,
+                ["antigravity-acp", "conversations", `${input.sessionId}.db`],
+                "file",
+              )
+            )?.path;
+      if (databasePath === undefined) return resolved;
+      const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
+      try {
+        database.exec("PRAGMA busy_timeout = 100");
+        const hasSteps =
+          database
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'")
+            .get() !== undefined;
+        if (!hasSteps) return resolved;
+        const statement = database.prepare(
+          "SELECT step_payload FROM steps WHERE idx = ? AND step_format = 0 AND length(step_payload) <= ?",
+        );
+        for (const [rawTaskId, stepIdx] of stepByTaskId) {
+          const payload = payloadOf(statement.get(stepIdx, MAX_STEP_BYTES));
+          const toolCallId = payload === undefined ? undefined : decodeStepToolCallId(payload);
+          if (toolCallId !== undefined) {
+            resolved.set(rawTaskId, toolCallId);
+          }
+        }
+        return resolved;
+      } finally {
+        database.close();
+      }
+    },
+    catch: () => new Map<string, string>(),
+  }).pipe(Effect.orElseSucceed(() => new Map<string, string>()));
+});

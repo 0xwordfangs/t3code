@@ -23,12 +23,15 @@ import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
@@ -41,6 +44,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import {
   makeAntigravityAcpAdapterFlavor,
   makeAntigravityAdapterV2,
+  type AntigravityAdapterV2RuntimeInput,
 } from "./AntigravityAdapterV2.ts";
 
 const flavor = makeAntigravityAcpAdapterFlavor({
@@ -1270,6 +1274,867 @@ describe("AntigravityAdapterV2 session system prompt", () => {
         } else {
           assert.notInclude(append, "systemPrompt");
           assert.include(sent, "<pull_request_linking>");
+        }
+      }).pipe(Effect.provide(layerSession)),
+  );
+});
+
+describe("AntigravityAdapterV2 background commands and post-settle wakeup", () => {
+  const makeHarness = Effect.fnUntraced(function* (options: {
+    readonly threadName: string;
+    readonly runtimeMode: "full-access" | "approval-required";
+    readonly profileDirectory?: string;
+  }) {
+    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const path = yield* Path.Path;
+    const crypto = yield* SecureRandom.SecureRandom;
+    const mockAgentPath = yield* path.fromFileUrl(
+      new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+    );
+    type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+    let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+    let permissionHandler: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+    let onOutgoingResponse: AntigravityAdapterV2RuntimeInput["onOutgoingResponse"];
+    let onTermination: AntigravityAdapterV2RuntimeInput["onTermination"];
+    let cancelCount = 0;
+    let promptStarted = yield* Deferred.make<void>();
+    let promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+    const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
+      [];
+    const continuationOffered =
+      yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+    const instanceId = ProviderInstanceId.make(`antigravity-bg-${options.threadName}`);
+    const adapter = yield* makeAntigravityAdapterV2({
+      instanceId,
+      selfInvocation: yield* resolveSelfInvocation(),
+      ...(options.profileDirectory === undefined
+        ? {}
+        : { profileDirectory: options.profileDirectory }),
+      makeRuntime: (input) => {
+        onOutgoingResponse = input.onOutgoingResponse;
+        onTermination = input.onTermination;
+        return makeAntigravityAcpRuntime({
+          ...input,
+          childProcessSpawner,
+          spawn: {
+            command: process.execPath,
+            args: [mockAgentPath],
+            cwd: input.cwd,
+            env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_HANG_PROMPT_FOREVER: "1" },
+          },
+        }).pipe(
+          Effect.provideService(SecureRandom.SecureRandom, crypto),
+          Effect.map((runtime): RuntimeService => ({
+            ...runtime,
+            cancel: Effect.sync(() => {
+              cancelCount += 1;
+            }).pipe(Effect.andThen(runtime.cancel)),
+            handleSessionUpdate: (handler) =>
+              Effect.sync(() => {
+                sessionUpdateHandler = handler;
+              }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+            handleRequestPermission: (handler) =>
+              Effect.sync(() => {
+                permissionHandler = handler;
+              }).pipe(Effect.andThen(runtime.handleRequestPermission(handler))),
+            prompt: () =>
+              Deferred.succeed(promptStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(promptGate)),
+              ),
+          })),
+        );
+      },
+      withProcess: (_stop, task) => task,
+      defaultModel: Effect.undefined,
+      continuationRequests: {
+        offer: (request) =>
+          Effect.sync(() => {
+            continuationRequests.push(request);
+          }).pipe(Effect.andThen(Queue.offer(continuationOffered, request)), Effect.asVoid),
+      },
+    });
+    const threadId = ThreadId.make(`thread-antigravity-bg-${options.threadName}`);
+    const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: options.runtimeMode,
+      interactionMode: "default",
+      cwd: process.cwd(),
+    });
+    const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+    const session = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make(`provider-session-bg-${options.threadName}`),
+      modelSelection,
+      runtimePolicy,
+    });
+    const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    yield* session.events.pipe(
+      Stream.runForEach((event) => Queue.offer(events, event)),
+      Effect.forkScoped,
+    );
+    const providerThread = yield* session.ensureThread({
+      threadId,
+      modelSelection,
+      runtimePolicy,
+    });
+    const sessionId = providerThread.nativeThreadRef?.nativeId ?? "mock-session-1";
+    const now = yield* DateTime.now;
+    const makeTurn = (
+      ordinal: number,
+      turnOptions?: { readonly continuation?: boolean; readonly text?: string },
+    ): ProviderAdapter.ProviderAdapterV2TurnInput => ({
+      appThread: {
+        createdBy: "user",
+        creationSource: "web",
+        id: threadId,
+        projectId: ProjectId.make(`project-bg-${options.threadName}`),
+        title: `Antigravity background ${options.threadName}`,
+        providerInstanceId: instanceId,
+        modelSelection,
+        runtimeMode: options.runtimeMode,
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: providerThread.id,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      },
+      threadId,
+      runId: RunId.make(`run-bg-${options.threadName}-${ordinal}`),
+      runOrdinal: ordinal,
+      providerTurnOrdinal: ordinal,
+      attemptId: RunAttemptId.make(`attempt-bg-${options.threadName}-${ordinal}`),
+      rootNodeId: NodeId.make(`node-bg-${options.threadName}-${ordinal}`),
+      providerThread,
+      message: {
+        createdBy: turnOptions?.continuation ? "agent" : "user",
+        creationSource: turnOptions?.continuation ? "provider" : "web",
+        messageId: MessageId.make(`message-bg-${options.threadName}-${ordinal}`),
+        text:
+          turnOptions?.text ??
+          (turnOptions?.continuation ? "Background task completed." : "run build"),
+        attachments: [],
+      },
+      modelSelection,
+      runtimePolicy,
+    });
+    return {
+      session,
+      sessionId,
+      providerThread,
+      events,
+      get promptStarted() {
+        return promptStarted;
+      },
+      get promptGate() {
+        return promptGate;
+      },
+      get cancelCount() {
+        return cancelCount;
+      },
+      resetPrompt: Effect.gen(function* () {
+        promptStarted = yield* Deferred.make<void>();
+        promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+      }),
+      terminateRuntime: (detail = "Antigravity process exited") =>
+        onTermination?.(new EffectAcpErrors.AcpTransportError({ detail, cause: detail })) ??
+        Effect.void,
+      continuationRequests,
+      continuationOffered,
+      makeTurn,
+      emitUpdate: (update: EffectAcpSchema.SessionUpdate) =>
+        sessionUpdateHandler!({ sessionId, update }),
+      requestPermission: (
+        params: Omit<EffectAcpSchema.RequestPermissionRequest, "sessionId">,
+        requestId = "perm-1",
+      ) =>
+        permissionHandler!(
+          { ...params, sessionId },
+          { requestId, method: "session/request_permission" },
+        ).pipe(Effect.tap(() => onOutgoingResponse?.(requestId) ?? Effect.void)),
+    };
+  });
+
+  it.effect(
+    "keeps a backgrounded run_command awaiting completion, updates it on exit, and continues on post-settle wakeup with permission",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "full-lifecycle",
+          runtimeMode: "full-access",
+        });
+        assert.isDefined(harness.session.hasPendingBackgroundWork);
+        assert.isDefined(harness.session.awaitBackgroundTasks);
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        // Long run_command stays in_progress when Antigravity moves it to background.
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_bg_build",
+          title: "Running run_command",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { CommandLine: "vp test && build", WaitMsBeforeAsync: 10000 },
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Build is running in background." },
+        });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+
+        const turn1Events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          turn1Events.push(event);
+          if (event.type === "turn.terminal") break;
+        }
+        const bgItemAtSettle = turn1Events.findLast(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "call_bg_build",
+        );
+        assert.equal(bgItemAtSettle?.type, "turn_item.updated");
+        if (bgItemAtSettle?.type === "turn_item.updated") {
+          assert.equal(bgItemAtSettle.turnItem.status, "running");
+        }
+        const threadAtSettle = turn1Events.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.equal(threadAtSettle?.type, "provider_thread.updated");
+        if (threadAtSettle?.type === "provider_thread.updated") {
+          assert.deepEqual(threadAtSettle.providerThread.pendingBackgroundTasks, [
+            {
+              taskId: "call_bg_build",
+              kind: "command",
+              description: "vp test && build",
+              awaited: true,
+            },
+          ]);
+        }
+        assert.isTrue(yield* harness.session.hasPendingBackgroundWork!);
+
+        // Background command finishes post-settle.
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_bg_build",
+          status: "completed",
+          rawOutput: { combinedOutput: "BUILD OK\n", exitCode: 0 },
+        });
+        let bgCompleted = false;
+        let clearedPending = false;
+        while (!bgCompleted || !clearedPending) {
+          const event = yield* Queue.take(harness.events);
+          if (
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "call_bg_build" &&
+            event.turnItem.status === "completed"
+          ) {
+            bgCompleted = true;
+            assert.equal(event.turnItem.type, "command_execution");
+            if (event.turnItem.type === "command_execution") {
+              assert.equal(event.turnItem.output, "BUILD OK\n");
+              assert.equal(event.turnItem.exitCode, 0);
+            }
+          }
+          if (
+            event.type === "provider_thread.updated" &&
+            (event.providerThread.pendingBackgroundTasks?.length ?? 0) === 0
+          ) {
+            clearedPending = true;
+          }
+        }
+        assert.lengthOf(harness.continuationRequests, 0);
+
+        // Antigravity wakes up: thought -> tool_call (pending) -> permission -> tool completes -> reply.
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "Build passed, checking git status." },
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_wake_git",
+          title: "Running run_command",
+          kind: "execute",
+          status: "pending",
+          rawInput: { CommandLine: "git status -s" },
+        });
+        const offered = yield* Queue.take(harness.continuationOffered);
+        assert.lengthOf(harness.continuationRequests, 1);
+
+        // Permission arrives while activeTurn is still null (before Turn 2 attaches).
+        const permissionOutcome = yield* harness.requestPermission({
+          toolCall: { toolCallId: "call_wake_git", kind: "execute", title: "Run command" },
+          options: [
+            { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+            { optionId: "deny", name: "Deny", kind: "reject_once" },
+          ],
+        });
+        assert.deepEqual(permissionOutcome, {
+          outcome: { outcome: "selected", optionId: "allow_once" },
+        });
+
+        // Start Turn 2 continuation.
+        yield* offered.dispatchIfCurrent!(Effect.void);
+        yield* harness.session.startTurn(harness.makeTurn(2, { continuation: true }));
+
+        // Tool runs for 6s (> 3s debounce); Turn 2 must NOT prematurely finalize while tool runs.
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_wake_git",
+          status: "in_progress",
+        });
+        yield* TestClock.adjust("6 seconds");
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_wake_git",
+          status: "completed",
+          rawOutput: { combinedOutput: "clean\n", exitCode: 0 },
+        });
+        // Model thinks for 6s after tool completion (< 15s post-tool debounce) before replying.
+        yield* TestClock.adjust("6 seconds");
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Build succeeded and git tree is clean." },
+        });
+        yield* TestClock.adjust("4 seconds");
+
+        const turn2Events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          turn2Events.push(event);
+          if (event.type === "turn.terminal") break;
+        }
+        assert.include(JSON.stringify(turn2Events), "Build succeeded and git tree is clean.");
+        assert.include(JSON.stringify(turn2Events.at(-1)), '"status":"completed"');
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "does not hold completion for daemon commands, supports t3_background_wait, and wakes while a daemon runs",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "daemon-and-wait",
+          runtimeMode: "full-access",
+        });
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_daemon",
+          title: "Running run_command",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { CommandLine: "vp dev", IsDaemon: true },
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_tests",
+          title: "Running run_command",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { CommandLine: "vp test", IsDaemon: false },
+        });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+
+        let settleTasks: ReadonlyArray<unknown> | undefined;
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "provider_thread.updated") {
+            settleTasks = event.providerThread.pendingBackgroundTasks;
+          }
+          if (event.type === "turn.terminal") break;
+        }
+        assert.deepEqual(settleTasks, [
+          { taskId: "call_daemon", kind: "command", description: "vp dev" },
+          { taskId: "call_tests", kind: "command", description: "vp test", awaited: true },
+        ]);
+
+        // Toggle awaited flags via t3_background_wait (`awaitBackgroundTasks`).
+        const cleared = yield* harness.session.awaitBackgroundTasks!({
+          providerThread: harness.providerThread,
+          taskIds: ["call_tests"],
+          awaited: false,
+        });
+        assert.deepEqual(cleared, { matched: ["call_tests"] });
+        const afterClear = yield* Queue.take(harness.events);
+        assert.equal(afterClear.type, "provider_thread.updated");
+        if (afterClear.type === "provider_thread.updated") {
+          assert.deepEqual(afterClear.providerThread.pendingBackgroundTasks, [
+            { taskId: "call_daemon", kind: "command", description: "vp dev" },
+            { taskId: "call_tests", kind: "command", description: "vp test" },
+          ]);
+        }
+
+        // Tests finish while daemon keeps running; wake must still offer continuation immediately.
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_tests",
+          status: "completed",
+          rawOutput: { combinedOutput: "ALL PASS\n", exitCode: 0 },
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Tests passed while dev server stays up." },
+        });
+        const offered = yield* Queue.take(harness.continuationOffered);
+        assert.isDefined(offered);
+        assert.lengthOf(harness.continuationRequests, 1);
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "awaits a continuation turn for approval-required post-settle permission requests without failing",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "approval-wake",
+          runtimeMode: "approval-required",
+        });
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        // Antigravity wakes up in approval-required mode and immediately requests permission.
+        const permissionFiber = yield* harness
+          .requestPermission({
+            toolCall: { toolCallId: "call_wake_perm", kind: "execute", title: "Run git status" },
+            options: [
+              { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+              { optionId: "deny", name: "Deny", kind: "reject_once" },
+            ],
+          })
+          .pipe(Effect.forkScoped);
+
+        const offered = yield* Queue.take(harness.continuationOffered);
+        yield* offered.dispatchIfCurrent!(Effect.void);
+        yield* harness.session.startTurn(harness.makeTurn(2, { continuation: true }));
+
+        let approvalRequestId:
+          | Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "runtime_request.updated" }
+            >["runtimeRequest"]["id"]
+          | undefined;
+        while (approvalRequestId === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (
+            event.type === "runtime_request.updated" &&
+            event.runtimeRequest.status === "pending"
+          ) {
+            approvalRequestId = event.runtimeRequest.id;
+          }
+        }
+
+        // Wait 6s (> 3s debounce) while user considers approval; Turn 2 must stay open.
+        yield* TestClock.adjust("6 seconds");
+        yield* harness.session.respondToRuntimeRequest({
+          requestId: approvalRequestId,
+          decision: "accept",
+        });
+        const outcome = yield* Fiber.join(permissionFiber);
+        assert.deepEqual(outcome, {
+          outcome: { outcome: "selected", optionId: "allow_once" },
+        });
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Approved wake finished." },
+        });
+        yield* TestClock.adjust("4 seconds");
+        let terminalStatus: string | undefined;
+        while (terminalStatus === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal") terminalStatus = event.status;
+        }
+        assert.equal(terminalStatus, "completed");
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "settles cleanly when a turn invokes a native Antigravity subagent without hanging",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "native-subagent-settle",
+          runtimeMode: "full-access",
+        });
+        assert.isTrue(harness.session.backgroundTasksEndWithProcess);
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "subagent-call-1",
+          kind: "other",
+          title: "Running invoke_subagent",
+          status: "in_progress",
+          rawInput: {
+            Subagents: [{ Role: "Codebase Researcher", Prompt: "Inspect adapters" }],
+          },
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "subagent-call-1",
+          status: "completed",
+        });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+
+        let terminalStatus: string | undefined;
+        let sawIdleSubagent = false;
+        while (terminalStatus === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "subagent" &&
+            event.turnItem.status === "idle"
+          ) {
+            sawIdleSubagent = true;
+          }
+          if (event.type === "turn.terminal") terminalStatus = event.status;
+        }
+        assert.equal(terminalStatus, "completed");
+        assert.isTrue(sawIdleSubagent);
+        assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "stops detached background commands on post-settle Stop, blocks post-Stop auto-approve and late wakes",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "post-settle-stop",
+          runtimeMode: "full-access",
+        });
+        const turn1 = harness.makeTurn(1);
+        yield* harness.session.startTurn(turn1).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_stop_bg",
+          kind: "execute",
+          title: "sleep 60",
+          status: "in_progress",
+          rawInput: { CommandLine: "sleep 60", WaitMsBeforeAsync: 5000 },
+        });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+
+        let turn1Id:
+          | Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "turn.terminal" }
+            >["providerTurnId"]
+          | undefined;
+        while (turn1Id === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal") turn1Id = event.providerTurnId;
+        }
+        assert.isTrue(yield* harness.session.hasPendingBackgroundWork!);
+
+        // User clicks Stop after Turn 1 settled while background command still runs.
+        yield* harness.session.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn1Id,
+          requestRuntimeRestart: true,
+        });
+
+        assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+        assert.isAtLeast(harness.cancelCount, 1);
+
+        const drained = yield* Queue.takeAll(harness.events);
+        const interruptedCmd = drained.find(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "command_execution" &&
+            event.turnItem.status === "interrupted",
+        );
+        assert.isDefined(interruptedCmd);
+        const clearedThread = drained.findLast((event) => event.type === "provider_thread.updated");
+        assert.equal(clearedThread?.type, "provider_thread.updated");
+        if (clearedThread?.type === "provider_thread.updated") {
+          assert.deepEqual(clearedThread.providerThread.pendingBackgroundTasks, []);
+          assert.isFalse(clearedThread.pendingBackgroundWork);
+        }
+
+        // Late exit + assistant message from the stopped runtime must be quarantined and not wake Turn 2.
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Late post-stop wake" },
+        });
+        assert.lengthOf(harness.continuationRequests, 0);
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "cancels post-Stop permission requests in full-access mode when stoppedRunQuarantine is active",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "post-stop-perm-cancel",
+          runtimeMode: "full-access",
+        });
+        const turn1 = harness.makeTurn(1);
+        yield* harness.session.startTurn(turn1).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        let turn1Id:
+          | Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "provider_turn.updated" }
+            >["providerTurn"]["id"]
+          | undefined;
+        while (turn1Id === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "provider_turn.updated" && event.providerTurn.status === "running") {
+            turn1Id = event.providerTurn.id;
+          }
+        }
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "cancelled" });
+        yield* harness.session.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn1Id,
+          requestRuntimeRestart: true,
+        });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        // Permission request arriving while stoppedRunQuarantine is active must cancel, not auto-approve.
+        const postStopPerm = yield* harness.requestPermission({
+          toolCall: { toolCallId: "call_after_stop", kind: "execute", title: "echo nope" },
+          options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+        });
+        assert.deepEqual(postStopPerm, { outcome: { outcome: "cancelled" } });
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "terminalizes Turn 2 as failed when the Antigravity process crashes mid-continuation and preserves exitCode on duplicate updates",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "crash-and-exitcode",
+          runtimeMode: "full-access",
+        });
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_exitcode_bg",
+          kind: "execute",
+          title: "run test",
+          status: "in_progress",
+          rawInput: { CommandLine: "exit 7", WaitMsBeforeAsync: 5000 },
+        });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        // Background command exits with exitCode 7, then a duplicate completion update arrives without rawOutput.
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_exitcode_bg",
+          status: "failed",
+          rawOutput: { combinedOutput: "boom", exitCode: 7 },
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_exitcode_bg",
+          status: "failed",
+        });
+
+        const exitEvents = yield* Queue.takeAll(harness.events);
+        const lastCommandItem = exitEvents.findLast(
+          (event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "command_execution",
+        );
+        assert.equal(lastCommandItem?.type, "turn_item.updated");
+        if (
+          lastCommandItem?.type === "turn_item.updated" &&
+          lastCommandItem.turnItem.type === "command_execution"
+        ) {
+          assert.equal(lastCommandItem.turnItem.status, "failed");
+          assert.equal(lastCommandItem.turnItem.exitCode, 7);
+        }
+
+        // Agent wakes up into Turn 2 and starts a tool, then antigravity-acp crashes.
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_turn2_open",
+          kind: "execute",
+          title: "echo recovery",
+          status: "in_progress",
+          rawInput: { CommandLine: "echo recovery" },
+        });
+        const offered = yield* Queue.take(harness.continuationOffered);
+        yield* offered.dispatchIfCurrent!(Effect.void);
+        yield* harness.session.startTurn(harness.makeTurn(2, { continuation: true }));
+
+        yield* harness.terminateRuntime("antigravity-acp crashed");
+
+        let turn2TerminalStatus: string | undefined;
+        while (turn2TerminalStatus === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal") turn2TerminalStatus = event.status;
+        }
+        assert.equal(turn2TerminalStatus, "failed");
+        assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "unblocks awaitRequestTurn when continuation is declined via clearIfCurrent and keeps soft-interrupted detached daemons",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "decline-and-soft-interrupt",
+          runtimeMode: "approval-required",
+        });
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_daemon_keep",
+          kind: "execute",
+          title: "npm run dev",
+          status: "in_progress",
+          rawInput: { CommandLine: "npm run dev", IsDaemon: true },
+        });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        // Mid-turn soft interrupt (requestRuntimeRestart omitted) on Turn 2 must NOT drop Turn 1's daemon.
+        yield* harness.resetPrompt;
+        const turn2 = harness.makeTurn(2, { text: "next prompt" });
+        yield* harness.session.startTurn(turn2).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        let turn2Id:
+          | Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "provider_turn.updated" }
+            >["providerTurn"]["id"]
+          | undefined;
+        while (turn2Id === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "provider_turn.updated" && event.providerTurn.status === "running") {
+            turn2Id = event.providerTurn.id;
+          }
+        }
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "cancelled" });
+        yield* harness.session.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn2Id,
+        });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
+        }
+        // Detached daemon is still tracked after soft interrupt.
+        assert.isTrue(yield* harness.session.hasPendingBackgroundWork!);
+
+        // Post-settle permission request whose continuation offer is declined via clearIfCurrent must cancel promptly.
+        const permFiber = yield* harness
+          .requestPermission({
+            toolCall: { toolCallId: "call_declined_wake", kind: "execute", title: "echo hi" },
+            options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+          })
+          .pipe(Effect.forkScoped);
+        const declined = yield* Queue.take(harness.continuationOffered);
+        yield* declined.clearIfCurrent!();
+        const outcome = yield* Fiber.join(permFiber);
+        assert.deepEqual(outcome, { outcome: { outcome: "cancelled" } });
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "matches only running commands in mid-turn awaitBackgroundTasks, publishes awaited state, and clears on completion",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "midturn-await-bg",
+          runtimeMode: "full-access",
+        });
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_running_1",
+          kind: "execute",
+          title: "pnpm build",
+          status: "in_progress",
+          rawInput: { CommandLine: "pnpm build", IsDaemon: true },
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_done_1",
+          kind: "execute",
+          title: "echo ok",
+          status: "completed",
+          rawInput: { CommandLine: "echo ok" },
+        });
+        yield* Queue.takeAll(harness.events);
+
+        const waitResult = yield* harness.session.awaitBackgroundTasks!({
+          providerThread: harness.providerThread,
+          taskIds: ["call_running_1", "call_done_1"],
+          awaited: true,
+        });
+        assert.deepEqual(waitResult, { matched: ["call_running_1"] });
+
+        const afterAwait = yield* Queue.takeAll(harness.events);
+        const awaitedThread = afterAwait.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.equal(awaitedThread?.type, "provider_thread.updated");
+        if (awaitedThread?.type === "provider_thread.updated") {
+          assert.deepEqual(awaitedThread.providerThread.pendingBackgroundTasks, [
+            {
+              taskId: "call_running_1",
+              kind: "command",
+              description: "pnpm build",
+              awaited: true,
+            },
+          ]);
+        }
+
+        // Finishing the command mid-turn clears its override and updates pendingBackgroundTasks.
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_running_1",
+          status: "completed",
+          rawOutput: { combinedOutput: "built", exitCode: 0 },
+        });
+        const afterFinish = yield* Queue.takeAll(harness.events);
+        const clearedThread = afterFinish.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.equal(clearedThread?.type, "provider_thread.updated");
+        if (clearedThread?.type === "provider_thread.updated") {
+          assert.deepEqual(clearedThread.providerThread.pendingBackgroundTasks, []);
+        }
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
         }
       }).pipe(Effect.provide(layerSession)),
   );

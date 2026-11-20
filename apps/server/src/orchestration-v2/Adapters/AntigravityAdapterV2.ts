@@ -31,6 +31,7 @@ import {
   ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
+  resolveAntigravityBackgroundTaskToolCallIds,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
@@ -39,6 +40,8 @@ import {
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
+  isAntigravityBackgroundCommandTool,
+  isAntigravityPersistentBackgroundTool,
   makeAntigravityReadRepair,
   makeAntigravityUserInputResponse,
   normalizeAntigravityToolCall,
@@ -278,6 +281,14 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
+    isBackgroundCommandTool: isAntigravityBackgroundCommandTool,
+    isPersistentBackgroundTool: isAntigravityPersistentBackgroundTool,
+    detachOpenBackgroundCommandsOnSettle: true,
+    deferFinalizeForBackgroundWork: true,
+    enablePostSettleContinuation: true,
+    offerPostSettleContinuationOnActiveTool: true,
+    allowPostSettleWakeWhileBackgroundWorkRuns: true,
+    postToolDeferredFinalizeDebounce: "15 seconds",
     supportsImagePrompts: true,
     // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,
@@ -292,6 +303,8 @@ export function makeAntigravityAcpAdapterFlavor(
       : {
           watchPromptOutcome: (sessionId: string) =>
             watchAntigravityPromptOutcome(profileDirectory, sessionId),
+          resolveBackgroundTaskIds: ({ sessionId, taskIds }) =>
+            resolveAntigravityBackgroundTaskToolCallIds({ profileDirectory, sessionId, taskIds }),
         }),
   };
 }

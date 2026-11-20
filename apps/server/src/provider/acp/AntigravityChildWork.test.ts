@@ -12,6 +12,7 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
   readAntigravityChildWork,
+  resolveAntigravityBackgroundTaskToolCallIds,
 } from "./AntigravityChildWork.ts";
 import { sanitizeAntigravityToolPayload } from "./AntigravityProtocol.ts";
 import {
@@ -340,5 +341,53 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
       expect(children.every((child) => child.truncated)).toBe(true);
       expect(JSON.stringify(children).length).toBeLessThan(600 * 1024);
     }),
+  );
+
+  it.effect("resolves Antigravity background task ids to their step toolCallIds", () =>
+    Effect.gen(function* () {
+      const { profile } = yield* makeProfile({ steps: autoApproved });
+      // autoApproved puts callId "call-a" on step idx 2
+      const batch = yield* resolveAntigravityBackgroundTaskToolCallIds({
+        profileDirectory: profile,
+        sessionId: ROOT,
+        taskIds: [`${ROOT}/task-2`, `${ROOT}/task-999`, "other-session/task-2", "not-a-task-id"],
+      });
+      expect([...batch.entries()]).toEqual([[`${ROOT}/task-2`, "call-a"]]);
+    }),
+  );
+
+  it.effect(
+    "returns empty results for symlinked, corrupt, or schema-missing background task databases",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { profile } = yield* makeProfile({ steps: autoApproved });
+        const dbPath = path.join(profile, "antigravity-acp", "conversations", `${ROOT}.db`);
+
+        // Symlinked DB must be rejected.
+        const outsideDb = path.join(profile, "outside.db");
+        yield* fs.copyFile(dbPath, outsideDb);
+        yield* fs.remove(dbPath);
+        yield* fs.symlink(outsideDb, dbPath);
+        expect(
+          (yield* resolveAntigravityBackgroundTaskToolCallIds({
+            profileDirectory: profile,
+            sessionId: ROOT,
+            taskIds: [`${ROOT}/task-2`],
+          })).size,
+        ).toBe(0);
+
+        // Corrupt DB file must return empty without throwing.
+        yield* fs.remove(dbPath);
+        yield* fs.writeFileString(dbPath, "not a sqlite database");
+        expect(
+          (yield* resolveAntigravityBackgroundTaskToolCallIds({
+            profileDirectory: profile,
+            sessionId: ROOT,
+            taskIds: [`${ROOT}/task-2`],
+          })).size,
+        ).toBe(0);
+      }),
   );
 });
