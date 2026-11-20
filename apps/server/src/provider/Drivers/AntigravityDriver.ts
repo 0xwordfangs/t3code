@@ -6,6 +6,7 @@ import {
   settingsSecretLiteral,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import {
   NodeRuntimeUnavailableError,
@@ -16,11 +17,14 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { HttpClient } from "effect/http";
 import * as AcpErrors from "effect-acp/errors";
@@ -40,6 +44,7 @@ import {
   buildAntigravityAcpSpawnInput,
   isAntigravitySignInRequiredError,
   prepareAntigravityProfile,
+  readAntigravityStoredEmail,
   resolveAntigravityInstanceDirectories,
   type AntigravityAuthConfig,
 } from "../antigravityAuthSupport.ts";
@@ -200,10 +205,14 @@ export const AntigravityDriver: ProviderDriver<
         Effect.map((catalog) => stampIdentity(ModelCatalog.applyModelCatalog(draft, catalog))),
       );
 
-    const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
-      input: AntigravityAdapterV2RuntimeInput,
+    const prepareSpawn = Effect.fn("AntigravityDriver.prepareSpawn")(function* (
+      cwd: string,
+      baseEnv: NodeJS.ProcessEnv,
     ): Effect.fn.Return<
-      AcpSessionRuntime.AcpSessionRuntime["Service"],
+      {
+        readonly executable: AntigravityInstallation.AntigravityExecutable;
+        readonly spawn: AcpSessionRuntime.AcpSpawnInput;
+      },
       AcpErrors.AcpError | ProviderSetupError,
       Scope.Scope
     > {
@@ -270,26 +279,41 @@ export const AntigravityDriver: ProviderDriver<
               ),
             ),
       );
+      return {
+        executable,
+        spawn: buildAntigravityAcpSpawnInput({
+          installation: executable,
+          profile,
+          cwd,
+          baseEnv,
+          auth,
+          runtimeTempDirectory,
+        }),
+      };
+    });
+
+    const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
+      input: AntigravityAdapterV2RuntimeInput,
+    ): Effect.fn.Return<
+      AcpSessionRuntime.AcpSessionRuntime["Service"],
+      AcpErrors.AcpError | ProviderSetupError,
+      Scope.Scope
+    > {
       // `buildAntigravityAcpSpawnInput` sets `extendEnv: false`, so thread variables only reach the
       // agent's shell through `baseEnv`.
       const { processEnvironment: threadEnvironment, ...runtimeInput } = input;
-      const spawnEnvironment =
+      const { executable, spawn } = yield* prepareSpawn(
+        runtimeInput.cwd,
         threadEnvironment === undefined
           ? processEnvironment
-          : { ...processEnvironment, ...threadEnvironment };
+          : { ...processEnvironment, ...threadEnvironment },
+      );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
         runtimeVersion: executable.version,
         authMethod: auth.authMethod,
         childProcessSpawner: spawner,
-        spawn: buildAntigravityAcpSpawnInput({
-          installation: executable,
-          profile,
-          cwd: runtimeInput.cwd,
-          baseEnv: spawnEnvironment,
-          auth,
-          runtimeTempDirectory,
-        }),
+        spawn,
       }).pipe(Effect.provideService(SecureRandom.SecureRandom, random));
       return {
         ...runtime,
@@ -354,6 +378,89 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
+    // The agy CLI ignores T3's browser helper during ACP `authenticate`, so Google sign-in runs its
+    // remote-friendly `--login`, which stores the sign-in where the ACP process reads it.
+    const codeLogin = Effect.fn("AntigravityDriver.codeLogin")(function* (input: {
+      readonly onAuthorizationUrl: (url: string) => Effect.Effect<void, AcpErrors.AcpError>;
+    }) {
+      if (auth.authMethod !== "oauth-personal") return undefined;
+      const resolved = yield* installation
+        .resolve(settings.binaryPath, processEnvironment)
+        .pipe(Effect.option);
+      if (Option.isSome(resolved) && resolved.value.harnessPath !== null) return undefined;
+      const cwd = yield* fileSystem
+        .makeTempDirectoryScoped({ prefix: "t3-antigravity-login-" })
+        .pipe(
+          Effect.mapError(
+            () =>
+              new ProviderSetupError({
+                instanceId,
+                operation: "start",
+                detail: "Could not create an Antigravity setup workspace.",
+              }),
+          ),
+        );
+      const { executable, spawn } = yield* prepareSpawn(cwd, processEnvironment);
+      if (executable.harnessPath !== null) return undefined;
+      const failed = (detail: string, cause?: unknown) =>
+        new ProviderSetupError({ instanceId, operation: "start", detail, cause });
+      // Without a display it prints the link only, instead of opening a browser on this machine.
+      const { DISPLAY: _display, WAYLAND_DISPLAY: _wayland, ...env } = spawn.env ?? {};
+      const resolvedSpawn = yield* resolveSpawnCommand(spawn.command, [...spawn.args, "--login"], {
+        env,
+        extendEnv: false,
+      });
+      const child = yield* spawner
+        .spawn(
+          ChildProcess.make(resolvedSpawn.command, resolvedSpawn.args, {
+            cwd,
+            env,
+            extendEnv: false,
+            shell: resolvedSpawn.shell,
+          }),
+        )
+        .pipe(Effect.mapError((cause) => failed("Could not start Antigravity sign-in.", cause)));
+      const code = yield* Deferred.make<string>();
+      yield* Stream.fromEffect(Deferred.await(code)).pipe(
+        Stream.map((response) => `${response}\n`),
+        Stream.encodeText,
+        Stream.run(child.stdin),
+        Effect.ignore,
+        Effect.forkScoped,
+      );
+      const output = yield* child.stdout.pipe(
+        Stream.decodeText(),
+        Stream.splitLines,
+        Stream.map((line) => line.trim()),
+        Stream.runForEach((line) =>
+          line.startsWith("https://accounts.google.com/")
+            ? input.onAuthorizationUrl(line)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* Stream.runDrain(child.stderr).pipe(Effect.ignore, Effect.forkScoped);
+      return {
+        submit: (response: string) => Deferred.succeed(code, response).pipe(Effect.asVoid),
+        completed: Effect.gen(function* () {
+          // Stdout closes when the process exits, or this fails first on an unusable link.
+          yield* Fiber.join(output).pipe(
+            Effect.mapError((cause) =>
+              failed("Antigravity returned an invalid Google sign-in link.", cause),
+            ),
+          );
+          const exitCode = yield* child.exitCode.pipe(
+            Effect.mapError((cause) => failed("Antigravity sign-in stopped unexpectedly.", cause)),
+          );
+          if (Number(exitCode) !== 0) {
+            return yield* failed(
+              "Antigravity could not finish Google sign-in. Start sign-in again.",
+            );
+          }
+        }),
+      };
+    });
+
     const publishCatalog = Effect.fn("AntigravityDriver.publishCatalog")(function* (
       started: AcpSessionRuntime.AcpSessionRuntimeStartResult,
       runtime: Pick<
@@ -362,6 +469,7 @@ export const AntigravityDriver: ProviderDriver<
       >,
     ) {
       yield* provider.onSessionStarted(started);
+      yield* authFlow.onSignedInElsewhere;
       yield* Stream.runForEach(runtime.getEvents(), (event) => {
         if (event._tag === "EventStreamBarrier") {
           return Deferred.succeed(event.acknowledge, undefined).pipe(Effect.asVoid);
@@ -392,8 +500,11 @@ export const AntigravityDriver: ProviderDriver<
         Effect.suspend(() => provider.onSignedIn).pipe(
           Effect.andThen(publishCatalog(started, runtime)),
         ),
+      onCredentialsReplaced: Effect.suspend(() => provider.onSignedIn),
+      onVerificationFailed: Effect.suspend(() => provider.onAuthRequired),
       onSignedOut: Effect.suspend(() => provider.onSignedOut),
       usesBrowser: antigravityAuthUsesBrowser(auth.authMethod),
+      codeLogin,
     });
 
     // The probe must not spawn. The agent is a PyInstaller one-file bundle
@@ -450,6 +561,14 @@ export const AntigravityDriver: ProviderDriver<
       stampIdentity: classifyModels,
       probe,
       probeUsage: usage.probe,
+      ...(auth.authMethod === "oauth-personal"
+        ? {
+            readAccountEmail: readAntigravityStoredEmail(profileDirectory).pipe(
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+            ),
+          }
+        : {}),
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -480,7 +599,8 @@ export const AntigravityDriver: ProviderDriver<
         ),
       ),
       profileDirectory,
-      onSessionStarted: provider.onSessionStarted,
+      onSessionStarted: (started, cwd) =>
+        provider.onSessionStarted(started, cwd).pipe(Effect.andThen(authFlow.onSignedInElsewhere)),
       onSessionEvent: (event) => {
         if (event._tag === "ConfigOptionsUpdated") {
           return provider.onConfigOptionsUpdated(event.configOptions);

@@ -18,7 +18,11 @@ Antigravity setup.
 
 ### Sign in from a remote device
 
-Google returns to a `127.0.0.1` address. It can finish directly when your browser is
+For personal Google account sign-ins with the native CLI, Google finishes on an Antigravity page
+that shows a code. Paste that code, or the page's full address, into the code field in the client
+where you started sign-in. This works the same from any device.
+
+With Gemini Enterprise or the older 1.4.5 runtime, Google returns to a `127.0.0.1` address. It can finish directly when your browser is
 on the environment's machine. From another device, the final page will usually
 fail to load because the sign-in listener is on the environment.
 
@@ -161,14 +165,17 @@ Open **Usage > Limits** to see the remaining Gemini and shared Claude/GPT allowa
 for Google sign-ins. Each group has separate five-hour and weekly limits and reset
 times. Limits refresh with provider status and include usage outside T3 Code.
 
-Antigravity 1.5 and later keeps its Google sign-in in your system keyring (Keychain on
-macOS, Credential Manager on Windows, Secret Service on Linux). **Usage > Limits** reads
-that sign-in (and ignores legacy `acp_token.json` files from older runtimes), so your
-keyring may ask you to allow access the first time. Antigravity renews the sign-in only
-while it runs, so limits update when an Antigravity session starts.
+Personal Google sign-ins on Antigravity 1.5 and later are stored per instance in that
+instance's profile (`antigravity-oauth-token`), keeping each Antigravity instance isolated
+from other instances and your IDE. Gemini Enterprise still uses your system keyring
+(Keychain on macOS, Credential Manager on Windows, Secret Service on Linux), so your
+keyring may ask you to allow access the first time. **Usage > Limits** reads the active
+1.5 sign-in (and ignores legacy `acp_token.json` files from older runtimes). Antigravity
+renews the sign-in only while it runs, so limits update when an Antigravity session starts.
 
-A server restart keeps your Google sign-in. The provider shows the saved account
-until a session, a refresh, or a sign-out reports something new.
+A server restart keeps your Google sign-in. The provider checks sign-in and loads
+models on the next session or model refresh. For personal Google sign-ins, Usage > Limits
+shows the signed-in email right away.
 
 To check access and reload models, use **Refresh provider status** in web or desktop
 provider settings, or **Refresh models** in mobile thread settings. If asked to

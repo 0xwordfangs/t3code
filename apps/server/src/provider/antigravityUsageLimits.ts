@@ -41,8 +41,8 @@ const SUMMARY_WINDOW_MINS = new Map([
 const MANUAL_REDIRECT: RequestInit = { redirect: "manual" };
 
 // The 1.5.x CLI never writes acp_token.json: it keeps its sign-in in the OS keyring (go-keyring),
-// or in antigravity-oauth-token when no keyring is usable. Any acp_token.json in the profile is a
-// leftover from an older runtime. The CLI stores no OAuth client, so T3 cannot refresh its token.
+// or in antigravity-oauth-token without one or when T3 bypasses the keyring. Any acp_token.json in
+// the profile is a leftover from an older runtime. The CLI stores no OAuth client, so T3 cannot refresh its token.
 const KEYRING_SERVICE = "gemini";
 const KEYRING_ACCOUNT = "antigravity";
 const CLI_TOKEN_FILE = "antigravity-oauth-token";
@@ -361,9 +361,14 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       return makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
     }
     const now = yield* Clock.currentTimeMillis;
+    // Google account instances bypass the keyring, whose one entry every profile shares.
     const stored = yield* fs
       .readFileString(cliTokenPath)
-      .pipe(Effect.catchReason("PlatformError", "NotFound", () => readKeyringSecret));
+      .pipe(
+        Effect.catchReason("PlatformError", "NotFound", () =>
+          input.authMethod === "oauth-business" ? readKeyringSecret : Effect.undefined,
+        ),
+      );
     if (stored === undefined) {
       return makeUnavailableUsageLimits({
         checkedAt,

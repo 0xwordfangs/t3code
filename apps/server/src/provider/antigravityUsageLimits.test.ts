@@ -697,38 +697,51 @@ describe("Antigravity subscription limits", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
-  it.effect(
-    "reads 1.5.x CLI keyring sign-ins for personal and business accounts without refreshing",
-    () =>
-      Effect.gen(function* () {
-        yield* TestClock.setTime(
-          DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T00:00:00Z")),
-        );
-        for (const authMethod of ["oauth-personal", "oauth-business"] as const) {
-          const { probe, requests } = yield* fixture({
-            authMethod,
-            missingToken: true,
-            userId: "google-user-1",
-            keyringSecret: cliToken("cli-refresh", {
+  it.effect("reads 1.5.x CLI keyring sign-ins only for Gemini Enterprise without refreshing", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T00:00:00Z")));
+      // Google account instances keep their own sign-in; the shared entry belongs to another app.
+      let personalKeyringReads = 0;
+      const personal = yield* fixture({
+        authMethod: "oauth-personal",
+        missingToken: true,
+        readKeyringSecret: Effect.suspend(() => {
+          personalKeyringReads += 1;
+          return Effect.succeed(
+            cliToken("cli-refresh", {
               expiry: "2026-10-09T12:00:00.123456789+11:00",
             }),
-          });
-          const limits = yield* probe;
-          expect(limits.unavailable).toBeUndefined();
-          expect(limits.windows).toHaveLength(4);
-          expect(limits.credentialFingerprint).toMatch(/^[0-9a-f]{64}$/);
-          expect(requests.some((request) => request.url.endsWith("/token"))).toBe(false);
-          expect(JSON.stringify(limits)).not.toMatch(
-            /cli-refresh|access-token|someone@example.com/,
           );
-        }
-      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+        }),
+      });
+      expect((yield* personal.probe).unavailable?.message).toBe(
+        "Sign in with Google to see Antigravity limits.",
+      );
+      expect(personal.requests).toEqual([]);
+      expect(personalKeyringReads).toBe(0);
+
+      const { probe, requests } = yield* fixture({
+        authMethod: "oauth-business",
+        missingToken: true,
+        userId: "google-user-1",
+        keyringSecret: cliToken("cli-refresh", {
+          expiry: "2026-10-09T12:00:00.123456789+11:00",
+        }),
+      });
+      const limits = yield* probe;
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.windows).toHaveLength(4);
+      expect(limits.credentialFingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect(requests.some((request) => request.url.endsWith("/token"))).toBe(false);
+      expect(JSON.stringify(limits)).not.toMatch(/cli-refresh|access-token|someone@example.com/);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect("prefers antigravity-oauth-token over the OS keyring", () =>
     Effect.gen(function* () {
       let keyringReads = 0;
       const { probe } = yield* fixture({
+        authMethod: "oauth-business",
         readKeyringSecret: Effect.suspend(() => {
           keyringReads += 1;
           return Effect.die("the keyring must not be read when antigravity-oauth-token exists");
@@ -754,20 +767,27 @@ describe("Antigravity subscription limits", () => {
         "stale-refresh",
       );
 
-      for (const authMethod of ["oauth-personal", "oauth-business"] as const) {
-        const fromKeyring = yield* fixture({
-          authMethod,
-          leftoverAcpToken: true,
-          missingToken: true,
-          keyringSecret: cliToken("refresh-b"),
-        });
-        const keyringLimits = yield* fromKeyring.probe;
-        expect(keyringLimits.unavailable).toBeUndefined();
-        expect(keyringLimits.windows).toHaveLength(4);
-        expect(fromKeyring.requests.map((request) => request.body).join("\n")).not.toContain(
-          "stale-refresh",
-        );
-      }
+      const fromKeyring = yield* fixture({
+        authMethod: "oauth-business",
+        leftoverAcpToken: true,
+        missingToken: true,
+        keyringSecret: cliToken("refresh-b"),
+      });
+      const keyringLimits = yield* fromKeyring.probe;
+      expect(keyringLimits.unavailable).toBeUndefined();
+      expect(keyringLimits.windows).toHaveLength(4);
+      expect(fromKeyring.requests.map((request) => request.body).join("\n")).not.toContain(
+        "stale-refresh",
+      );
+
+      const personalSignedOut = yield* fixture({
+        authMethod: "oauth-personal",
+        leftoverAcpToken: true,
+        missingToken: true,
+        keyringSecret: cliToken("refresh-b"),
+      });
+      expect((yield* personalSignedOut.probe).unavailable?.reason).toBe("unsupported");
+      expect(personalSignedOut.requests).toEqual([]);
 
       const signedOut = yield* fixture({
         leftoverAcpToken: true,
@@ -789,6 +809,7 @@ describe("Antigravity subscription limits", () => {
         undefined,
       ]) {
         const fromKeyring = yield* fixture({
+          authMethod: "oauth-business",
           missingToken: true,
           keyringSecret: cliToken("cli-refresh", { expiry }),
         });
@@ -809,6 +830,7 @@ describe("Antigravity subscription limits", () => {
       }
 
       const validPastMargin = yield* fixture({
+        authMethod: "oauth-business",
         missingToken: true,
         keyringSecret: cliToken("cli-refresh", { expiry: "2026-10-09T12:01:01Z" }),
       });
@@ -819,6 +841,7 @@ describe("Antigravity subscription limits", () => {
   it.effect("returns a safe failure with zero network requests when the keyring read fails", () =>
     Effect.gen(function* () {
       const { probe, requests } = yield* fixture({
+        authMethod: "oauth-business",
         missingToken: true,
         readKeyringSecret: Effect.fail(
           new AntigravityKeyringError({ cause: "secret-service-locked-super-secret-detail" }),
@@ -850,6 +873,7 @@ describe("Antigravity subscription limits", () => {
           JSON.stringify({ token: { access_token: "", refresh_token: "leaked-keyring-refresh" } }),
         ]) {
           const fromKeyring = yield* fixture({
+            authMethod: "oauth-business",
             missingToken: true,
             keyringSecret,
           });
@@ -876,11 +900,13 @@ describe("Antigravity subscription limits", () => {
             },
           });
         const first = yield* fixture({
+          authMethod: "oauth-business",
           missingToken: true,
           accessToken: "token-a",
           keyringSecret: noRefresh("token-a"),
         });
         const second = yield* fixture({
+          authMethod: "oauth-business",
           missingToken: true,
           accessToken: "token-b",
           keyringSecret: noRefresh("token-b"),

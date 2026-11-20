@@ -289,6 +289,19 @@ const mergeProviderModels = (
     : mergedModels;
 };
 
+const hasSwitchedAntigravityAccount = (
+  previousProvider: ServerProvider,
+  nextProvider: ServerProvider,
+): boolean => {
+  const antigravity = ProviderDriverKind.make("antigravity");
+  if (nextProvider.driver !== antigravity || previousProvider.driver !== antigravity) {
+    return false;
+  }
+  const previousEmail = previousProvider.auth.email?.trim().toLowerCase();
+  const nextEmail = nextProvider.auth.email?.trim().toLowerCase();
+  return previousEmail !== undefined && nextEmail !== undefined && previousEmail !== nextEmail;
+};
+
 /** Antigravity health checks only initialize; preserve previously verified Google auth across restarts. */
 const carrySavedAntigravityAccount = (
   previousProvider: ServerProvider,
@@ -303,13 +316,18 @@ const carrySavedAntigravityAccount = (
     previousProvider.auth.status !== "authenticated" ||
     (nextProvider.auth.type !== undefined &&
       nextProvider.auth.type !== previousProvider.auth.type) ||
-    (!nextProvider.installed && nextProvider.status !== "warning")
+    (!nextProvider.installed && nextProvider.status !== "warning") ||
+    hasSwitchedAntigravityAccount(previousProvider, nextProvider)
   ) {
     return undefined;
   }
   const status =
     nextProvider.installed && nextProvider.status === "warning" ? "ready" : nextProvider.status;
-  return { auth: previousProvider.auth, status };
+  const email = nextProvider.auth.email?.trim() || previousProvider.auth.email?.trim();
+  return {
+    auth: email ? { ...previousProvider.auth, email } : previousProvider.auth,
+    status,
+  };
 };
 
 export const mergeProviderSnapshot = (
@@ -319,16 +337,25 @@ export const mergeProviderSnapshot = (
   if (!previousProvider) {
     return nextProvider;
   }
-  const savedAccount = carrySavedAntigravityAccount(previousProvider, nextProvider);
+  const switchedAntigravityAccount = hasSwitchedAntigravityAccount(previousProvider, nextProvider);
+  const savedAccount = switchedAntigravityAccount
+    ? undefined
+    : carrySavedAntigravityAccount(previousProvider, nextProvider);
   const { message: _uncheckedMessage, ...nextWithoutMessage } = nextProvider;
-  const models = mergeProviderModels(nextProvider, previousProvider.models, nextProvider.models);
+  const models = mergeProviderModels(
+    nextProvider,
+    switchedAntigravityAccount ? [] : previousProvider.models,
+    nextProvider.models,
+  );
   // Folder catalogs were compared with the old machine catalog, so every folder rescans.
-  const previousWorkspaceSnapshots = Equal.equals(models, previousProvider.models)
-    ? previousProvider.workspaceSnapshots
-    : previousProvider.workspaceSnapshots?.map((snapshot) => ({
-        ...snapshot,
-        modelsPending: true,
-      }));
+  const previousWorkspaceSnapshots = switchedAntigravityAccount
+    ? undefined
+    : Equal.equals(models, previousProvider.models)
+      ? previousProvider.workspaceSnapshots
+      : previousProvider.workspaceSnapshots?.map((snapshot) => ({
+          ...snapshot,
+          modelsPending: true,
+        }));
   return {
     ...(savedAccount?.status === "ready" ? nextWithoutMessage : nextProvider),
     ...savedAccount,

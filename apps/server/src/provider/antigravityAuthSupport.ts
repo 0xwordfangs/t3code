@@ -38,6 +38,13 @@ const maxStdoutLineBytes = 16 * 1024 * 1024;
 const authPrefixBytes = new TextEncoder().encode(ANTIGRAVITY_AUTH_STDOUT_PREFIX);
 const decodeUrl = Schema.decodeUnknownEffect(Schema.URLFromString);
 const decodeBrowserHelperUrl = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.String));
+const decodeStoredSignInEmail = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      id_token_email: Schema.optional(Schema.String),
+    }),
+  ),
+);
 const ProfileSettingsFile = Schema.Struct({
   auth: Schema.Struct({ type: Schema.String }),
   gcp: Schema.optional(
@@ -205,9 +212,15 @@ function antigravityEnvironment(
   runtimeTempDirectory?: string,
 ) {
   const environment: NodeJS.ProcessEnv = {};
+  let existingSshConnection: string | undefined;
   for (const [key, value] of Object.entries(baseEnv)) {
+    const upper = key.toUpperCase();
+    if (upper === "SSH_CONNECTION") {
+      if (value) existingSshConnection = value;
+      if (auth.authMethod === "oauth-personal") continue;
+    }
     // Windows treats environment keys as case-insensitive. Remove aliases too.
-    if (!removedEnvironmentKeys.has(key.toUpperCase())) environment[key] = value;
+    if (!removedEnvironmentKeys.has(upper)) environment[key] = value;
   }
   // Put the GCP pair in settings.json because GOOGLE_API_KEY takes precedence in the environment.
   const credential =
@@ -225,6 +238,11 @@ function antigravityEnvironment(
     baseEnv.SSL_CERT_FILE === undefined &&
     baseEnv.SSL_CERT_DIR === undefined
       ? { SSL_CERT_FILE: profile.caBundlePath }
+      : {}),
+    // The 1.5 CLI ignores AGY_ACP_FORCE_FILE_STORAGE and keeps Google sign-ins in one OS keyring
+    // entry for every profile, unless it believes it runs over SSH. Sign-in then uses `--login`.
+    ...(auth.authMethod === "oauth-personal"
+      ? { SSH_CONNECTION: existingSshConnection || "127.0.0.1 0 127.0.0.1 0" }
       : {}),
     GEMINI_HOME: profile.geminiHome,
     AGY_ACP_FORCE_FILE_STORAGE: "1",
@@ -456,6 +474,23 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   return profile;
 });
 
+/** Reads the signed-in Google email from the instance's 1.5.x profile token file, if present. */
+export const readAntigravityStoredEmail = Effect.fn("readAntigravityStoredEmail")(function* (
+  profileDirectory: string,
+): Effect.fn.Return<string | undefined, never, FileSystem.FileSystem | Path.Path> {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const tokenPath = path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token");
+  return yield* fs.readFileString(tokenPath).pipe(
+    Effect.flatMap(decodeStoredSignInEmail),
+    Effect.map((stored) => {
+      const email = stored.id_token_email?.trim();
+      return email && email.length > 0 ? email : undefined;
+    }),
+    Effect.orElseSucceed(() => undefined),
+  );
+});
+
 export function buildAntigravityAcpSpawnInput(input: {
   readonly installation: {
     readonly executablePath: string;
@@ -499,9 +534,13 @@ export function buildAntigravityAcpSpawnInput(input: {
   };
 }
 
+/** Where `agy acp --login` sends Google; the page shows a code the user pastes back. */
+const ANTIGRAVITY_CODE_REDIRECT_URI = "https://antigravity.google/oauth-callback";
+
 export const parseAntigravityAuthorizationUrl = Effect.fn("parseAntigravityAuthorizationUrl")(
   function* (
     authorizationUrl: string,
+    kind: "loopback" | "code" = "loopback",
   ): Effect.fn.Return<AntigravityAuthorizationUrl, AcpErrors.AcpError> {
     const invalidUrl = () =>
       authSupportError("Antigravity returned an invalid Google sign-in URL.");
@@ -513,7 +552,7 @@ export const parseAntigravityAuthorizationUrl = Effect.fn("parseAntigravityAutho
     const redirectUri = url.searchParams.get("redirect_uri");
     if (
       url.origin !== "https://accounts.google.com" ||
-      url.pathname !== "/o/oauth2/v2/auth" ||
+      url.pathname !== (kind === "loopback" ? "/o/oauth2/v2/auth" : "/o/oauth2/auth") ||
       url.username !== "" ||
       url.password !== "" ||
       url.hash !== "" ||
@@ -526,15 +565,51 @@ export const parseAntigravityAuthorizationUrl = Effect.fn("parseAntigravityAutho
       state.length > 512 ||
       /\s/.test(state) ||
       redirectUri === null ||
-      !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/$/.test(redirectUri)
+      (kind === "loopback"
+        ? !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/$/.test(redirectUri)
+        : redirectUri !== ANTIGRAVITY_CODE_REDIRECT_URI)
     ) {
       return yield* invalidUrl();
     }
+    if (kind === "code") return { authorizationUrl, redirectUri, state };
     const redirect = yield* decodeUrl(redirectUri).pipe(Effect.mapError(invalidUrl));
     if (Number(redirect.port) < 1_024) return yield* invalidUrl();
     return { authorizationUrl, redirectUri, state };
   },
 );
+
+/**
+ * What `agy acp --login` reads after its link: the code the Antigravity page shows, or that page's
+ * URL, which must answer this sign-in. Undefined for anything else, including any line break.
+ */
+export function antigravityLoginResponse(
+  pending: AntigravityAuthorizationUrl,
+  response: string,
+): string | undefined {
+  const value = response.trim();
+  if (/^[\w./~-]{1,2048}$/.test(value)) return value;
+  if (value.length > maxAuthorizationUrlLength || /\s/.test(value)) return undefined;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return undefined;
+  }
+  const url = URL.parse(value);
+  if (
+    url === null ||
+    `${url.origin}${url.pathname}` !== pending.redirectUri ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.hash !== "" ||
+    url.searchParams.has("error") ||
+    url.searchParams.getAll("state").length !== 1 ||
+    url.searchParams.get("state") !== pending.state ||
+    url.searchParams.getAll("code").length !== 1 ||
+    !url.searchParams.get("code")
+  ) {
+    return undefined;
+  }
+  return value;
+}
 
 export function makeAntigravityStdoutTransform(
   input: {

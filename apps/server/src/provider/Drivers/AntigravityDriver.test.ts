@@ -13,9 +13,11 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { HttpClient } from "effect/http";
 
@@ -661,6 +663,140 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         );
         expect(yield* fs.exists(directories.runtimeTemp)).toBe(false);
         expect(yield* fs.exists(legacyRoot)).toBe(false);
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "reports the stored Google email only for personal OAuth instances",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const writeStoredToken = (profileDirectory: string, email: string) =>
+          Effect.gen(function* () {
+            const acpDir = path.join(profileDirectory, "antigravity-acp");
+            yield* fs.makeDirectory(acpDir, { recursive: true });
+            yield* fs.writeFileString(
+              path.join(acpDir, "antigravity-oauth-token"),
+              JSON.stringify({ id_token_email: email }),
+            );
+          });
+
+        const personal = yield* makeHarness({ config: { authMethod: "oauth-personal" } });
+        yield* writeStoredToken(personal.profileDirectory, "personal@example.com");
+        expect((yield* personal.instance.snapshot.refresh).auth).toMatchObject({
+          status: "unknown",
+          type: "oauth-personal",
+          email: "personal@example.com",
+        });
+        yield* personal.refresh();
+        expect((yield* personal.instance.snapshot.getSnapshot).auth).toMatchObject({
+          status: "authenticated",
+          type: "oauth-personal",
+          label: "Google account",
+          email: "personal@example.com",
+        });
+        yield* personal.assertClosed;
+
+        const enterprise = yield* makeHarness({
+          config: {
+            authMethod: "oauth-business",
+            gcpProject: "demo-project",
+            gcpLocation: "us-central1",
+          },
+        });
+        yield* writeStoredToken(enterprise.profileDirectory, "ignored@example.com");
+        const enterpriseAuth = (yield* enterprise.instance.snapshot.refresh).auth;
+        expect(enterpriseAuth).toMatchObject({
+          status: "unknown",
+          type: "oauth-business",
+        });
+        expect(enterpriseAuth.email).toBeUndefined();
+        yield* enterprise.assertClosed;
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "runs native CLI code login in SSH mode without display variables, then authenticates a fresh session",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const h = yield* makeHarness({
+          config: { authMethod: "oauth-personal" },
+          environment: [
+            { name: "DISPLAY", value: ":99" },
+            { name: "WAYLAND_DISPLAY", value: "wayland-1" },
+          ],
+        });
+        const cliDir = path.join(path.dirname(h.first.executablePath), "native-cli");
+        const cliExecutable = path.join(cliDir, "agy");
+        const codeLog = path.join(cliDir, "submitted-code.txt");
+        const loginUrl =
+          "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=driver-state";
+        yield* fs.makeDirectory(cliDir, { recursive: true });
+        yield* fs.writeFileString(
+          cliExecutable,
+          [
+            "#!/bin/sh",
+            'case " $* " in',
+            '  *" --login "*)',
+            `    printf '%s\\n' ${shellQuote(loginUrl)}`,
+            "    IFS= read -r code",
+            `    printf '%s' "$code" > ${shellQuote(codeLog)}`,
+            `    mkdir -p "$GEMINI_HOME/antigravity-acp"`,
+            `    printf '{"id_token_email":"isolated@example.com"}' > "$GEMINI_HOME/antigravity-acp/antigravity-oauth-token"`,
+            "    exit 0",
+            "    ;;",
+            "esac",
+            `exec ${shellQuote(h.first.executablePath)} "$@"`,
+            "",
+          ].join("\n"),
+        );
+        yield* fs.chmod(cliExecutable, 0o755);
+        h.controls.selected = {
+          executablePath: cliExecutable,
+          harnessPath: null,
+          source: "path",
+          version: "1.5.13",
+          managedVersionDirectory: null,
+        };
+
+        const auth = h.instance.auth;
+        if (!auth?.respond) return yield* Effect.die("Antigravity auth respond is missing.");
+        const owner = "driver-code-login-owner";
+        const startedFlow = yield* auth.start(owner);
+        const waiting = yield* auth.subscribe(owner).pipe(
+          Stream.filter((state) => state.phase === "waiting"),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+        expect(waiting.authorizationUrl).toBe(loginUrl);
+        expect(waiting.interaction?.type).toBe("credentials");
+
+        yield* auth.respond(owner, {
+          instanceId: h.instance.instanceId,
+          flowId: startedFlow.flowId!,
+          interactionId: startedFlow.flowId!,
+          response: { type: "credentials", values: { code: "4/0Ab-driver-code" } },
+        });
+        yield* auth.subscribe(owner).pipe(
+          Stream.filter((state) => state.phase === "succeeded"),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+
+        expect(yield* fs.readFileString(codeLog)).toBe("4/0Ab-driver-code");
+        const loginLaunch = h.launches.find((launch) => launch.args.includes("--login"));
+        expect(loginLaunch?.environment.SSH_CONNECTION).toBe("127.0.0.1 0 127.0.0.1 0");
+        expect(loginLaunch?.environment.DISPLAY).toBeUndefined();
+        expect(loginLaunch?.environment.WAYLAND_DISPLAY).toBeUndefined();
+        expect((yield* h.instance.snapshot.getSnapshot).auth).toMatchObject({
+          status: "authenticated",
+          type: "oauth-personal",
+          email: "isolated@example.com",
+        });
+        yield* h.assertClosed;
       }),
   );
 });

@@ -27,6 +27,8 @@ const otherOwner = "t3-auth-session-other";
 const authorizationUrl =
   "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2F&state=test-state";
 const callbackUrl = "http://127.0.0.1:51234/?state=test-state&code=test-code";
+const loginUrl =
+  "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=login-state";
 
 const initialized = {
   protocolVersion: 1,
@@ -60,8 +62,11 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
     readonly supportsLogout?: boolean;
     readonly beforeInitialize?: Effect.Effect<void>;
     readonly forwardCallback?: Effect.Effect<void, ProviderSetupError>;
+    readonly codeLogin?: boolean;
   } = {},
 ) {
+  const loginCodes: string[] = [];
+  const loginCode = yield* Deferred.make<void>();
   const authenticated = yield* Deferred.make<void, AcpErrors.AcpError>();
   const discovered = yield* Deferred.make<void, AcpErrors.AcpError>();
   const closed = yield* Deferred.make<void>();
@@ -123,6 +128,13 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
         catalog = ["gemini-test"];
         events.push("catalog-published");
       }),
+    onCredentialsReplaced: Effect.sync(() => {
+      events.push("credentials-replaced");
+    }),
+    onVerificationFailed: Effect.sync(() => {
+      catalog = [];
+      events.push("verification-failed");
+    }),
     onSignedOut: Effect.sync(() => {
       catalog = [];
       events.push("catalog-cleared");
@@ -131,6 +143,21 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
       options.forwardCallback ??
       Effect.sync(() => {
         forwarded += 1;
+      }),
+    codeLogin: ({ onAuthorizationUrl }) =>
+      Effect.gen(function* () {
+        if (!options.codeLogin) return undefined;
+        events.push("login-open");
+        yield* Effect.addFinalizer(() => Effect.sync(() => events.push("login-close")));
+        yield* onAuthorizationUrl(loginUrl);
+        return {
+          submit: (response: string) =>
+            Effect.sync(() => loginCodes.push(response)).pipe(
+              Effect.andThen(Deferred.succeed(loginCode, undefined)),
+              Effect.asVoid,
+            ),
+          completed: Deferred.await(loginCode),
+        };
       }),
   });
   return {
@@ -142,6 +169,7 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
     events,
     catalog: () => catalog,
     forwarded: () => forwarded,
+    loginCodes,
     receiveAuthorizationUrl: (url: string) =>
       Effect.suspend(() =>
         receiveAuthorizationUrl
@@ -168,6 +196,93 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
       yield* Deferred.succeed(harness.discovered, undefined);
       yield* phase(harness.auth, "succeeded");
     }),
+  );
+
+  it.effect("signs in through the CLI's code login, then authenticates a fresh process", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ codeLogin: true });
+      const state = yield* harness.auth.controller.start(owner);
+      const waiting = yield* phase(harness.auth, "waiting");
+      assert.equal(waiting.authorizationUrl, loginUrl);
+      assert.equal(waiting.interaction?.type, "credentials");
+      const respond = (code: string) =>
+        harness.auth.controller.respond!(owner, {
+          instanceId,
+          flowId: state.flowId!,
+          interactionId: state.flowId!,
+          response: { type: "credentials", values: { code } },
+        });
+      for (const invalid of [callbackUrl, "two words", ""]) {
+        assert.isTrue(Exit.isFailure(yield* respond(invalid).pipe(Effect.exit)), invalid);
+      }
+      assert.isTrue(
+        Exit.isFailure(
+          yield* harness.auth.controller.respond!(otherOwner, {
+            instanceId,
+            flowId: state.flowId!,
+            interactionId: state.flowId!,
+            response: { type: "credentials", values: { code: "4/0Ab-code" } },
+          }).pipe(Effect.exit),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* harness.auth.controller.respond!(owner, {
+            instanceId,
+            flowId: state.flowId!,
+            interactionId: "wrong-interaction",
+            response: { type: "credentials", values: { code: "4/0Ab-code" } },
+          }).pipe(Effect.exit),
+        ),
+      );
+      assert.equal((yield* respond("4/0Ab-code")).phase, "verifying");
+      assert.isTrue(Exit.isFailure(yield* respond("4/0Ab-code").pipe(Effect.exit)));
+      assert.deepEqual(harness.loginCodes, ["4/0Ab-code"]);
+
+      // onSignedInElsewhere must not clear an active flow.
+      yield* harness.auth.onSignedInElsewhere;
+      assert.equal((yield* phase(harness.auth, "verifying")).phase, "verifying");
+
+      yield* Deferred.succeed(harness.authenticated, undefined);
+      yield* Deferred.succeed(harness.discovered, undefined);
+      yield* phase(harness.auth, "succeeded");
+      assert.deepEqual(harness.events, [
+        "login-open",
+        "login-close",
+        "credentials-replaced",
+        "process-open",
+        "initialize",
+        "authenticate",
+        "session-new",
+        "catalog-published",
+        "process-close",
+      ]);
+    }),
+  );
+
+  it.effect(
+    "clears previous account metadata if verification fails after code login replaces credentials",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({ codeLogin: true });
+        const state = yield* harness.auth.controller.start(owner);
+        yield* phase(harness.auth, "waiting");
+        yield* harness.auth.controller.respond!(owner, {
+          instanceId,
+          flowId: state.flowId!,
+          interactionId: state.flowId!,
+          response: { type: "credentials", values: { code: "4/0Ab-code" } },
+        });
+        yield* Deferred.fail(
+          harness.authenticated,
+          AcpErrors.AcpRequestError.internalError("SUBSCRIPTION_REQUIRED"),
+        );
+        const failed = yield* phase(harness.auth, "failed");
+        assert.include(failed.message ?? "", "eligible Antigravity subscription");
+        assert.deepEqual(harness.catalog(), []);
+        assert.include(harness.events, "credentials-replaced");
+        assert.include(harness.events, "verification-failed");
+      }),
   );
 
   it.effect("rejects a different second authorization URL", () =>
@@ -281,6 +396,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
       yield* TestClock.adjust("270 seconds");
       const failed = yield* phase(harness.auth, "failed");
       assert.include(failed.message ?? "", "could not reach Google");
+
+      yield* harness.auth.onSignedInElsewhere;
+      const cleared = yield* phase(harness.auth, "idle");
+      assert.isNull(cleared.message);
     }),
   );
 

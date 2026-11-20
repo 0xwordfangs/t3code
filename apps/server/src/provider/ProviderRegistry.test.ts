@@ -2082,6 +2082,37 @@ it.layer(
           signedIn.auth,
         );
       });
+
+      it("preserves a newly discovered email on restart and drops carried account state when the email changed", () => {
+        const upgraded = ProviderRegistry.mergeProviderSnapshot(signedIn, {
+          ...restartProbe,
+          auth: { status: "unknown", type: "oauth-personal", email: "alice@example.com" },
+        });
+        assert.deepStrictEqual(upgraded.auth, {
+          ...signedIn.auth,
+          email: "alice@example.com",
+        });
+        assert.equal(upgraded.status, "ready");
+        assert.deepStrictEqual(upgraded.models, signedIn.models);
+
+        const switched = ProviderRegistry.mergeProviderSnapshot(
+          {
+            ...signedIn,
+            auth: { ...signedIn.auth, email: "alice@example.com" },
+          },
+          {
+            ...restartProbe,
+            auth: { status: "unknown", type: "oauth-personal", email: "bob@example.com" },
+          },
+        );
+        assert.deepStrictEqual(switched.auth, {
+          status: "unknown",
+          type: "oauth-personal",
+          email: "bob@example.com",
+        });
+        assert.equal(switched.status, "warning");
+        assert.deepStrictEqual(switched.models, []);
+      });
     });
 
     it("fills missing capabilities from the previous provider snapshot", () => {
