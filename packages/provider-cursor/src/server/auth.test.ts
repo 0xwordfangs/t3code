@@ -272,7 +272,13 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("CursorAuth", (it
       const harness = yield* makeHarness();
       yield* harness.auth.controller.start(owner);
       yield* phase(harness.auth, "waiting");
-      yield* harness.auth.controller.logout(Effect.void);
+      for (const actor of [otherOwner, undefined] as const) {
+        const denied = yield* Effect.flip(harness.auth.controller.logout(Effect.void, actor));
+        expect(denied.operation).toBe("logout");
+        expect(denied.detail).toContain("Another session is currently signing in");
+      }
+      expect(harness.loginOptions()?.signal?.aborted).toBe(false);
+      yield* harness.auth.controller.logout(Effect.void, owner);
       expect(harness.loginOptions()?.signal?.aborted).toBe(true);
       yield* Effect.sync(() => harness.complete.resolve());
       yield* Effect.promise(() => harness.returned.promise);

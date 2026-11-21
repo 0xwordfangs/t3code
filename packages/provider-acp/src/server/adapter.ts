@@ -5160,25 +5160,27 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             threadId: route.threadId,
             providerThreadId: route.providerThreadId,
           });
+          const clearIfCurrent = () =>
+            continuationPermit.withPermit(
+              Effect.gen(function* () {
+                if ((yield* Ref.get(continuationGeneration)) === generation) {
+                  yield* Ref.set(continuationRequested, false);
+                  if ((yield* Ref.get(activeTurn)) === null) {
+                    const waiting = turnAttached;
+                    turnAttached = yield* Deferred.make<boolean>();
+                    yield* Deferred.succeed(waiting, false);
+                  }
+                }
+              }),
+            );
           yield* continuationRequests.offer({
             threadId: route.threadId,
             providerThreadId: route.providerThreadId,
             driver,
             detail: null,
             ...(notification === null ? {} : { notification }),
-            clearIfCurrent: () =>
-              continuationPermit.withPermit(
-                Effect.gen(function* () {
-                  if ((yield* Ref.get(continuationGeneration)) === generation) {
-                    yield* Ref.set(continuationRequested, false);
-                    if ((yield* Ref.get(activeTurn)) === null) {
-                      const waiting = turnAttached;
-                      turnAttached = yield* Deferred.make<boolean>();
-                      yield* Deferred.succeed(waiting, false);
-                    }
-                  }
-                }),
-              ),
+            clearIfCurrent,
+            onRunEndedWithoutStarting: clearIfCurrent,
             dispatchIfCurrent: (effect) =>
               continuationPermit.withPermit(
                 Effect.gen(function* () {
@@ -6594,11 +6596,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const attempt = yield* runRuntimeCallbackAtGeneration(
                 generation,
                 Effect.gen(function* () {
-                  if (awaitsContinuation) {
-                    const rawContext = yield* Ref.get(activeTurn);
-                    if (rawContext === null || rawContext.finalized) {
-                      return { _tag: "AwaitTurn" as const };
-                    }
+                  const rawContext = yield* Ref.get(activeTurn);
+                  if (
+                    rawContext?.interrupted === true ||
+                    (yield* Ref.get(stoppedRunQuarantine)) ||
+                    (!awaitsContinuation && rawContext?.finalized === true)
+                  ) {
+                    return { _tag: "Cancelled" as const };
+                  }
+                  if (awaitsContinuation && (rawContext === null || rawContext.finalized)) {
+                    return { _tag: "AwaitTurn" as const };
                   }
                   const value = yield* request;
                   return {
@@ -6608,6 +6615,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 }),
               );
               if (Option.isNone(attempt)) return yield* Effect.never;
+              if (attempt.value._tag === "Cancelled") {
+                return { answers: null, acknowledgeNativeResponse: Effect.void };
+              }
               if (attempt.value._tag === "AwaitTurn") {
                 if (!(yield* awaitRequestTurn(generation))) {
                   return { answers: null, acknowledgeNativeResponse: Effect.void };
@@ -7339,6 +7349,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               };
               let resolvedParams = params;
               let resolvedAnswerableParams = answerableParams;
+              let strictestDisposition: "allow" | "ask" | "deny" = "allow";
+              const mergeDisposition = (
+                current: "allow" | "ask" | "deny",
+                next: "allow" | "ask" | "deny",
+              ): "allow" | "ask" | "deny" => {
+                if (current === "deny" || next === "deny") return "deny";
+                if (current === "ask" || next === "ask") return "ask";
+                return "allow";
+              };
               let admitted:
                 | {
                     readonly _tag: "Immediate";
@@ -7353,17 +7372,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 const attempt = yield* runRuntimeCallbackAtGeneration(
                   handlerGeneration,
                   Effect.gen(function* () {
-                    const rawContext = awaitsContinuationTurn
-                      ? yield* Ref.get(activeTurn)
-                      : yield* activeContext;
-                    if (awaitsContinuationTurn && rawContext?.finalized === true) {
-                      return { _tag: "AwaitTurn" as const };
-                    }
-                    const context = rawContext;
+                    const rawContext = yield* Ref.get(activeTurn);
                     if (
-                      context === null &&
-                      awaitsContinuationTurn &&
-                      (yield* Ref.get(stoppedRunQuarantine))
+                      rawContext?.interrupted === true ||
+                      (yield* Ref.get(stoppedRunQuarantine)) ||
+                      (!awaitsContinuationTurn && rawContext?.finalized === true)
                     ) {
                       return {
                         _tag: "Immediate" as const,
@@ -7373,8 +7386,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     const rootSessionId = yield* Ref.get(activeSessionId);
                     const trackedTool =
                       nativeParams.sessionId === rootSessionId
-                        ? context !== null
-                          ? context.tools.get(nativeParams.toolCall.toolCallId)
+                        ? rawContext !== null
+                          ? rawContext.tools.get(nativeParams.toolCall.toolCallId)
                           : postSettleContinuationEnabled
                             ? bufferedToolFor(yield* Ref.get(wakeBuffer))
                             : undefined
@@ -7397,28 +7410,27 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     // tool already seen under the same id so policy can tell a
                     // read from a write.
                     const knownKind = trackedTool?.kind;
-                    const disposition = dispositionFor(
-                      context?.input.runtimePolicy ?? latestRuntimePolicy,
+                    const effectiveParamsWithKnownKind =
                       effectiveParams.toolCall.kind == null && knownKind !== undefined
                         ? {
                             ...effectiveParams,
                             toolCall: { ...effectiveParams.toolCall, kind: knownKind },
                           }
-                        : effectiveParams,
+                        : effectiveParams;
+                    if (awaitsContinuationTurn && (rawContext === null || rawContext.finalized)) {
+                      strictestDisposition = mergeDisposition(
+                        strictestDisposition,
+                        dispositionFor(latestRuntimePolicy, effectiveParamsWithKnownKind),
+                      );
+                      return { _tag: "AwaitTurn" as const };
+                    }
+                    const context = rawContext ?? (yield* activeContext);
+                    const disposition = mergeDisposition(
+                      strictestDisposition,
+                      dispositionFor(context.input.runtimePolicy, effectiveParamsWithKnownKind),
                     );
+                    strictestDisposition = disposition;
                     if (disposition === "allow") {
-                      const backgroundWorkBlocksWake =
-                        !followsAgentWorkState &&
-                        flavor.allowPostSettleWakeWhileBackgroundWorkRuns !== true &&
-                        (yield* Ref.get(runningBackgroundTaskIds)).size > 0;
-                      if (
-                        awaitsContinuationTurn &&
-                        context === null &&
-                        !backgroundWorkBlocksWake &&
-                        effectiveParams.sessionId === rootSessionId
-                      ) {
-                        yield* offerContinuationRun(effectiveParams.sessionId);
-                      }
                       const optionId =
                         selectAutoApprovedPermissionOption(effectiveAnswerableParams);
                       return {
@@ -7441,9 +7453,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                             ? ({ outcome: { outcome: "cancelled" } } as const)
                             : ({ outcome: { outcome: "selected", optionId } } as const),
                       };
-                    }
-                    if (context === null) {
-                      return { _tag: "AwaitTurn" as const };
                     }
                     return {
                       _tag: "Pending" as const,
@@ -7557,47 +7566,46 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 (unknownRecord(params._meta)?.codex_approval_kind === "mcp_tool_call" ||
                   transportRequestId.startsWith("mcp_tool_call_approval_"))
               ) {
+                const awaitsContinuation = postSettleRequestsAwaitContinuation();
+                let requiredAsk = false;
                 let mcpApprovalDisposition: "allow" | "ask" | "cancel" | undefined;
                 while (true) {
                   const attempt = yield* runRuntimeCallbackAtGeneration(
                     handlerGeneration,
                     Effect.gen(function* () {
-                      const awaitsContinuation = postSettleRequestsAwaitContinuation();
-                      const rawContext = awaitsContinuation
-                        ? yield* Ref.get(activeTurn)
-                        : yield* activeContext;
-                      if (awaitsContinuation && rawContext?.finalized === true) {
-                        return { _tag: "WaitFinalize" as const, completed: rawContext.completed };
-                      }
-                      const context = rawContext;
+                      const rawContext = yield* Ref.get(activeTurn);
                       if (
-                        context === null &&
-                        awaitsContinuation &&
-                        (yield* Ref.get(stoppedRunQuarantine))
+                        rawContext?.interrupted === true ||
+                        (yield* Ref.get(stoppedRunQuarantine)) ||
+                        (!awaitsContinuation && rawContext?.finalized === true)
                       ) {
                         return { _tag: "Resolved" as const, disposition: "cancel" as const };
                       }
-                      const disposition = acpMcpToolApprovalElicitationDisposition(
-                        context?.input.runtimePolicy ?? latestRuntimePolicy,
+                      if (awaitsContinuation && (rawContext === null || rawContext.finalized)) {
+                        if (
+                          acpMcpToolApprovalElicitationDisposition(
+                            latestRuntimePolicy,
+                            params,
+                            transportRequestId,
+                          ) === "ask"
+                        ) {
+                          requiredAsk = true;
+                        }
+                        return { _tag: "AwaitTurn" as const };
+                      }
+                      const context = rawContext ?? (yield* activeContext);
+                      const rawDisposition = acpMcpToolApprovalElicitationDisposition(
+                        context.input.runtimePolicy,
                         params,
                         transportRequestId,
                       );
+                      const disposition =
+                        rawDisposition === "allow" && requiredAsk ? "ask" : rawDisposition;
+                      if (disposition === "ask") {
+                        requiredAsk = true;
+                      }
                       if (disposition === undefined || disposition === "ask") {
                         return { _tag: "Resolved" as const, disposition };
-                      }
-                      const backgroundWorkBlocksWake =
-                        !followsAgentWorkState &&
-                        flavor.allowPostSettleWakeWhileBackgroundWorkRuns !== true &&
-                        (yield* Ref.get(runningBackgroundTaskIds)).size > 0;
-                      const rootSessionId = yield* Ref.get(activeSessionId);
-                      if (
-                        disposition === "allow" &&
-                        awaitsContinuation &&
-                        context === null &&
-                        !backgroundWorkBlocksWake &&
-                        rootSessionId !== null
-                      ) {
-                        yield* offerContinuationRun(rootSessionId);
                       }
                       const nativeResponseAcknowledgement = yield* Deferred.make<
                         void,
@@ -7612,8 +7620,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     }),
                   );
                   if (Option.isNone(attempt)) return yield* Effect.never;
-                  if (attempt.value._tag === "WaitFinalize") {
-                    yield* Deferred.await(attempt.value.completed);
+                  if (attempt.value._tag === "AwaitTurn") {
+                    if (!(yield* awaitRequestTurn(handlerGeneration))) {
+                      mcpApprovalDisposition = "cancel";
+                      break;
+                    }
                     continue;
                   }
                   mcpApprovalDisposition = attempt.value.disposition;
@@ -7637,6 +7648,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 const admitted = yield* runRuntimeCallbackAtGeneration(
                   handlerGeneration,
                   Effect.gen(function* () {
+                    const rawContext = yield* Ref.get(activeTurn);
+                    if (
+                      rawContext?.interrupted === true ||
+                      (yield* Ref.get(stoppedRunQuarantine))
+                    ) {
+                      return { action: "cancel" } as const;
+                    }
                     const nativeResponseAcknowledgement = yield* Deferred.make<
                       void,
                       EffectAcpErrors.AcpError

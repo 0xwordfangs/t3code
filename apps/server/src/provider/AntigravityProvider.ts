@@ -209,8 +209,8 @@ function withAuthVerification(
 }
 
 function isDifferentEmail(previous: string | undefined, next: string | undefined): boolean {
-  const previousNormalized = previous?.trim().toLowerCase();
-  const nextNormalized = next?.trim().toLowerCase();
+  const previousNormalized = previous?.trim().toLowerCase() || undefined;
+  const nextNormalized = next?.trim().toLowerCase() || undefined;
   return (
     previousNormalized !== undefined &&
     nextNormalized !== undefined &&
@@ -286,96 +286,110 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const scope = yield* Effect.scope;
   const refreshUsage = Effect.fn("AntigravityProvider.refreshUsage")(function* () {
     if (!options.probeUsage || (yield* PublishingUsage)) return;
-    const startedEmail = (yield* SubscriptionRef.get(metadata)).draft.auth.email;
+    const startedState = yield* SubscriptionRef.get(metadata);
+    if (startedState.draft.auth.status === "unauthenticated") return;
+    const startedEmail = startedState.draft.auth.email;
+    const startedRevision = startedState.authRevision;
     yield* FiberHandle.run(
       usageRead,
       options.probeUsage.pipe(
         Effect.map(normalizeUsageProbeResult),
         Effect.flatMap((probed) =>
-          SubscriptionRef.update(metadata, (state): AntigravityProviderState => {
-            if (isDifferentEmail(startedEmail, state.draft.auth.email)) {
-              return state;
-            }
-            if (probed.verificationRequired !== undefined) {
-              if (state.draft.auth.status === "unauthenticated") {
-                return state;
+          SubscriptionRef.modify(
+            metadata,
+            (state): readonly [boolean, AntigravityProviderState] => {
+              if (
+                state.draft.auth.status === "unauthenticated" ||
+                state.authRevision !== startedRevision ||
+                isDifferentEmail(startedEmail, state.draft.auth.email)
+              ) {
+                return [false, state];
               }
-              const verificationMessage =
-                probed.verificationRequired.message.trim() ||
-                ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
-              const verificationUrl =
-                probed.verificationRequired.verificationUrl ?? state.draft.auth.verificationUrl;
-              return {
-                ...state,
-                verificationRequired: true,
-                draft: {
-                  ...state.draft,
-                  auth: withAuthVerification(state.draft.auth, {
-                    required: true,
-                    url: verificationUrl,
-                  }),
-                  status: "warning",
-                  message: verificationMessage,
-                  usageLimits: probed.usageLimits,
+              if (probed.verificationRequired !== undefined) {
+                const verificationMessage =
+                  probed.verificationRequired.message.trim() ||
+                  ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
+                const verificationUrl =
+                  probed.verificationRequired.verificationUrl ?? state.draft.auth.verificationUrl;
+                return [
+                  true,
+                  {
+                    ...state,
+                    verificationRequired: true,
+                    draft: {
+                      ...state.draft,
+                      auth: withAuthVerification(state.draft.auth, {
+                        required: true,
+                        url: verificationUrl,
+                      }),
+                      status: "warning",
+                      message: verificationMessage,
+                      usageLimits: probed.usageLimits,
+                    },
+                  },
+                ];
+              }
+              const shouldClearVerification = probed.usageLimits.windows.length > 0;
+              const nextUsageLimits =
+                state.verificationRequired && !shouldClearVerification
+                  ? state.draft.usageLimits
+                  : resolveUsageLimitsAfterProbe({
+                      published: state.draft.usageLimits,
+                      probed: probed.usageLimits,
+                    });
+              if (!shouldClearVerification) {
+                return [
+                  true,
+                  {
+                    ...state,
+                    draft: {
+                      ...state.draft,
+                      usageLimits: nextUsageLimits,
+                    },
+                  },
+                ];
+              }
+              const hadVerification =
+                state.verificationRequired ||
+                state.draft.auth.verificationRequired === true ||
+                state.draft.auth.verificationUrl !== undefined;
+              const { message: _previousMessage, ...draftWithoutMessage } = state.draft;
+              const clearedAuth = withAuthVerification(state.draft.auth, undefined);
+              const restoredMessage =
+                clearedAuth.status === "authenticated" ? undefined : authUncheckedMessage;
+              return [
+                true,
+                {
+                  ...state,
+                  verificationRequired: false,
+                  draft: {
+                    ...(hadVerification && state.draft.status === "warning"
+                      ? draftWithoutMessage
+                      : state.draft),
+                    auth: clearedAuth,
+                    ...(hadVerification && state.draft.status === "warning"
+                      ? {
+                          status: clearedAuth.status === "authenticated" ? "ready" : "warning",
+                          ...(restoredMessage ? { message: restoredMessage } : {}),
+                        }
+                      : {}),
+                    usageLimits: nextUsageLimits,
+                  },
                 },
-              };
-            }
-            const shouldClearVerification = probed.usageLimits.windows.length > 0;
-            const nextUsageLimits =
-              state.verificationRequired && !shouldClearVerification
-                ? state.draft.usageLimits
-                : resolveUsageLimitsAfterProbe({
-                    published: state.draft.usageLimits,
-                    probed: probed.usageLimits,
-                  });
-            if (!shouldClearVerification) {
-              return {
-                ...state,
-                draft: {
-                  ...state.draft,
-                  usageLimits: nextUsageLimits,
-                },
-              };
-            }
-            const hadVerification =
-              state.verificationRequired ||
-              state.draft.auth.verificationRequired === true ||
-              state.draft.auth.verificationUrl !== undefined;
-            const { message: _previousMessage, ...draftWithoutMessage } = state.draft;
-            const clearedAuth = withAuthVerification(state.draft.auth, undefined);
-            const restoredMessage =
-              clearedAuth.status === "authenticated"
-                ? undefined
-                : clearedAuth.status === "unauthenticated"
-                  ? signInMessage
-                  : authUncheckedMessage;
-            return {
-              ...state,
-              verificationRequired: false,
-              draft: {
-                ...(hadVerification && state.draft.status === "warning"
-                  ? draftWithoutMessage
-                  : state.draft),
-                auth: clearedAuth,
-                ...(hadVerification && state.draft.status === "warning"
-                  ? {
-                      status: clearedAuth.status === "authenticated" ? "ready" : "warning",
-                      ...(restoredMessage ? { message: restoredMessage } : {}),
-                    }
-                  : {}),
-                usageLimits: nextUsageLimits,
-              },
-            };
-          }),
+              ];
+            },
+          ),
         ),
         // Enrichment cannot change published limits; a health check publishes them.
-        Effect.andThen(
-          Deferred.await(republish).pipe(
-            Effect.flatten,
-            Effect.provideService(PublishingUsage, true),
-            Effect.ignoreCause({ log: true }),
-            Effect.forkIn(scope),
-          ),
+        Effect.flatMap((applied) =>
+          applied
+            ? Deferred.await(republish).pipe(
+                Effect.flatten,
+                Effect.provideService(PublishingUsage, true),
+                Effect.ignoreCause({ log: true }),
+                Effect.forkIn(scope),
+              )
+            : Effect.void,
         ),
       ),
       // Store the fiber before it runs, so a sign-out during the read can interrupt it.
@@ -447,11 +461,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           (state.verificationRequired ||
             emailAuth.verificationRequired === true ||
             emailAuth.verificationUrl !== undefined);
-        const auth = clearVerification
-          ? withAuthVerification(emailAuth, undefined)
-          : verificationRequired
-            ? withAuthVerification(emailAuth, { required: true, url: emailAuth.verificationUrl })
-            : emailAuth;
+        const auth = switchedAccount
+          ? withAuthVerification({ ...emailAuth, status: "unknown" as const }, undefined)
+          : clearVerification
+            ? withAuthVerification(emailAuth, undefined)
+            : verificationRequired
+              ? withAuthVerification(emailAuth, { required: true, url: emailAuth.verificationUrl })
+              : emailAuth;
         const authenticated = auth.status === "authenticated";
         const verificationMessage =
           state.draft.status === "warning" &&
@@ -472,6 +488,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
                 : authUncheckedMessage);
         const checked: AntigravityProviderState = {
           ...state,
+          authRevision: switchedAccount ? state.authRevision + 1 : state.authRevision,
           verificationRequired,
           draft: {
             ...draft,
@@ -488,7 +505,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
                   : "warning",
             checkedAt: updatedAt,
             usageLimits: missingInstallation || switchedAccount ? undefined : draft.usageLimits,
-            ...(missingInstallation
+            ...(missingInstallation || switchedAccount
               ? {
                   models: [],
                   slashCommands: [],
@@ -496,21 +513,24 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
                   workspaceSnapshots: [],
                   supportsTextGeneration: false,
                 }
-              : {}),
-            ...(initialized !== undefined
-              ? {
-                  supportsTextGeneration:
-                    supportsTextGeneration && auth.status !== "unauthenticated",
-                }
-              : {}),
+              : initialized !== undefined
+                ? {
+                    supportsTextGeneration:
+                      supportsTextGeneration && auth.status !== "unauthenticated",
+                  }
+                : {}),
             ...(message ? { message } : {}),
           },
         };
         return [{ next: checked, switchedAccount, authChanged: false }, checked];
       },
     );
-    if (switchedAccount) yield* resetUsage;
-    if (initialized !== undefined && !authChanged) {
+    if (switchedAccount) {
+      discoveredSkills.clear();
+      thinkingLevels.clear();
+      yield* resetUsage;
+    }
+    if (initialized !== undefined && !authChanged && next.draft.auth.status !== "unauthenticated") {
       yield* refreshUsage();
     }
     return yield* options.stampIdentity(next.draft);
@@ -543,105 +563,139 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     cwd?: string,
   ) {
     if (!settings.enabled) return;
-    observeThinkingLevels(started.sessionSetupResult.configOptions);
     const before = yield* SubscriptionRef.get(metadata);
     const supportsTextGeneration = yield* options.supportsTextGeneration;
     const accountEmail = options.readAccountEmail ? yield* options.readAccountEmail : undefined;
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
-    const { shouldRefreshUsage, switchedAccount, wasUnauthenticated } =
-      yield* SubscriptionRef.modify(metadata, (state) => {
-        if (
-          state.authRevision !== before.authRevision &&
-          state.draft.auth.status === "unauthenticated"
-        ) {
-          return [
-            { shouldRefreshUsage: false, switchedAccount: false, wasUnauthenticated: false },
-            state,
-          ] as const;
-        }
-        const { message: previousMessage, ...draft } = state.draft;
-        const wasUnauthenticated = draft.auth.status === "unauthenticated";
-        const email =
-          state.authRevision === before.authRevision
-            ? (accountEmail ?? state.draft.auth.email)
-            : state.draft.auth.email;
-        const switchedAccount = isDifferentEmail(draft.auth.email, email);
-        const preserveVerification =
-          !switchedAccount &&
-          !wasUnauthenticated &&
-          (state.verificationRequired ||
-            draft.auth.verificationRequired === true ||
-            draft.auth.verificationUrl !== undefined);
-        const verificationUrl = preserveVerification ? draft.auth.verificationUrl : undefined;
-        const verificationMessage =
-          state.draft.status === "warning" &&
-          previousMessage &&
-          previousMessage !== authUncheckedMessage &&
-          previousMessage !== signInMessage &&
-          previousMessage !== "Checking Antigravity availability."
-            ? previousMessage
-            : ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
-        const workspaces = draft.workspaceSnapshots ?? [];
-        const workspace = cwd ? workspaces.find((entry) => entry.cwd === cwd) : undefined;
-        const nextUsageLimits = switchedAccount ? undefined : draft.usageLimits;
-        return [
+    const { aborted, shouldRefreshUsage, switchedAccount, wasUnauthenticated } =
+      yield* SubscriptionRef.modify(
+        metadata,
+        (
+          state,
+        ): readonly [
           {
-            shouldRefreshUsage:
-              preserveVerification ||
-              wasUnauthenticated ||
-              !nextUsageLimits ||
-              Boolean(nextUsageLimits.unavailable),
-            switchedAccount,
-            wasUnauthenticated,
+            readonly aborted: boolean;
+            readonly shouldRefreshUsage: boolean;
+            readonly switchedAccount: boolean;
+            readonly wasUnauthenticated: boolean;
           },
-          {
-            authRevision: state.authRevision + 1,
-            verificationRequired: preserveVerification,
-            draft: {
-              ...draft,
-              installed: true,
-              status: preserveVerification ? "warning" : "ready",
-              ...(preserveVerification ? { message: verificationMessage } : {}),
-              version: started.initializeResult.agentInfo?.version || draft.version,
-              auth: withAuthVerification(
-                withAuthEmail(
-                  {
-                    status: "authenticated",
-                    type: options.auth?.type ?? "oauth-personal",
-                    label: options.auth?.label ?? "Google account",
-                  },
-                  email,
-                ),
-                preserveVerification ? { required: true, url: verificationUrl } : undefined,
-              ),
-              usageLimits: nextUsageLimits,
-              checkedAt: updatedAt,
-              models: buildAntigravityModelsFromSession(started.sessionSetupResult, thinkingLevels),
-              supportsTextGeneration,
-              ...(cwd
-                ? {
-                    workspaceSnapshots: [
-                      ...workspaces.filter((entry) => entry.cwd !== cwd),
-                      {
-                        cwd,
-                        checkedAt: updatedAt,
-                        slashCommands: workspace?.slashCommands ?? draft.slashCommands,
-                        skills: workspace?.skills ?? discoveredSkills.get(cwd) ?? [],
-                      },
-                    ].slice(-MAX_WORKSPACE_SNAPSHOTS),
-                  }
-                : {}),
+          AntigravityProviderState,
+        ] => {
+          if (
+            state.authRevision !== before.authRevision &&
+            state.draft.auth.status === "unauthenticated"
+          ) {
+            return [
+              {
+                aborted: true,
+                shouldRefreshUsage: false,
+                switchedAccount: false,
+                wasUnauthenticated: false,
+              },
+              state,
+            ] as const;
+          }
+          const { message: previousMessage, ...draft } = state.draft;
+          const wasUnauthenticated = draft.auth.status === "unauthenticated";
+          const email =
+            state.authRevision === before.authRevision
+              ? (accountEmail ?? state.draft.auth.email)
+              : state.draft.auth.email;
+          const switchedAccount = isDifferentEmail(draft.auth.email, email);
+          const accountChanged = switchedAccount || wasUnauthenticated;
+          const preserveVerification =
+            !accountChanged &&
+            (state.verificationRequired ||
+              draft.auth.verificationRequired === true ||
+              draft.auth.verificationUrl !== undefined);
+          const verificationUrl = preserveVerification ? draft.auth.verificationUrl : undefined;
+          const verificationMessage =
+            state.draft.status === "warning" &&
+            previousMessage &&
+            previousMessage !== authUncheckedMessage &&
+            previousMessage !== signInMessage &&
+            previousMessage !== "Checking Antigravity availability."
+              ? previousMessage
+              : ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
+          const workspaces = accountChanged ? [] : (draft.workspaceSnapshots ?? []);
+          const workspace = cwd ? workspaces.find((entry) => entry.cwd === cwd) : undefined;
+          const nextUsageLimits = accountChanged ? undefined : draft.usageLimits;
+          return [
+            {
+              aborted: false,
+              shouldRefreshUsage:
+                preserveVerification ||
+                wasUnauthenticated ||
+                !nextUsageLimits ||
+                Boolean(nextUsageLimits.unavailable),
+              switchedAccount,
+              wasUnauthenticated,
             },
-          } satisfies AntigravityProviderState,
-        ] as const;
-      });
+            {
+              authRevision: accountChanged ? state.authRevision + 1 : state.authRevision,
+              verificationRequired: preserveVerification,
+              draft: {
+                ...draft,
+                installed: true,
+                status: preserveVerification ? "warning" : "ready",
+                ...(preserveVerification ? { message: verificationMessage } : {}),
+                version: started.initializeResult.agentInfo?.version || draft.version,
+                auth: withAuthVerification(
+                  withAuthEmail(
+                    {
+                      status: "authenticated",
+                      type: options.auth?.type ?? "oauth-personal",
+                      label: options.auth?.label ?? "Google account",
+                    },
+                    email,
+                  ),
+                  preserveVerification ? { required: true, url: verificationUrl } : undefined,
+                ),
+                usageLimits: nextUsageLimits,
+                checkedAt: updatedAt,
+                models: buildAntigravityModelsFromSession(
+                  started.sessionSetupResult,
+                  accountChanged ? new Map() : thinkingLevels,
+                ),
+                supportsTextGeneration,
+                ...(accountChanged ? { slashCommands: [], skills: [] } : {}),
+                ...(cwd
+                  ? {
+                      workspaceSnapshots: [
+                        ...workspaces.filter((entry) => entry.cwd !== cwd),
+                        {
+                          cwd,
+                          checkedAt: updatedAt,
+                          slashCommands: accountChanged
+                            ? []
+                            : (workspace?.slashCommands ?? draft.slashCommands),
+                          skills: accountChanged
+                            ? []
+                            : (workspace?.skills ?? discoveredSkills.get(cwd) ?? []),
+                        },
+                      ].slice(-MAX_WORKSPACE_SNAPSHOTS),
+                    }
+                  : accountChanged
+                    ? { workspaceSnapshots: [] }
+                    : {}),
+              },
+            } satisfies AntigravityProviderState,
+          ] as const;
+        },
+      );
+    if (switchedAccount || wasUnauthenticated) {
+      discoveredSkills.clear();
+      thinkingLevels.clear();
+    }
+    if (!aborted) {
+      observeThinkingLevels(started.sessionSetupResult.configOptions);
+    }
     if (switchedAccount || wasUnauthenticated) {
       yield* resetUsage;
-    }
-    if (switchedAccount) {
       yield* Deferred.await(republish).pipe(
         Effect.flatten,
         Effect.provideService(PublishingUsage, true),
+        Effect.ignoreCause({ log: true }),
       );
     }
     if (shouldRefreshUsage) yield* refreshUsage();
@@ -764,6 +818,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     );
     discoveredSkills.clear();
     thinkingLevels.clear();
+    // Fork so sign-out cannot deadlock if an in-flight health check holds managedProvider's lock.
+    yield* Deferred.await(republish).pipe(
+      Effect.flatten,
+      Effect.provideService(PublishingUsage, true),
+      Effect.ignoreCause({ log: true }),
+      Effect.forkIn(scope),
+    );
   });
 
   const snapshotForCwd = Effect.fn("AntigravityProvider.snapshotForCwd")(function* (

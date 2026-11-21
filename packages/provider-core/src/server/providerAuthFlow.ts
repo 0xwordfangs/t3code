@@ -469,7 +469,7 @@ export const make = Effect.fn("ProviderAuthFlow.make")(function* (options: {
       operation = "idle";
       return snapshot.value.state;
     }, Effect.uninterruptible),
-    logout: Effect.fn("providerAuthFlow.logout")(function* (stopSessions) {
+    logout: Effect.fn("providerAuthFlow.logout")(function* (stopSessions, actorSessionId) {
       const flow = yield* lock.withPermit(
         Effect.gen(function* () {
           if (operation !== "idle" && operation !== "auth")
@@ -477,6 +477,16 @@ export const make = Effect.fn("ProviderAuthFlow.make")(function* (options: {
               instanceId: options.instanceId,
               operation: "logout",
               detail: "Provider setup is already stopping.",
+            });
+          if (
+            active !== undefined &&
+            (actorSessionId === undefined || active.owner !== actorSessionId)
+          )
+            return yield* new ProviderSetupError({
+              instanceId: options.instanceId,
+              operation: "logout",
+              detail:
+                "Another session is currently signing in. Wait for it to finish or cancel it from that session before signing out.",
             });
           operation = "stopping";
           const flow = active;

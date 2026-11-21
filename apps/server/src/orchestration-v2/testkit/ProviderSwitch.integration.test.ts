@@ -134,6 +134,7 @@ function makeTestAdapter(input: {
   readonly backgroundTasksEndWithProcess?: true;
   readonly backgroundWork?: Ref.Ref<boolean>;
   readonly closedSessions?: Ref.Ref<ReadonlyArray<string>>;
+  readonly sessionClosed?: Deferred.Deferred<string>;
   /** Like ACP: opening resumes the initial native id, and forcing a new thread restarts the runtime. */
   readonly runtimeStarts?: Ref.Ref<ReadonlyArray<string>>;
   // ACP cannot truncate, so its rollback answers with a fresh, empty native session.
@@ -156,8 +157,17 @@ function makeTestAdapter(input: {
         }
         if (input.closedSessions !== undefined) {
           const closedSessions = input.closedSessions;
+          const sessionClosed = input.sessionClosed;
           yield* Effect.addFinalizer(() =>
-            Ref.update(closedSessions, (ids) => [...ids, sessionInput.providerSessionId]),
+            Ref.update(closedSessions, (ids) => [...ids, sessionInput.providerSessionId]).pipe(
+              Effect.tap(() =>
+                sessionClosed === undefined
+                  ? Effect.void
+                  : Deferred.succeed(sessionClosed, sessionInput.providerSessionId).pipe(
+                      Effect.asVoid,
+                    ),
+              ),
+            ),
           );
         }
         const now = yield* DateTime.now;
@@ -4035,6 +4045,137 @@ describe("orchestration v2 provider switching", () => {
         ),
       );
     }),
+  );
+
+  it.live(
+    "rejects runtime mode changes during an active turn or background work and detaches an idle non-switchable session",
+    () =>
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("runtime-mode-active-and-detach");
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const backgroundWork = yield* Ref.make(false);
+        const closedSessions = yield* Ref.make<ReadonlyArray<string>>([]);
+        const sessionClosed = yield* Deferred.make<string>();
+        const firstStarted = yield* Deferred.make<void>();
+        const releaseFirst = yield* Deferred.make<void>();
+        const antigravityDriver = ProviderDriverKind.make("antigravity");
+        const antigravitySelection: ModelSelection = {
+          instanceId: ProviderInstanceId.make("antigravity-runtime-mode-test"),
+          model: "gemini-test",
+        };
+        const antigravityCapabilities: OrchestrationV2ProviderCapabilities = {
+          ...AcpProviderCapabilitiesV2,
+          sessions: {
+            ...AcpProviderCapabilitiesV2.sessions,
+            supportsModelSwitchInSession: true,
+            supportsRuntimeModeSwitchInSession: false,
+          },
+        };
+        const testThreadId = ThreadId.make("thread:runtime-mode-active-and-detach");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("command:runtime-mode-active:create"),
+            threadId: testThreadId,
+            projectId: ProjectId.make("project:runtime-mode-active"),
+            title: "Runtime mode active and detach",
+            modelSelection: antigravitySelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("command:runtime-mode-active:send"),
+            threadId: testThreadId,
+            messageId: MessageId.make("message:runtime-mode-active:send"),
+            text: "Start turn",
+            attachments: [],
+            modelSelection: antigravitySelection,
+            dispatchMode: { type: "start_immediately" },
+          });
+          yield* Deferred.await(firstStarted);
+
+          const activeReject = yield* orchestrator
+            .dispatch({
+              type: "thread.runtime-mode.set",
+              commandId: CommandId.make("command:runtime-mode-active:while-running"),
+              threadId: testThreadId,
+              runtimeMode: "approval-required",
+            })
+            .pipe(Effect.flip);
+          assert.equal(activeReject._tag, "OrchestratorDispatchError");
+          assert.deepEqual(yield* Ref.get(closedSessions), []);
+
+          yield* Deferred.succeed(releaseFirst, undefined);
+          yield* worker.drain();
+          const afterTurn = yield* waitForIdle(testThreadId);
+          const session = afterTurn.providerSessions[0];
+          assert.equal(session?.status, "ready");
+          assert.equal(afterTurn.thread.runtimeMode, "full-access");
+
+          yield* Ref.set(backgroundWork, true);
+          const bgReject = yield* orchestrator
+            .dispatch({
+              type: "thread.runtime-mode.set",
+              commandId: CommandId.make("command:runtime-mode-active:while-bg"),
+              threadId: testThreadId,
+              runtimeMode: "approval-required",
+            })
+            .pipe(Effect.flip);
+          assert.equal(bgReject._tag, "OrchestratorDispatchError");
+          assert.deepEqual(yield* Ref.get(closedSessions), []);
+
+          yield* Ref.set(backgroundWork, false);
+          yield* orchestrator.dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make("command:runtime-mode-active:while-idle"),
+            threadId: testThreadId,
+            runtimeMode: "approval-required",
+          });
+          yield* worker.drain();
+          assert.equal(yield* Deferred.await(sessionClosed), session!.id);
+          const detachedEvent = yield* orchestrator
+            .streamStoredEventsFrom({
+              threadId: testThreadId,
+              afterSequence: 0,
+              eventType: "provider-session.detached",
+            })
+            .pipe(Stream.runHead);
+          assert.equal(detachedEvent._tag, "Some");
+          const afterDetach = yield* orchestrator.getThreadProjection(testThreadId);
+          assert.equal(afterDetach.thread.runtimeMode, "approval-required");
+          assert.deepEqual(yield* Ref.get(closedSessions), [session!.id]);
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              { name: "runtime-mode-active-and-detach" },
+              ProviderAdapterRegistry.layerFromAdapters([
+                makeTestAdapter({
+                  instanceId: antigravitySelection.instanceId,
+                  driver: antigravityDriver,
+                  capabilities: antigravityCapabilities,
+                  modelSelection: antigravitySelection,
+                  responseByRunOrdinal: { 1: "Turn completed" },
+                  capturedTurns,
+                  holdFirstTurn: firstStarted,
+                  releaseFirstTurn: releaseFirst,
+                  backgroundWork,
+                  closedSessions,
+                  sessionClosed,
+                }),
+              ]),
+            ),
+          ),
+        );
+      }),
   );
 
   // regression: a session kept by a queued hand-off is probed when a later change detaches it

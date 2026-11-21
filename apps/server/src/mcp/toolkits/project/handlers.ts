@@ -13,6 +13,7 @@ import * as Hex from "effect/encoding/Hex";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as AntigravityFailover from "../../../orchestration-v2/AntigravityFailover.ts";
 import { OrchestratorRuntimeModeAboveCeilingError } from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
@@ -366,6 +367,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           // Kept only alongside linkOrigin: thread.create drops it otherwise.
           ...(input.delegatedFrom === undefined ? {} : { delegatedFrom: input.delegatedFrom }),
         }).pipe(
+          Effect.provideService(
+            AntigravityFailover.SuppressAntigravityPreflight,
+            input.modelSelection !== undefined,
+          ),
           Effect.mapError((error) => {
             if (error._tag === "AttachmentClaimError") {
               return new OrchestratorMcpFailure({

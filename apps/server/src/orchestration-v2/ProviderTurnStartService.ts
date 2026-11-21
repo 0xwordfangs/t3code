@@ -635,18 +635,26 @@ export const layer: Layer.Layer<
             providerThread.id,
         );
         const authInstanceId = nativeThread?.providerInstanceId ?? run.providerInstanceId;
-        const authResult = isEmptyCompaction
-          ? null
-          : yield* Effect.result(
-              providerAuth.tryHandlePromptCommand({
-                instanceId: authInstanceId,
-                text: projectComposerContextForProvider({
-                  text: providerMessage.text,
-                  records: providerMessage.context?.records ?? [],
+        const mayRunProviderAuthPrompt =
+          providerMessage.createdBy === "user" &&
+          providerMessage.creationSource !== "mcp" &&
+          providerMessage.creationSource !== "server" &&
+          providerMessage.creationSource !== "provider" &&
+          providerMessage.scheduledTaskId === undefined &&
+          providerMessage.context?.guest === undefined;
+        const authResult =
+          isEmptyCompaction || !mayRunProviderAuthPrompt
+            ? null
+            : yield* Effect.result(
+                providerAuth.tryHandlePromptCommand({
+                  instanceId: authInstanceId,
+                  text: projectComposerContextForProvider({
+                    text: providerMessage.text,
+                    records: providerMessage.context?.records ?? [],
+                  }),
+                  hasAttachments: false,
                 }),
-                hasAttachments: false,
-              }),
-            );
+              );
         if (isEmptyCompaction || authResult?._tag === "Failure" || authResult?.success) {
           const now = yield* DateTime.now;
           const failure = isEmptyCompaction

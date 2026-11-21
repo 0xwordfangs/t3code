@@ -12,6 +12,7 @@ import {
   type OrchestrationV2ProviderFailure,
 } from "@t3tools/contracts";
 
+import { extractAntigravityVerificationFromText } from "../antigravityVerification.ts";
 import {
   classifyAntigravityPromptFailure,
   watchAntigravityPromptOutcome,
@@ -461,5 +462,148 @@ describe("classifyAntigravityPromptFailure", () => {
     );
     assert.equal(http429.class, "usage_limit");
     assert.equal(http429.retryable, true);
+  });
+
+  it("bounds verification scanning while extracting valid JSON nested inside unclosed wrappers", () => {
+    const adversarial = `VALIDATION_REQUIRED ${'{"error":'.repeat(8_000)}`;
+    const fallback = extractAntigravityVerificationFromText(adversarial);
+    assert.deepEqual(fallback, {
+      message: "Verify your Google account to continue using Antigravity.",
+    });
+
+    const nestedUrl =
+      "https://accounts.google.com/v3/signin/continue?plt=nested-1&continue=https%3A%2F%2Fantigravity.google%2F";
+    const innerJson = JSON.stringify({
+      error: {
+        code: 403,
+        status: "PERMISSION_DENIED",
+        details: [
+          {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            reason: "VALIDATION_REQUIRED",
+            metadata: {
+              validation_url: nestedUrl,
+              validation_error_message: "Nested verification prompt.",
+            },
+          },
+        ],
+      },
+    });
+    const unclosedOuter = `{"error": {"unclosed": ${innerJson}`;
+    const extracted = extractAntigravityVerificationFromText(unclosedOuter);
+    assert.deepEqual(extracted, {
+      message: "Nested verification prompt.",
+      verificationUrl: GoogleAccountVerificationUrl.make(nestedUrl),
+    });
+  });
+
+  it("bounds oversized AcpRequestError.data scanning, serialization, and repeated API_ERROR segments", () => {
+    // Early-stops string candidate scanning once verificationUrl is found without reading later fields.
+    const validUrl =
+      "https://accounts.google.com/v3/signin/continue?plt=early-stop&continue=https%3A%2F%2Fantigravity.google%2F";
+    const earlyReads: Record<string, number> = {};
+    const earlyStopData: Record<string, unknown> = {};
+    Object.defineProperty(earlyStopData, "first", {
+      enumerable: true,
+      get() {
+        earlyReads.first = (earlyReads.first ?? 0) + 1;
+        return JSON.stringify({
+          error: {
+            code: 403,
+            details: [
+              {
+                reason: "VALIDATION_REQUIRED",
+                metadata: { validation_url: validUrl },
+              },
+            ],
+          },
+        });
+      },
+    });
+    for (let index = 0; index < 20; index++) {
+      const key = `extra_${index}`;
+      Object.defineProperty(earlyStopData, key, {
+        enumerable: true,
+        get() {
+          earlyReads[key] = (earlyReads[key] ?? 0) + 1;
+          return "unused";
+        },
+      });
+    }
+    const earlyResult = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Permission denied",
+        data: earlyStopData,
+      }),
+    );
+    assert.equal(earlyResult.class, "permission_error");
+    assert.equal(earlyResult.code, "VALIDATION_REQUIRED");
+    assert.equal(earlyResult.verificationUrl, validUrl);
+    assert.equal(earlyReads.first, 1);
+    assert.isUndefined(earlyReads.extra_0);
+
+    // Caps candidate string scans, serializes cause.data at most once, and stops at the byte budget.
+    const largeReads: Record<string, number> = {};
+    const hugeData: Record<string, unknown> = {};
+    const chunk = "x".repeat(4_096);
+    for (let index = 0; index < 40; index++) {
+      const key = `field_${index}`;
+      Object.defineProperty(hugeData, key, {
+        enumerable: true,
+        get() {
+          largeReads[key] = (largeReads[key] ?? 0) + 1;
+          return index === 0 ? `HTTP 429 ${chunk}` : chunk;
+        },
+      });
+    }
+    const largeResult = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Request failed",
+        data: hugeData,
+      }),
+    );
+    assert.equal(largeResult.class, "usage_limit");
+    assert.equal(largeResult.retryable, true);
+    // Field 0 is inspected once as a verification candidate and once during the single bounded serialization.
+    assert.equal(largeReads.field_0, 2);
+    // Fields well past the 8-candidate and 32 KiB serialization budget are never touched.
+    assert.isUndefined(largeReads.field_20);
+    assert.isUndefined(largeReads.field_39);
+
+    // Repeated `Error 429, Message: ` segments without a closing Status classify cleanly with bounded message.
+    const repeatedSegments = "Error 429, Message: ".repeat(1_500);
+    const repeatedResult = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `${repeatedSegments}Quota exhausted`,
+      }),
+    );
+    assert.equal(repeatedResult.class, "usage_limit");
+    assert.equal(repeatedResult.retryable, true);
+    assert.isAtMost(repeatedResult.message.length, 32_768);
+
+    // Oversized message before `, Status: ` does not match past the 4096-char regex cap.
+    const overlongApiMessage = `Error 500, Message: ${"a".repeat(5_000)}, Status: INTERNAL`;
+    const overlongResult = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: overlongApiMessage,
+      }),
+    );
+    assert.equal(overlongResult.class, "provider_error");
+    assert.equal(overlongResult.code, "-32603");
+
+    // A 40 KiB errorMessage does not truncate cause.data out of combined classification.
+    const longMessageWithQuotaData = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "z".repeat(40_000),
+        data: { details: "Error 429, Message: Quota exhausted, Status: RESOURCE_EXHAUSTED" },
+      }),
+    );
+    assert.equal(longMessageWithQuotaData.class, "usage_limit");
+    assert.equal(longMessageWithQuotaData.retryable, true);
   });
 });

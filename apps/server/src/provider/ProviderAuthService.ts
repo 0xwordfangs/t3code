@@ -56,6 +56,7 @@ export class ProviderAuthService extends Context.Service<
     ) => Effect.Effect<ProviderAuthState, ProviderSetupError>;
     readonly logout: (
       input: ProviderAuthTarget,
+      actorSessionId?: string,
     ) => Effect.Effect<ProviderAuthState, ProviderSetupError>;
     readonly subscribe: (
       input: ProviderAuthTarget,
@@ -275,12 +276,15 @@ export const makeProviderAuthService = Effect.gen(function* () {
         }),
       );
     }),
-    logout: Effect.fn("ProviderAuthService.logout")(function* (input) {
+    logout: Effect.fn("ProviderAuthService.logout")(function* (input, actorSessionId) {
       return yield* credentialChanges.withPermit(
         Effect.gen(function* () {
           const auth = yield* getController(input.instanceId, "logout");
           yield* checkSharedBinding(input.instanceId, "logout", auth);
-          return yield* auth.logout(stopSessions(input.instanceId, auth.credentialBinding));
+          return yield* auth.logout(
+            stopSessions(input.instanceId, auth.credentialBinding),
+            actorSessionId,
+          );
         }),
       );
     }),

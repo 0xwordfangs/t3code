@@ -567,6 +567,49 @@ it.effect("handoff analytics read only the caller's active run and its message",
   );
 });
 
+it.effect("t3_queue edit rejects rewriting a queued message to /logout", () => {
+  const dispatched: Array<unknown> = [];
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    for (const text of ["/logout", " /LOGOUT \n"]) {
+      const result = yield* server
+        .callTool({
+          name: "t3_queue",
+          arguments: { action: "edit", queuedRunId: "run:queued", text },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(result.isError).toBe(true);
+      expect(declaredFailure(result)).toMatchObject({
+        code: "invalid_request",
+      });
+    }
+    expect(dispatched).toEqual([]);
+  }).pipe(
+    Effect.provide(
+      layerThreadToolkit.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+            getProjectThreadRecords: ({ threadId: id }) =>
+              Effect.succeed(
+                McpToolAccessTestkit.idleThreadProjection(McpToolAccessTestkit.liveThreadShell(id)),
+              ),
+            dispatch: (command) => {
+              dispatched.push(command);
+              return Effect.succeed({ sequence: 1 } as never);
+            },
+          }),
+        ),
+      ),
+    ),
+  );
+});
+
 it.effect("rejects an unknown organize target instead of archiving the calling thread", () => {
   const dispatched: Array<unknown> = [];
   return Effect.gen(function* () {

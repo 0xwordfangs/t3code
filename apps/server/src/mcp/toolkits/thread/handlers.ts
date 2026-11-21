@@ -324,6 +324,12 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         switch (input.action) {
           case "edit": {
             const text = yield* required(input.text, "text");
+            if (text.trim().toLowerCase() === "/logout") {
+              return yield* new OrchestratorMcpFailure({
+                code: "invalid_request",
+                message: "Queued messages cannot be edited to `/logout`.",
+              });
+            }
             return yield* dispatch(input.threadId, (common) => ({
               ...common,
               type: "queued-run.edit",

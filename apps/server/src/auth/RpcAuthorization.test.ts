@@ -5,10 +5,15 @@ import {
   AuthProvidersManageScope,
   AuthSettingsWriteScope,
   AuthAccessWriteScope,
+  ChatAttachmentId,
+  CommandId,
   DEFAULT_SERVER_SETTINGS,
+  MessageId,
+  ORCHESTRATION_V2_WS_METHODS,
   ProviderDriverKind,
   ProviderInstanceId,
   ProjectId,
+  RunId,
   IssueTrackerKind,
   SecretProviderId,
   ThreadId,
@@ -606,3 +611,149 @@ it.effect("denies manual cleanup before the handler without settings permission"
     expect(handled).toBe(false);
   }),
 );
+
+describe("logout prompt authorization", () => {
+  const tested = [
+    ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+    ORCHESTRATION_V2_WS_METHODS.launchThread,
+  ] as const;
+  const group = WsRpcGroup.omit(
+    ...[...WsRpcGroup.requests.keys()].filter(
+      (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof tested)[number]> =>
+        !(tested as ReadonlyArray<string>).includes(tag),
+    ),
+  );
+  const threadId = ThreadId.make("thread-logout-auth");
+  const projectId = ProjectId.make("project-logout-auth");
+  const commandId = CommandId.make("cmd-logout-auth");
+  const messageId = MessageId.make("msg-logout-auth");
+  const runId = RunId.make("run-logout-auth");
+  const modelSelection = {
+    instanceId: ProviderInstanceId.make("antigravity"),
+    model: "gemini-2.5-pro",
+  };
+  const attachment = {
+    type: "file" as const,
+    id: ChatAttachmentId.make("att-1"),
+    name: "notes.txt",
+    mimeType: "text/plain",
+    sizeBytes: 12,
+  };
+
+  it.effect(
+    "requires providers:manage for /logout prompts across dispatchCommand and launchThread",
+    () =>
+      Effect.gen(function* () {
+        let handled = 0;
+        const handlers = Layer.mergeAll(
+          group.toLayerHandler(ORCHESTRATION_V2_WS_METHODS.dispatchCommand, () =>
+            Effect.sync(() => {
+              handled += 1;
+              return { sequence: handled };
+            }),
+          ),
+          group.toLayerHandler(ORCHESTRATION_V2_WS_METHODS.launchThread, () =>
+            Effect.sync(() => {
+              handled += 1;
+              return { threadId, projection: {} as never, resumed: false, sequence: handled };
+            }),
+          ),
+        );
+        const operator = yield* RpcTest.makeClient(group).pipe(
+          Effect.provide(
+            Layer.merge(handlers, RpcAuthorization.layer([AuthOrchestrationOperateScope])),
+          ),
+        );
+        const manager = yield* RpcTest.makeClient(group).pipe(
+          Effect.provide(
+            Layer.merge(
+              handlers,
+              RpcAuthorization.layer([AuthOrchestrationOperateScope, AuthProvidersManageScope]),
+            ),
+          ),
+        );
+
+        const dispatchMessage = (text: string, attachments: Array<typeof attachment> = []) => ({
+          type: "message.dispatch" as const,
+          commandId,
+          threadId,
+          messageId,
+          text,
+          attachments,
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+          dispatchMode: { type: "start_immediately" as const },
+        });
+        const editQueued = (text: string, attachments?: Array<typeof attachment>) => ({
+          type: "queued-run.edit" as const,
+          commandId,
+          threadId,
+          runId,
+          text,
+          ...(attachments === undefined ? {} : { attachments }),
+        });
+        const updateContinuation = (text: string) => ({
+          type: "thread.metadata.update" as const,
+          commandId,
+          threadId,
+          continuation: { messageId, text },
+        });
+        const launch = (text: string, attachments: Array<typeof attachment> = []) => ({
+          commandId,
+          projectId,
+          title: "New thread",
+          modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          workspaceStrategy: { type: "root" as const },
+          initialMessage: { messageId, text, attachments },
+        });
+
+        // Ordinary prompts and /logout with attachments still need only orchestration:operate.
+        yield* operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](dispatchMessage("hello"));
+        yield* operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](
+          dispatchMessage("/logout", [attachment]),
+        );
+        yield* operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](editQueued("updated"));
+        yield* operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](
+          editQueued("/logout", [attachment]),
+        );
+        yield* operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](
+          updateContinuation("continue"),
+        );
+        yield* operator[ORCHESTRATION_V2_WS_METHODS.launchThread](launch("hello"));
+        expect(handled).toBe(6);
+
+        const protectedDispatches = [
+          dispatchMessage("/logout"),
+          dispatchMessage("  /LOGOUT \n"),
+          editQueued("/logout"),
+          editQueued(" /Logout ", []),
+          updateContinuation(" /logout "),
+        ] as const;
+        for (const payload of protectedDispatches) {
+          expect(
+            yield* operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](payload).pipe(Effect.flip),
+          ).toMatchObject({
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthProvidersManageScope,
+          });
+        }
+        expect(
+          yield* operator[ORCHESTRATION_V2_WS_METHODS.launchThread](launch(" /LOGOUT ")).pipe(
+            Effect.flip,
+          ),
+        ).toMatchObject({
+          _tag: "EnvironmentAuthorizationError",
+          requiredPermission: AuthProvidersManageScope,
+        });
+        expect(handled).toBe(6);
+
+        for (const payload of protectedDispatches) {
+          yield* manager[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](payload);
+        }
+        yield* manager[ORCHESTRATION_V2_WS_METHODS.launchThread](launch(" /LOGOUT "));
+        expect(handled).toBe(12);
+      }),
+  );
+});

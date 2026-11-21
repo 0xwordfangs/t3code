@@ -4554,6 +4554,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.type !== "thread.settle" &&
       liveSessions.length > 0
     ) {
+      if (command.type === "thread.runtime-mode.set") {
+        const projection = yield* loadProjectionForCommand(command, ["runs"], {
+          turnItemTypes: [],
+        });
+        if (projection.runs.some(isActiveRun)) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause:
+              "The current session is still running an active turn, and this change would end it. Wait for it to finish, or press Stop, then try again.",
+          });
+        }
+      }
       // The provider context holds only the active and target provider threads; a session kept
       // busy by an earlier queued hand-off owns neither, so probe every thread of this one.
       const { providerThreads } = yield* projectionStore

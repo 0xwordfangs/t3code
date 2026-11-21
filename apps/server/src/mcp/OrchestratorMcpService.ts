@@ -1575,6 +1575,8 @@ const make = Effect.gen(function* () {
     readonly optionBaseline?: ReadonlyArray<ProviderOptionSelection> | undefined;
     /** Receipt replays bypass current settings because they start no work. Dispatch must reuse the checked command ID. */
     readonly skipProjectEnablementFilter?: boolean;
+    /** Caller-pinned provider instances must not be rewritten by Antigravity pre-flight failover. */
+    readonly explicitProviderInstanceId?: boolean;
   }): Effect.fn.Return<ResolvedTarget, OrchestratorMcpFailure> {
     const requestedInstanceId = input.target?.providerInstanceId;
     const requestedDriver = input.target?.driverKind;
@@ -1718,7 +1720,11 @@ const make = Effect.gen(function* () {
       ...(options === undefined ? {} : { options }),
     };
     let supportedRuntimeModes = provider.supportedRuntimeModes;
-    if (provider.driver === "antigravity" && input.skipProjectEnablementFilter !== true) {
+    if (
+      provider.driver === "antigravity" &&
+      input.skipProjectEnablementFilter !== true &&
+      input.explicitProviderInstanceId !== true
+    ) {
       const preflight = yield* antigravityFailover.preflightSelection({
         projectId: input.parent.thread.projectId,
         selection: resolvedSelection,
@@ -2808,8 +2814,9 @@ const make = Effect.gen(function* () {
       const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
       // An explicit provider/model target wins. Options alone refine the configured
       // role selection, whose provider/model and option baseline still apply.
+      const explicitProviderInstanceId = input.target?.providerInstanceId !== undefined;
       const hasExplicitModelTarget =
-        input.target?.providerInstanceId !== undefined ||
+        explicitProviderInstanceId ||
         input.target?.driverKind !== undefined ||
         input.target?.model !== undefined;
       let roleTarget = input.target;
@@ -2883,6 +2890,7 @@ const make = Effect.gen(function* () {
         parent,
         target: roleTarget,
         providers,
+        explicitProviderInstanceId,
         ...(optionBaseline === undefined ? {} : { optionBaseline }),
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
@@ -2961,6 +2969,10 @@ const make = Effect.gen(function* () {
           completionWake: input.mode === "wait" ? "settled_only" : "always",
         })
         .pipe(
+          Effect.provideService(
+            AntigravityFailover.SuppressAntigravityPreflight,
+            explicitProviderInstanceId,
+          ),
           Effect.mapError((error) =>
             error._tag === "ThreadManagementProviderInstanceDisabledError"
               ? threadManagementFailure(error)
@@ -3259,6 +3271,7 @@ const make = Effect.gen(function* () {
                     .getThreadShell(threadId)
                     .pipe(Effect.mapError(threadManagementFailure))
                 : null;
+              const explicitProviderInstanceId = request.target?.providerInstanceId !== undefined;
               const target = yield* resolveTargetRechecking({
                 parent,
                 target:
@@ -3269,6 +3282,7 @@ const make = Effect.gen(function* () {
                         providerInstanceId: committedThread.modelSelection.instanceId,
                       },
                 providers,
+                explicitProviderInstanceId,
                 skipProjectEnablementFilter: isRetryOfAcceptedCreation,
               });
               const runtimeMode = yield* resolveRuntimeMode(
@@ -3320,6 +3334,10 @@ const make = Effect.gen(function* () {
                   ...(initialMessage === undefined ? {} : { initialMessage }),
                 })
                 .pipe(
+                  Effect.provideService(
+                    AntigravityFailover.SuppressAntigravityPreflight,
+                    explicitProviderInstanceId,
+                  ),
                   Effect.mapError((error) =>
                     failure(
                       "orchestration_error",
@@ -3355,6 +3373,10 @@ const make = Effect.gen(function* () {
                     dispatchMode: { type: "start_immediately" },
                   })
                   .pipe(
+                    Effect.provideService(
+                      AntigravityFailover.SuppressAntigravityPreflight,
+                      explicitProviderInstanceId,
+                    ),
                     Effect.provideService(DispatchModeLimit, {
                       runtimeMode: currentParent.runtimeMode,
                       interactionMode: currentParent.interactionMode,

@@ -1997,6 +1997,219 @@ it.layer(
           assert.deepStrictEqual(afterFailure.models, []);
         }
       });
+
+      it("clears workspaceSnapshots and does not carry Account A models or usageLimits across unauthenticated to Account B", () => {
+        const accountA: ServerProvider = {
+          ...previousProvider,
+          auth: { status: "authenticated", type: "oauth-personal", email: "alice@example.com" },
+          workspaceSnapshots: [
+            {
+              cwd: "/repo-a",
+              checkedAt: "2026-09-02T00:00:00.000Z",
+              slashCommands: [{ name: "plan" }],
+              skills: [],
+            },
+          ],
+          workspaceRescannedAt: "2026-09-02T00:00:00.000Z",
+          usageLimits: {
+            checkedAt: "2026-09-02T00:00:00.000Z",
+            credentialFingerprint: "fp-alice",
+            windows: [
+              { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 50 },
+            ],
+          },
+        };
+        const unauthenticated: ServerProvider = {
+          ...previousProvider,
+          status: "warning",
+          auth: { status: "unauthenticated" },
+          checkedAt: "2026-09-02T00:01:00.000Z",
+          models: [],
+        };
+
+        const cleared = ProviderRegistry.mergeProviderSnapshot(accountA, unauthenticated);
+        assert.deepStrictEqual(cleared.models, []);
+        assert.isUndefined(cleared.workspaceSnapshots);
+        assert.isUndefined(cleared.workspaceRescannedAt);
+        assert.isUndefined(cleared.usageLimits);
+
+        const accountBProbeFailed: ServerProvider = {
+          ...previousProvider,
+          status: "warning",
+          auth: { status: "unknown", type: "oauth-personal", email: "bob@example.com" },
+          checkedAt: "2026-09-02T00:02:00.000Z",
+          models: [],
+          usageLimits: {
+            checkedAt: "2026-09-02T00:02:00.000Z",
+            windows: [],
+            unavailable: { reason: "probeFailed" },
+          },
+        };
+        const mergedB = ProviderRegistry.mergeProviderSnapshot(cleared, accountBProbeFailed);
+        assert.deepStrictEqual(mergedB.models, []);
+        assert.isUndefined(mergedB.workspaceSnapshots);
+        assert.strictEqual(mergedB.usageLimits?.unavailable?.reason, "probeFailed");
+        assert.isUndefined(mergedB.usageLimits?.credentialFingerprint);
+      });
+
+      it.effect(
+        "does not leak Antigravity Account A models, workspaceSnapshots, or usageLimits to Account B across live source updates",
+        () =>
+          Effect.gen(function* () {
+            const config = yield* ServerConfig.ServerConfig;
+            const path = yield* Path.Path;
+            const instanceId = ProviderInstanceId.make("antigravity-personal");
+            const filePath = yield* resolveProviderStatusCachePath({
+              cacheDir: config.providerStatusCacheDir,
+              instanceId,
+            }).pipe(Effect.provideService(Path.Path, path));
+            const accountA: ServerProvider = {
+              ...previousProvider,
+              auth: { status: "authenticated", type: "oauth-personal", email: "alice@example.com" },
+              workspaceSnapshots: [
+                {
+                  cwd: "/repo-a",
+                  checkedAt: "2026-09-02T00:00:00.000Z",
+                  slashCommands: [{ name: "plan" }],
+                  skills: [],
+                },
+              ],
+              usageLimits: {
+                checkedAt: "2026-09-02T00:00:00.000Z",
+                credentialFingerprint: "fp-alice",
+                windows: [
+                  { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 50 },
+                ],
+              },
+            };
+            const unauthenticated: ServerProvider = {
+              ...previousProvider,
+              status: "warning",
+              auth: { status: "unauthenticated" },
+              checkedAt: "2026-09-02T00:01:00.000Z",
+              models: [],
+            };
+            const accountB: ServerProvider = {
+              ...previousProvider,
+              status: "ready",
+              auth: { status: "authenticated", type: "oauth-personal", email: "bob@example.com" },
+              checkedAt: "2026-09-02T00:02:00.000Z",
+              models: [],
+              usageLimits: {
+                checkedAt: "2026-09-02T00:02:00.000Z",
+                windows: [],
+                unavailable: { reason: "probeFailed" },
+              },
+            };
+            const currentRef = yield* Ref.make<ServerProvider>(accountA);
+            const updates = yield* PubSub.unbounded<ServerProvider>();
+            const instance: ProviderInstance = {
+              instanceId,
+              displayName: "Antigravity Personal",
+              driverKind: ProviderDriverKind.make("antigravity"),
+              continuationIdentity: {
+                driverKind: ProviderDriverKind.make("antigravity"),
+                continuationKey: "antigravity:antigravity-personal",
+              },
+              enabled: true,
+              snapshot: {
+                resolveMaintenance: () =>
+                  Effect.succeed(
+                    makeManualOnlyProviderMaintenanceCapabilities({
+                      provider: ProviderDriverKind.make("antigravity"),
+                      packageName: null,
+                    }),
+                  ),
+                getSnapshot: Ref.get(currentRef),
+                isAwaitingFirstCheck: Effect.succeed(false),
+                refresh: Ref.get(currentRef),
+                applyUsageLimits: () => Effect.void,
+                streamChanges: Stream.fromPubSub(updates),
+              },
+              orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+              textGeneration: {} as ProviderInstance["textGeneration"],
+            };
+            const layerInstanceRegistry = Layer.succeed(
+              ProviderInstanceRegistry.ProviderInstanceRegistry,
+              {
+                getInstance: (id) =>
+                  Effect.succeed(id === instance.instanceId ? instance : undefined),
+                listInstances: Effect.succeed([instance]),
+                listUnavailable: Effect.succeed([]),
+                streamChanges: Stream.empty,
+                subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
+              },
+            );
+            const layerUnusedMutator = Layer.succeed(
+              ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator,
+              {
+                reconcile: () => Effect.void,
+                reloadSecrets: () => Effect.void,
+                applySecret: () => Effect.succeed([]),
+                rebuild: () => Effect.void,
+              },
+            );
+
+            yield* Effect.gen(function* () {
+              const registry = yield* ProviderRegistry.ProviderRegistry;
+              const waitForChange = (predicate: (provider: ServerProvider) => boolean) =>
+                Stream.toPull(
+                  registry.streamChanges.pipe(
+                    Stream.filter((providers) => {
+                      const entry = providers.find((p) => p.instanceId === instanceId);
+                      return entry !== undefined && predicate(entry);
+                    }),
+                  ),
+                );
+
+              const [initial] = yield* registry.getProviders;
+              assert.strictEqual(initial?.models.length, 2);
+              assert.strictEqual(initial?.workspaceSnapshots?.length, 1);
+
+              const awaitCleared = yield* waitForChange(
+                (entry) => entry.auth.status === "unauthenticated",
+              );
+              yield* Ref.set(currentRef, unauthenticated);
+              yield* PubSub.publish(updates, unauthenticated);
+              yield* awaitCleared;
+
+              const [afterSignOut] = yield* registry.getProviders;
+              assert.deepStrictEqual(afterSignOut?.models, []);
+              assert.isUndefined(afterSignOut?.workspaceSnapshots);
+              assert.isUndefined(afterSignOut?.usageLimits);
+              const cachedAfterSignOut = yield* readProviderStatusCache(filePath);
+              assert.deepStrictEqual(cachedAfterSignOut?.models, []);
+              assert.strictEqual(cachedAfterSignOut?.auth.status, "unauthenticated");
+
+              const awaitAccountB = yield* waitForChange(
+                (entry) => entry.auth.email === "bob@example.com",
+              );
+              yield* Ref.set(currentRef, accountB);
+              yield* PubSub.publish(updates, accountB);
+              yield* awaitAccountB;
+
+              const [afterAccountB] = yield* registry.getProviders;
+              assert.deepStrictEqual(afterAccountB?.models, []);
+              assert.isUndefined(afterAccountB?.workspaceSnapshots);
+              assert.strictEqual(afterAccountB?.usageLimits?.unavailable?.reason, "probeFailed");
+              assert.isUndefined(afterAccountB?.usageLimits?.credentialFingerprint);
+            }).pipe(
+              Effect.provide(
+                ProviderRegistry.layer.pipe(
+                  Layer.provide(layerInstanceRegistry),
+                  Layer.provide(layerUnusedMutator),
+                ),
+              ),
+              Effect.scoped,
+            );
+          }).pipe(
+            Effect.provide(
+              ServerConfig.layerTest(process.cwd(), {
+                prefix: "t3-antigravity-account-isolation-",
+              }).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+            ),
+          ),
+      );
     });
 
     describe("Antigravity saved account", () => {

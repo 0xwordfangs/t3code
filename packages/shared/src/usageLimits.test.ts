@@ -16,6 +16,7 @@ import {
   displayLimitWindows,
   cursorUsageWindowDetails,
   collectProviderUsageLimits,
+  providersWithLimits,
   sameUsageLimitCommandCoverage,
   withUsageLimitsCommands,
   collectLimitAccounts,
@@ -1975,5 +1976,93 @@ describe("ChatGPT sharing presentation", () => {
         auth: { status: "unauthenticated", subscriptionSharing: true },
       }),
     ).toBe(false);
+  });
+});
+
+describe("unauthenticated provider exclusion", () => {
+  const checkedAt = "2026-09-03T11:00:00.000Z";
+  const antigravity = ProviderDriverKind.make("antigravity");
+  const hubSource = {
+    id: UsageLimitSourceId.make("hub"),
+    kind: "cliproxy" as const,
+    label: "Hub",
+    checkedAt,
+  };
+
+  it("excludes unauthenticated providers from limits and accountKeyResolver while keeping unknown startup providers", () => {
+    const unknownStartup = provider({
+      instanceId: ProviderInstanceId.make("antigravity-startup"),
+      driver: antigravity,
+      status: "warning",
+      auth: { status: "unknown", email: "alice@example.com" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "fp-alice",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 25 }],
+      },
+    });
+    const staleSignedOut = provider({
+      instanceId: ProviderInstanceId.make("antigravity-signed-out"),
+      driver: antigravity,
+      status: "warning",
+      auth: {
+        status: "unauthenticated",
+        email: "stale-owner@example.com",
+        workspaceId: "ws-stale",
+      },
+      usageLimits: {
+        checkedAt: "2026-09-03T11:30:00.000Z",
+        credentialFingerprint: "fp-alice",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 95 }],
+      },
+    });
+    const hubAccount = {
+      id: "antigravity-alice.json",
+      driver: antigravity,
+      usageLimits: {
+        checkedAt: "2026-09-03T11:20:00.000Z",
+        credentialFingerprint: "fp-alice",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 35 }],
+      },
+    };
+
+    expect(providersWithLimits([unknownStartup, staleSignedOut]).map((p) => p.instanceId)).toEqual([
+      unknownStartup.instanceId,
+    ]);
+
+    // If staleSignedOut were fed to accountKeyResolver, its conflicting email for fp-alice would
+    // prevent hubAccount from bridging with unknownStartup (yielding 2 accounts instead of 1).
+    const accounts = collectLimitAccounts(
+      new Map([
+        [
+          EnvironmentId.make("env-a"),
+          {
+            entry: { target: { label: "Laptop" } },
+            serverConfig: {
+              providers: [unknownStartup, staleSignedOut],
+              usageLimitSources: [{ ...hubSource, accounts: [hubAccount] }],
+            },
+          },
+        ],
+      ]),
+    );
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.email).toBe("alice@example.com");
+    expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(35);
+
+    const report = collectProviderUsageLimits(
+      unknownStartup.instanceId,
+      [unknownStartup, staleSignedOut],
+      [{ ...hubSource, accounts: [hubAccount] }],
+      now,
+    );
+    expect(report?.accounts).toHaveLength(1);
+    expect(report?.accounts[0]?.id).toBe(unknownStartup.instanceId);
+    expect(report?.accounts[0]?.email).toBe("alice@example.com");
+    expect(report?.accounts[0]?.limits.windows[0]?.usedPercent).toBe(25);
+
+    expect(
+      collectProviderUsageLimits(staleSignedOut.instanceId, [staleSignedOut], [], now),
+    ).toBeNull();
   });
 });

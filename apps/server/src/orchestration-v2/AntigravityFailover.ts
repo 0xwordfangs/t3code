@@ -27,6 +27,7 @@ import * as ServerSettingsService from "../serverSettings.ts";
 const DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_MS = 5 * 60 * 1_000;
 const ANTIGRAVITY_COOLDOWN_EARLY_CLEAR_GRACE_MS = 60 * 1_000;
 const MAX_ANTIGRAVITY_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1_000;
+const FAILOVER_COMPATIBLE_AUTH_TYPE = "oauth-personal";
 
 export interface AntigravityQuotaCooldownEntry {
   readonly untilMs: number;
@@ -78,6 +79,12 @@ const noopFailover: AntigravityFailoverShape = {
 export class AntigravityFailover extends Context.Reference<AntigravityFailoverShape>(
   "t3/orchestration-v2/AntigravityFailover",
   { defaultValue: () => noopFailover },
+) {}
+
+// Fiber-scoped opt-out so caller-pinned provider instances are not rewritten by pre-flight failover.
+export class SuppressAntigravityPreflight extends Context.Reference<boolean>(
+  "t3/orchestration-v2/SuppressAntigravityPreflight",
+  { defaultValue: () => false },
 ) {}
 
 export function antigravityCooldownKey(instanceId: ProviderInstanceId, model: string): string {
@@ -168,6 +175,38 @@ function supportsRequestedModel(provider: ServerProvider, model: string): boolea
   return advertisedAntigravityModel(provider, model) !== undefined;
 }
 
+function configuredAntigravityAuthMethod(
+  settings: ServerSettings,
+  instanceId: ProviderInstanceId,
+): unknown {
+  const instance = Object.hasOwn(settings.providerInstances, instanceId)
+    ? settings.providerInstances[instanceId]
+    : undefined;
+  const config = instance?.config;
+  if (config === null || typeof config !== "object" || Array.isArray(config)) {
+    return undefined;
+  }
+  return Object.hasOwn(config, "authMethod")
+    ? (config as { readonly authMethod?: unknown }).authMethod
+    : undefined;
+}
+
+// Failover is restricted to personal Google OAuth accounts so enterprise tenants
+// and metered API/Vertex billing instances are never crossed automatically.
+function isPersonalOAuthAntigravityInstance(
+  provider: ServerProvider,
+  settings: ServerSettings,
+): boolean {
+  if (provider.driver !== "antigravity") return false;
+  if (provider.auth.type !== FAILOVER_COMPATIBLE_AUTH_TYPE) return false;
+  const configuredMethod = configuredAntigravityAuthMethod(settings, provider.instanceId);
+  if (configuredMethod !== undefined && configuredMethod !== FAILOVER_COMPATIBLE_AUTH_TYPE) {
+    return false;
+  }
+  if (provider.usageLimits?.unavailable?.reason === "unsupported") return false;
+  return true;
+}
+
 function isEligibleAntigravityCandidate(input: {
   readonly candidate: ServerProvider;
   readonly model: string;
@@ -179,7 +218,7 @@ function isEligibleAntigravityCandidate(input: {
   readonly cooldowns?: ReadonlyMap<string, AntigravityQuotaCooldownEntry>;
 }): boolean {
   const { candidate, model, projectId, settings, nowMs } = input;
-  if (candidate.driver !== "antigravity") return false;
+  if (!isPersonalOAuthAntigravityInstance(candidate, settings)) return false;
   if (input.excludedInstanceIds.has(candidate.instanceId)) return false;
   if (
     input.orchestrationCapableInstanceIds !== undefined &&
@@ -240,7 +279,9 @@ export function selectAntigravityFailoverCandidate(input: {
   const current = input.providers.find(
     (provider) => provider.instanceId === input.selection.instanceId,
   );
-  if (current === undefined || current.driver !== "antigravity") return null;
+  if (current === undefined || !isPersonalOAuthAntigravityInstance(current, input.settings)) {
+    return null;
+  }
 
   if (input.mode === "preflight") {
     const currentExhausted =
@@ -347,6 +388,7 @@ export const layer = Layer.effect(
         },
       ),
       preflightSelection: Effect.fn("AntigravityFailover.preflightSelection")(function* (input) {
+        if (yield* SuppressAntigravityPreflight) return null;
         const { providers, settings, cooldowns, nowMs } = yield* readInputs(input);
         return selectAntigravityFailoverCandidate({
           mode: "preflight",

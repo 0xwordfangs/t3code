@@ -285,6 +285,34 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
       }),
   );
 
+  it.effect.each(["cancel", "timeout"] as const)(
+    "clears previous account metadata if post-code-login verification ends by %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({ codeLogin: true });
+        const state = yield* harness.auth.controller.start(owner);
+        yield* phase(harness.auth, "waiting");
+        yield* harness.auth.controller.respond!(owner, {
+          instanceId,
+          flowId: state.flowId!,
+          interactionId: state.flowId!,
+          response: { type: "credentials", values: { code: "4/0Ab-code" } },
+        });
+        yield* Deferred.await(harness.authenticateCalled);
+        if (mode === "cancel") {
+          const cancelled = yield* harness.auth.controller.cancel(owner, state.flowId!);
+          assert.equal(cancelled.phase, "cancelled");
+        } else {
+          yield* TestClock.adjust("300 seconds");
+          const failed = yield* phase(harness.auth, "failed");
+          assert.equal(failed.message, "Google sign-in expired. Start sign-in again.");
+        }
+        assert.deepEqual(harness.catalog(), []);
+        assert.include(harness.events, "credentials-replaced");
+        assert.include(harness.events, "verification-failed");
+      }),
+  );
+
   it.effect("rejects a different second authorization URL", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
@@ -701,6 +729,37 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
       assert.isTrue(Exit.isFailure(result));
       assert.deepEqual(harness.events, ["process-open", "initialize", "process-close"]);
       assert.deepEqual(harness.catalog(), ["previous-account-model"]);
+    }),
+  );
+
+  it.effect("blocks logout from other sessions or prompts while a sign-in flow is active", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const state = yield* harness.auth.controller.start(owner);
+      yield* phase(harness.auth, "waiting");
+      let stopSessionsCalls = 0;
+      const stopSessions = Effect.sync(() => {
+        stopSessionsCalls += 1;
+      });
+
+      for (const actor of [otherOwner, undefined] as const) {
+        const error = yield* Effect.flip(harness.auth.controller.logout(stopSessions, actor));
+        assert.equal(error.operation, "logout");
+        assert.include(error.detail, "Another session is currently signing in");
+      }
+      assert.equal(stopSessionsCalls, 0);
+      assert.deepEqual(harness.catalog(), ["previous-account-model"]);
+      assert.notInclude(harness.events, "logout");
+      assert.notInclude(harness.events, "catalog-cleared");
+      assert.notInclude(harness.events, "process-close");
+      assert.equal((yield* phase(harness.auth, "waiting")).flowId, state.flowId);
+
+      const signedOut = yield* harness.auth.controller.logout(stopSessions, owner);
+      assert.equal(signedOut.phase, "idle");
+      assert.equal(stopSessionsCalls, 1);
+      assert.include(harness.events, "logout");
+      assert.include(harness.events, "catalog-cleared");
+      assert.deepEqual(harness.catalog(), []);
     }),
   );
 });

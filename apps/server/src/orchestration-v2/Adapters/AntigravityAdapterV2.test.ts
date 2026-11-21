@@ -140,6 +140,10 @@ describe("AntigravityAdapterV2 flavor", () => {
       outcome: { outcome: "selected", optionId: "opt-dev" },
     });
   });
+
+  it("disables in-session runtime mode switching so mode changes detach the session", () => {
+    assert.isFalse(flavor.capabilities.sessions.supportsRuntimeModeSwitchInSession);
+  });
 });
 
 const layerSession = Layer.mergeAll(
@@ -1295,9 +1299,11 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
     type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
     let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
     let permissionHandler: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+    let elicitationHandler: Parameters<RuntimeService["handleElicitation"]>[0] | undefined;
     let onOutgoingResponse: AntigravityAdapterV2RuntimeInput["onOutgoingResponse"];
     let onTermination: AntigravityAdapterV2RuntimeInput["onTermination"];
     let cancelCount = 0;
+    let cancelCalled = yield* Deferred.make<void>();
     let promptStarted = yield* Deferred.make<void>();
     let promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
     const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
@@ -1327,9 +1333,10 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
           Effect.provideService(SecureRandom.SecureRandom, crypto),
           Effect.map((runtime): RuntimeService => ({
             ...runtime,
-            cancel: Effect.sync(() => {
+            cancel: Effect.suspend(() => {
               cancelCount += 1;
-            }).pipe(Effect.andThen(runtime.cancel)),
+              return Deferred.succeed(cancelCalled, undefined).pipe(Effect.andThen(runtime.cancel));
+            }),
             handleSessionUpdate: (handler) =>
               Effect.sync(() => {
                 sessionUpdateHandler = handler;
@@ -1338,6 +1345,10 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
               Effect.sync(() => {
                 permissionHandler = handler;
               }).pipe(Effect.andThen(runtime.handleRequestPermission(handler))),
+            handleElicitation: (handler) =>
+              Effect.sync(() => {
+                elicitationHandler = handler;
+              }).pipe(Effect.andThen(runtime.handleElicitation(handler))),
             prompt: () =>
               Deferred.succeed(promptStarted, undefined).pipe(
                 Effect.andThen(Deferred.await(promptGate)),
@@ -1381,50 +1392,65 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
     const now = yield* DateTime.now;
     const makeTurn = (
       ordinal: number,
-      turnOptions?: { readonly continuation?: boolean; readonly text?: string },
-    ): ProviderAdapter.ProviderAdapterV2TurnInput => ({
-      appThread: {
-        createdBy: "user",
-        creationSource: "web",
-        id: threadId,
-        projectId: ProjectId.make(`project-bg-${options.threadName}`),
-        title: `Antigravity background ${options.threadName}`,
-        providerInstanceId: instanceId,
+      turnOptions?: {
+        readonly continuation?: boolean;
+        readonly text?: string;
+        readonly runtimeMode?: "full-access" | "approval-required";
+      },
+    ): ProviderAdapter.ProviderAdapterV2TurnInput => {
+      const turnRuntimeMode = turnOptions?.runtimeMode ?? options.runtimeMode;
+      const turnRuntimePolicy =
+        turnRuntimeMode === options.runtimeMode
+          ? runtimePolicy
+          : ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: turnRuntimeMode,
+              interactionMode: "default",
+              cwd: process.cwd(),
+            });
+      return {
+        appThread: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId: ProjectId.make(`project-bg-${options.threadName}`),
+          title: `Antigravity background ${options.threadName}`,
+          providerInstanceId: instanceId,
+          modelSelection,
+          runtimeMode: turnRuntimeMode,
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: providerThread.id,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        },
+        threadId,
+        runId: RunId.make(`run-bg-${options.threadName}-${ordinal}`),
+        runOrdinal: ordinal,
+        providerTurnOrdinal: ordinal,
+        attemptId: RunAttemptId.make(`attempt-bg-${options.threadName}-${ordinal}`),
+        rootNodeId: NodeId.make(`node-bg-${options.threadName}-${ordinal}`),
+        providerThread,
+        message: {
+          createdBy: turnOptions?.continuation ? "agent" : "user",
+          creationSource: turnOptions?.continuation ? "provider" : "web",
+          messageId: MessageId.make(`message-bg-${options.threadName}-${ordinal}`),
+          text:
+            turnOptions?.text ??
+            (turnOptions?.continuation ? "Background task completed." : "run build"),
+          attachments: [],
+        },
         modelSelection,
-        runtimeMode: options.runtimeMode,
-        interactionMode: "default",
-        branch: null,
-        worktreePath: null,
-        activeProviderThreadId: providerThread.id,
-        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-        forkedFrom: null,
-        createdAt: now,
-        updatedAt: now,
-        archivedAt: null,
-        settledOverride: null,
-        settledAt: null,
-        lastVisitedAt: null,
-        deletedAt: null,
-      },
-      threadId,
-      runId: RunId.make(`run-bg-${options.threadName}-${ordinal}`),
-      runOrdinal: ordinal,
-      providerTurnOrdinal: ordinal,
-      attemptId: RunAttemptId.make(`attempt-bg-${options.threadName}-${ordinal}`),
-      rootNodeId: NodeId.make(`node-bg-${options.threadName}-${ordinal}`),
-      providerThread,
-      message: {
-        createdBy: turnOptions?.continuation ? "agent" : "user",
-        creationSource: turnOptions?.continuation ? "provider" : "web",
-        messageId: MessageId.make(`message-bg-${options.threadName}-${ordinal}`),
-        text:
-          turnOptions?.text ??
-          (turnOptions?.continuation ? "Background task completed." : "run build"),
-        attachments: [],
-      },
-      modelSelection,
-      runtimePolicy,
-    });
+        runtimePolicy: turnRuntimePolicy,
+      };
+    };
     return {
       session,
       sessionId,
@@ -1439,9 +1465,13 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
       get cancelCount() {
         return cancelCount;
       },
+      get cancelCalled() {
+        return cancelCalled;
+      },
       resetPrompt: Effect.gen(function* () {
         promptStarted = yield* Deferred.make<void>();
         promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+        cancelCalled = yield* Deferred.make<void>();
       }),
       terminateRuntime: (detail = "Antigravity process exited") =>
         onTermination?.(new EffectAcpErrors.AcpTransportError({ detail, cause: detail })) ??
@@ -1459,6 +1489,16 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
           { ...params, sessionId },
           { requestId, method: "session/request_permission" },
         ).pipe(Effect.tap(() => onOutgoingResponse?.(requestId) ?? Effect.void)),
+      elicit: (
+        params:
+          | Omit<Extract<EffectAcpSchema.CreateElicitationRequest, { mode: "form" }>, "sessionId">
+          | Omit<Extract<EffectAcpSchema.CreateElicitationRequest, { mode: "url" }>, "sessionId">,
+        requestId = "elicit-1",
+      ) =>
+        elicitationHandler!({ ...params, sessionId } as EffectAcpSchema.CreateElicitationRequest, {
+          requestId,
+          method: "elicitation/create",
+        }).pipe(Effect.tap(() => onOutgoingResponse?.(requestId) ?? Effect.void)),
     };
   });
 
@@ -1570,21 +1610,25 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
         const offered = yield* Queue.take(harness.continuationOffered);
         assert.lengthOf(harness.continuationRequests, 1);
 
-        // Permission arrives while activeTurn is still null (before Turn 2 attaches).
-        const permissionOutcome = yield* harness.requestPermission({
-          toolCall: { toolCallId: "call_wake_git", kind: "execute", title: "Run command" },
-          options: [
-            { optionId: "allow_once", name: "Allow", kind: "allow_once" },
-            { optionId: "deny", name: "Deny", kind: "reject_once" },
-          ],
-        });
-        assert.deepEqual(permissionOutcome, {
-          outcome: { outcome: "selected", optionId: "allow_once" },
-        });
+        // Permission arrives while activeTurn is still null; it waits for Turn 2 admission before approving.
+        const permissionFiber = yield* harness
+          .requestPermission({
+            toolCall: { toolCallId: "call_wake_git", kind: "execute", title: "Run command" },
+            options: [
+              { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+              { optionId: "deny", name: "Deny", kind: "reject_once" },
+            ],
+          })
+          .pipe(Effect.forkScoped);
+        assert.isUndefined(permissionFiber.pollUnsafe());
 
         // Start Turn 2 continuation.
         yield* offered.dispatchIfCurrent!(Effect.void);
         yield* harness.session.startTurn(harness.makeTurn(2, { continuation: true }));
+        const permissionOutcome = yield* Fiber.join(permissionFiber);
+        assert.deepEqual(permissionOutcome, {
+          outcome: { outcome: "selected", optionId: "allow_once" },
+        });
 
         // Tool runs for 6s (> 3s debounce); Turn 2 must NOT prematurely finalize while tool runs.
         yield* harness.emitUpdate({
@@ -2062,6 +2106,134 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
         yield* declined.clearIfCurrent!();
         const outcome = yield* Fiber.join(permFiber);
         assert.deepEqual(outcome, { outcome: { outcome: "cancelled" } });
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "waits for continuation admission on post-settle full-access requests, honors downgrade and onRunEndedWithoutStarting, and cancels on mid-turn interrupt",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "cf02-cf12-antigravity",
+          runtimeMode: "full-access",
+        });
+        assert.isFalse(
+          harness.session.providerSession.capabilities.sessions.supportsRuntimeModeSwitchInSession,
+        );
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        // Cancelled queued continuation unblocks held full-access permission via onRunEndedWithoutStarting.
+        const cancelledPermFiber = yield* harness
+          .requestPermission(
+            {
+              toolCall: { toolCallId: "call_ag_cancelled", kind: "execute", title: "echo cancel" },
+              options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+            },
+            "perm-ag-cancelled",
+          )
+          .pipe(Effect.forkScoped);
+        const firstOffer = yield* Queue.take(harness.continuationOffered);
+        assert.isUndefined(cancelledPermFiber.pollUnsafe());
+        yield* firstOffer.dispatchIfCurrent!(Effect.void);
+        yield* firstOffer.onRunEndedWithoutStarting!();
+        assert.deepEqual(yield* Fiber.join(cancelledPermFiber), {
+          outcome: { outcome: "cancelled" },
+        });
+
+        // Downgraded Turn 2 prompts instead of auto-approving.
+        const downgradedPermFiber = yield* harness
+          .requestPermission(
+            {
+              toolCall: { toolCallId: "call_ag_downgrade", kind: "execute", title: "echo ask" },
+              options: [
+                { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+                { optionId: "deny", name: "Deny", kind: "reject_once" },
+              ],
+            },
+            "perm-ag-downgrade",
+          )
+          .pipe(Effect.forkScoped);
+        const secondOffer = yield* Queue.take(harness.continuationOffered);
+        assert.isUndefined(downgradedPermFiber.pollUnsafe());
+        yield* secondOffer.dispatchIfCurrent!(Effect.void);
+        yield* harness.session.startTurn(
+          harness.makeTurn(2, { continuation: true, runtimeMode: "approval-required" }),
+        );
+        let requestId:
+          | Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "runtime_request.updated" }
+            >["runtimeRequest"]["id"]
+          | undefined;
+        while (requestId === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (
+            event.type === "runtime_request.updated" &&
+            event.runtimeRequest.status === "pending"
+          ) {
+            requestId = event.runtimeRequest.id;
+          }
+        }
+        yield* harness.session.respondToRuntimeRequest({ requestId, decision: "decline" });
+        assert.deepEqual(yield* Fiber.join(downgradedPermFiber), {
+          outcome: { outcome: "selected", optionId: "deny" },
+        });
+        yield* TestClock.adjust("16 seconds");
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
+        }
+
+        // Mid-turn interrupt on unsettled Turn 3 immediately cancels incoming requests.
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(3)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        let turn3Id:
+          | Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "provider_turn.updated" }
+            >["providerTurn"]["id"]
+          | undefined;
+        while (turn3Id === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "provider_turn.updated" && event.providerTurn.status === "running") {
+            turn3Id = event.providerTurn.id;
+          }
+        }
+        const interruptFiber = yield* harness.session
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn3Id,
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.cancelCalled);
+        const midStopPerm = yield* harness.requestPermission(
+          {
+            toolCall: { toolCallId: "call_ag_mid_stop", kind: "execute", title: "echo nope" },
+            options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+          },
+          "perm-ag-mid-stop",
+        );
+        assert.deepEqual(midStopPerm, { outcome: { outcome: "cancelled" } });
+        const midStopMcp = yield* harness.elicit(
+          {
+            mode: "form",
+            message: "Approve MCP?",
+            requestedSchema: {
+              type: "object",
+              properties: { approved: { type: "boolean", title: "Approved" } },
+            },
+            _meta: { codex_approval_kind: "mcp_tool_call" },
+          },
+          "mcp_tool_call_approval_ag_mid_stop",
+        );
+        assert.deepEqual(midStopMcp, { action: "cancel" });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "cancelled" });
+        yield* Fiber.join(interruptFiber);
       }).pipe(Effect.provide(layerSession)),
   );
 

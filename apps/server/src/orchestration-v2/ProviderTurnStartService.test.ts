@@ -9,6 +9,7 @@ import {
   ContextTransferId,
   EnvironmentId,
   GitCommandError,
+  GuestMessageId,
   MessageId,
   NodeId,
   ProviderSessionId,
@@ -19,6 +20,7 @@ import {
   ProviderSetupError,
   RunAttemptId,
   RunId,
+  ScheduledTaskId,
   ThreadId,
   ProjectId,
   type OrchestrationV2ThreadProjection,
@@ -3215,6 +3217,47 @@ effectIt.effect.each(["not_loaded", "error"] as const)(
         projection.providerThreads.find((thread) => thread.id === "new-provider-thread")?.status,
       ).toBe(providerThreadStatus);
     }),
+);
+
+effectIt.effect.each([
+  { label: "agent-authored message", patch: { createdBy: "agent" as const } },
+  { label: "mcp-created message", patch: { creationSource: "mcp" as const } },
+  { label: "server-created message", patch: { creationSource: "server" as const } },
+  { label: "provider-created message", patch: { creationSource: "provider" as const } },
+  { label: "scheduled task message", patch: { scheduledTaskId: ScheduledTaskId.make("task-1") } },
+  {
+    label: "guest-attributed message",
+    patch: {
+      context: {
+        version: 1 as const,
+        guest: {
+          guestMessageId: GuestMessageId.make("guest-1"),
+          name: "Guest",
+          text: "/logout",
+        },
+        records: [],
+      },
+    },
+  },
+])("skips provider auth prompt handling for /logout from $label", ({ patch }) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "/logout",
+      previousNativeSession: true,
+      sessionForTurn: true,
+    });
+    const initial = harness.projection();
+    harness.setProjection({
+      ...initial,
+      messages: initial.messages.map((msg) => ({ ...msg, ...patch })),
+    });
+
+    yield* harness.start;
+
+    expect(harness.tryHandlePromptCommand).not.toHaveBeenCalled();
+    expect(harness.open).toHaveBeenCalledTimes(1);
+    expect(harness.startRootRun).toHaveBeenCalledTimes(1);
+  }),
 );
 
 for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {

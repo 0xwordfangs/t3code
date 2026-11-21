@@ -377,17 +377,21 @@ export const mergeProviderSnapshot = (
     return nextProvider;
   }
   const switchedAntigravityAccount = hasSwitchedAntigravityAccount(previousProvider, nextProvider);
-  const savedAccount = switchedAntigravityAccount
+  const clearAntigravityAccount =
+    switchedAntigravityAccount ||
+    (nextProvider.driver === ProviderDriverKind.make("antigravity") &&
+      nextProvider.auth.status === "unauthenticated");
+  const savedAccount = clearAntigravityAccount
     ? undefined
     : carrySavedAntigravityAccount(previousProvider, nextProvider);
   const { message: _uncheckedMessage, ...nextWithoutMessage } = nextProvider;
   const models = mergeProviderModels(
     nextProvider,
-    switchedAntigravityAccount ? [] : previousProvider.models,
+    clearAntigravityAccount ? [] : previousProvider.models,
     nextProvider.models,
   );
   // Folder catalogs were compared with the old machine catalog, so every folder rescans.
-  const previousWorkspaceSnapshots = switchedAntigravityAccount
+  const previousWorkspaceSnapshots = clearAntigravityAccount
     ? undefined
     : Equal.equals(models, previousProvider.models)
       ? previousProvider.workspaceSnapshots
@@ -404,7 +408,8 @@ export const mergeProviderSnapshot = (
       : previousWorkspaceSnapshots !== undefined
         ? { workspaceSnapshots: previousWorkspaceSnapshots }
         : {}),
-    ...(nextProvider.workspaceRescannedAt === undefined &&
+    ...(!clearAntigravityAccount &&
+    nextProvider.workspaceRescannedAt === undefined &&
     previousProvider.workspaceRescannedAt !== undefined
       ? { workspaceRescannedAt: previousProvider.workspaceRescannedAt }
       : {}),

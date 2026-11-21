@@ -396,8 +396,10 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
         );
         yield* options.onAuthenticated(started, runtime);
       }).pipe(
-        Effect.tapError(() =>
-          signedIn && options.onVerificationFailed ? options.onVerificationFailed : Effect.void,
+        Effect.onExit((exit) =>
+          signedIn && Exit.isFailure(exit) && options.onVerificationFailed
+            ? options.onVerificationFailed
+            : Effect.void,
         ),
       );
     },
@@ -608,13 +610,22 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
       yield* stopFlow(flow, "cancelled", "Google sign-in was cancelled.");
       return flow.state;
     }),
-    logout: Effect.fn("AntigravityAuth.logout")(function* (stopSessions) {
+    logout: Effect.fn("AntigravityAuth.logout")(function* (stopSessions, actorSessionId) {
       const task = Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const flow = yield* lock.withPermits(1)(
             Effect.gen(function* () {
               if (operation !== "idle" && operation !== "auth") {
                 return yield* setupError("logout", "Antigravity setup is already stopping.");
+              }
+              if (
+                activeFlow !== undefined &&
+                (actorSessionId === undefined || activeFlow.ownerSessionId !== actorSessionId)
+              ) {
+                return yield* setupError(
+                  "logout",
+                  "Another session is currently signing in to Google. Wait for it to finish or cancel it from that session before signing out.",
+                );
               }
               operation = "logout";
               const currentFlow = activeFlow;

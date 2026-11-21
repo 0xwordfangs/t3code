@@ -42,6 +42,24 @@ function withUsageLimits(
   return usageLimits ? { ...rest, usageLimits } : rest;
 }
 
+function isDifferentEmail(a: string | undefined, b: string | undefined): boolean {
+  const left = a?.trim().toLowerCase() || undefined;
+  const right = b?.trim().toLowerCase() || undefined;
+  return left !== undefined && right !== undefined && left !== right;
+}
+
+function hasAuthBoundaryChanged(
+  previousAuth: ServerProvider["auth"],
+  nextAuth: ServerProvider["auth"],
+): boolean {
+  return (
+    nextAuth.status === "unauthenticated" ||
+    previousAuth.status === "unauthenticated" ||
+    isDifferentEmail(previousAuth.email, nextAuth.email) ||
+    (nextAuth.workspaceId !== undefined && nextAuth.workspaceId !== previousAuth.workspaceId)
+  );
+}
+
 const FAILED_CHECK_RECHECK_DELAY = "30 seconds";
 
 export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(function* <
@@ -97,23 +115,30 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
       if (state.enrichmentGeneration !== generation) {
         return [null, state] as const;
       }
+      const accountBoundaryChanged = hasAuthBoundaryChanged(state.snapshot.auth, nextSnapshot.auth);
+      const authBoundaryChanged =
+        accountBoundaryChanged ||
+        nextSnapshot.auth.verificationRequired === true ||
+        nextSnapshot.auth.verificationUrl !== undefined;
+      const nextUsageAuthLabel = accountBoundaryChanged ? undefined : state.usageAuthLabel;
       // Enrichment must not revert usage updates newer than its input snapshot.
       const merged = withUsageLimits(
-        state.usageAuthLabel === undefined
+        authBoundaryChanged || state.usageAuthLabel === undefined
           ? nextSnapshot
           : {
               ...nextSnapshot,
               auth: { ...nextSnapshot.auth, label: state.usageAuthLabel ?? undefined },
             },
-        nextSnapshot.auth.verificationRequired === true ||
-          nextSnapshot.auth.verificationUrl !== undefined
-          ? nextSnapshot.usageLimits
-          : state.snapshot.usageLimits,
+        authBoundaryChanged ? nextSnapshot.usageLimits : state.snapshot.usageLimits,
       );
+      const nextState =
+        nextUsageAuthLabel === state.usageAuthLabel
+          ? state
+          : { ...state, usageAuthLabel: nextUsageAuthLabel };
       if (Equal.equals(state.snapshot, merged)) {
-        return [null, state] as const;
+        return [null, nextState] as const;
       }
-      return [merged, { ...state, snapshot: merged }] as const;
+      return [merged, { ...nextState, snapshot: merged }] as const;
     });
     if (snapshotToPublish === null) {
       return;
@@ -202,26 +227,25 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
           : state.enrichmentGeneration;
         // Failed reads retain limits only for the same account and original workspace.
         const previous = state.snapshot.auth;
-        const differs = (a: string | undefined, b: string | undefined) =>
-          a !== undefined && b !== undefined && a !== b;
-        const switchedAccount =
-          differs(probedSnapshot.auth.email?.toLowerCase(), previous.email?.toLowerCase()) ||
-          (probedSnapshot.auth.workspaceId !== undefined &&
-            probedSnapshot.auth.workspaceId !== previous.workspaceId);
+        const switchedAccount = hasAuthBoundaryChanged(previous, probedSnapshot.auth);
         const usageLimits =
-          switchedAccount ||
-          probedSnapshot.auth.verificationRequired === true ||
-          probedSnapshot.auth.verificationUrl !== undefined
-            ? probedSnapshot.usageLimits
-            : probedSnapshot.usageLimits === undefined &&
-                state.snapshot.usageLimits !== usageBeforeProbe
-              ? state.snapshot.usageLimits
-              : resolveUsageLimitsAfterProbe({
-                  published: state.snapshot.usageLimits,
-                  probed: probedSnapshot.usageLimits,
-                });
+          probedSnapshot.auth.status === "unauthenticated"
+            ? undefined
+            : switchedAccount ||
+                probedSnapshot.auth.verificationRequired === true ||
+                probedSnapshot.auth.verificationUrl !== undefined
+              ? probedSnapshot.usageLimits
+              : probedSnapshot.usageLimits === undefined &&
+                  state.snapshot.usageLimits !== usageBeforeProbe
+                ? state.snapshot.usageLimits
+                : resolveUsageLimitsAfterProbe({
+                    published: state.snapshot.usageLimits,
+                    probed: probedSnapshot.usageLimits,
+                  });
         const workspaceId =
-          usageLimits === probedSnapshot.usageLimits ? undefined : state.snapshot.auth.workspaceId;
+          switchedAccount || usageLimits === probedSnapshot.usageLimits
+            ? undefined
+            : state.snapshot.auth.workspaceId;
         const usageAuthLabel =
           !switchedAccount && usageLimits?.checkedAt === state.snapshot.usageLimits?.checkedAt
             ? state.usageAuthLabel

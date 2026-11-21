@@ -416,7 +416,7 @@ export const makeCursorAuth = Effect.fn("makeCursorAuth")(function* (options: Cu
           return snapshot.value.state;
         }),
       ),
-    logout: (stopSessions) =>
+    logout: (stopSessions, actorSessionId) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
           const flow = yield* lock.withPermits(1)(
@@ -433,6 +433,16 @@ export const makeCursorAuth = Effect.fn("makeCursorAuth")(function* (options: Cu
                   instanceId: options.instanceId,
                   operation: "logout",
                   detail: "Cursor setup is already stopping.",
+                });
+              if (
+                active !== undefined &&
+                (actorSessionId === undefined || active.owner !== actorSessionId)
+              )
+                return yield* new ProviderSetupError({
+                  instanceId: options.instanceId,
+                  operation: "logout",
+                  detail:
+                    "Another session is currently signing in to Cursor. Wait for it to finish or cancel it from that session before signing out.",
                 });
               operation = "stopping";
               const flow = active;

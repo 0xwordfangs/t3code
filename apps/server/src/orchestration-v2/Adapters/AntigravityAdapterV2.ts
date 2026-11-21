@@ -68,7 +68,7 @@ const AntigravityProviderCapabilitiesV2 = {
   sessions: {
     ...AcpProviderCapabilitiesV2.sessions,
     supportsModelSwitchInSession: true,
-    supportsRuntimeModeSwitchInSession: true,
+    supportsRuntimeModeSwitchInSession: false,
   },
   tools: {
     ...AcpProviderCapabilitiesV2.tools,

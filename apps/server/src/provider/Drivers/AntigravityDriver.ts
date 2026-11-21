@@ -500,7 +500,7 @@ export const AntigravityDriver: ProviderDriver<
         Effect.suspend(() => provider.onSignedIn).pipe(
           Effect.andThen(publishCatalog(started, runtime)),
         ),
-      onCredentialsReplaced: Effect.suspend(() => provider.onSignedIn),
+      onCredentialsReplaced: Effect.suspend(() => provider.onAuthRequired),
       onVerificationFailed: Effect.suspend(() => provider.onAuthRequired),
       onSignedOut: Effect.suspend(() => provider.onSignedOut),
       usesBrowser: antigravityAuthUsesBrowser(auth.authMethod),

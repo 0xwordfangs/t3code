@@ -202,9 +202,9 @@ const makeHarness = Effect.fn("ProviderAuthService.test.makeHarness")(function* 
       state = { ...idle, flowId, phase: "cancelled" };
       return state;
     }),
-    logout: Effect.fn(function* (stopSessions) {
+    logout: Effect.fn(function* (stopSessions, actorSessionId) {
       gateClosed = true;
-      actions.push("close-gate");
+      actions.push(actorSessionId === undefined ? "close-gate" : `close-gate:${actorSessionId}`);
       yield* stopSessions;
       if (input.logoutError) return yield* input.logoutError;
       yield* input.beforeLogout ?? Effect.void;
@@ -485,6 +485,16 @@ describe("ProviderAuthService", () => {
       const cancelled = yield* service.cancel({ instanceId, flowId }, owner);
       assert.strictEqual(cancelled.phase, "cancelled");
       assert.strictEqual(cancelled.authorizationUrl, null);
+    }),
+  );
+
+  it.effect("forwards actorSessionId on direct logout and omits it on prompt logout", () =>
+    Effect.gen(function* () {
+      const { service, actions } = yield* makeHarness();
+      yield* service.logout({ instanceId }, owner);
+      yield* service.tryHandlePromptCommand({ instanceId, text: "/logout", hasAttachments: false });
+      assert.include(actions, `close-gate:${owner}`);
+      assert.include(actions, "close-gate");
     }),
   );
 

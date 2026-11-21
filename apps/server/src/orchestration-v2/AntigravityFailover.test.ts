@@ -50,7 +50,7 @@ import { AcpProviderCapabilitiesV2 } from "@t3tools/provider-acp/server/adapter"
 
 const ANTIGRAVITY_DRIVER = ProviderDriverKind.make("antigravity");
 const NOW = Date.parse("2026-11-21T12:00:00.000Z");
-const FUTURE_RESET = "2026-11-21T17:00:00.000Z";
+const FUTURE_RESET = "2099-01-01T00:00:00.000Z";
 const PROJECT_ID = ProjectId.make("project:antigravity-failover");
 
 const antigravityCapabilities = {
@@ -105,7 +105,7 @@ function makeAntigravityProvider(
     installed: true,
     version: "1.5.0",
     status: "ready",
-    auth: { status: "authenticated", email: `${id}@example.com` },
+    auth: { status: "authenticated", type: "oauth-personal", email: `${id}@example.com` },
     checkedAt: "2026-11-21T11:55:00.000Z",
     supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
     models: [
@@ -385,12 +385,22 @@ describe("selectAntigravityFailoverCandidate", () => {
     });
     const unverifiedAccount = makeAntigravityProvider("antigravity_2", {
       status: "warning",
-      auth: { status: "authenticated", email: "b@example.com", verificationUrl },
+      auth: {
+        status: "authenticated",
+        type: "oauth-personal",
+        email: "b@example.com",
+        verificationUrl,
+      },
       usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
     });
     const unverifiedWithoutUrl = makeAntigravityProvider("antigravity_4", {
       status: "warning",
-      auth: { status: "authenticated", email: "d@example.com", verificationRequired: true },
+      auth: {
+        status: "authenticated",
+        type: "oauth-personal",
+        email: "d@example.com",
+        verificationRequired: true,
+      },
       usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
     });
     const healthyAccount = makeAntigravityProvider("antigravity_3", {
@@ -443,6 +453,137 @@ describe("selectAntigravityFailoverCandidate", () => {
         nowMs: NOW,
       }),
     );
+  });
+
+  it("enforces personal OAuth tenant and billing boundaries in preflight and failover modes", () => {
+    const businessCurrent = makeAntigravityProvider("antigravity_biz_1", {
+      auth: { status: "authenticated", type: "oauth-business", email: "biz1@corp.example.com" },
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+    });
+    const businessCandidate = makeAntigravityProvider("antigravity_biz_2", {
+      auth: { status: "authenticated", type: "oauth-business", email: "biz2@corp.example.com" },
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+    });
+    const personalCurrent = makeAntigravityProvider("antigravity", {
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+    });
+    const personalHealthy = makeAntigravityProvider("antigravity_personal_2", {
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 25 }]),
+    });
+    const apiKeyCandidate = makeAntigravityProvider("antigravity_api_key", {
+      auth: { status: "authenticated", type: "gemini-api-key" },
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+    });
+    const vertexCandidate = makeAntigravityProvider("antigravity_vertex", {
+      auth: { status: "authenticated", type: "agent-platform" },
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+    });
+    const unsupportedLimitsCandidate = makeAntigravityProvider("antigravity_unsupported", {
+      usageLimits: {
+        checkedAt: "2026-11-21T11:55:00.000Z",
+        windows: [],
+        unavailable: { reason: "unsupported", message: "Usage limits are not supported." },
+      },
+    });
+    const untypedAuthCandidate = makeAntigravityProvider("antigravity_untyped", {
+      auth: { status: "authenticated", email: "untyped@example.com" },
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+    });
+    const configMismatchCandidate = makeAntigravityProvider("antigravity_cfg_biz", {
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+    });
+
+    const allProviders = [
+      businessCurrent,
+      businessCandidate,
+      personalCurrent,
+      personalHealthy,
+      apiKeyCandidate,
+      vertexCandidate,
+      unsupportedLimitsCandidate,
+      untypedAuthCandidate,
+      configMismatchCandidate,
+    ];
+    const baseSettings = settingsForProviders(allProviders);
+    const settingsWithConfigOverride: ServerSettings = {
+      ...baseSettings,
+      providerInstances: {
+        ...baseSettings.providerInstances,
+        [configMismatchCandidate.instanceId]: {
+          driver: ANTIGRAVITY_DRIVER,
+          enabled: true,
+          config: { authMethod: "oauth-business" },
+        },
+      },
+    };
+
+    for (const mode of ["preflight", "failover"] as const) {
+      // oauth-business never fails over to oauth-personal or another oauth-business.
+      assert.isNull(
+        AntigravityFailover.selectAntigravityFailoverCandidate({
+          mode,
+          projectId: PROJECT_ID,
+          selection: { instanceId: businessCurrent.instanceId, model: "gemini-4-neon" },
+          providers: [businessCurrent, businessCandidate, personalHealthy],
+          settings: settingsWithConfigOverride,
+          nowMs: NOW,
+        }),
+      );
+
+      // oauth-personal never fails over to non-personal, untyped, config-mismatched, or unsupported candidates.
+      assert.isNull(
+        AntigravityFailover.selectAntigravityFailoverCandidate({
+          mode,
+          projectId: PROJECT_ID,
+          selection: { instanceId: personalCurrent.instanceId, model: "gemini-4-neon" },
+          providers: [
+            personalCurrent,
+            businessCandidate,
+            apiKeyCandidate,
+            vertexCandidate,
+            unsupportedLimitsCandidate,
+            untypedAuthCandidate,
+            configMismatchCandidate,
+          ],
+          settings: settingsWithConfigOverride,
+          nowMs: NOW,
+        }),
+      );
+
+      // When a valid oauth-personal candidate exists alongside excluded accounts, only it is selected.
+      const decision = AntigravityFailover.selectAntigravityFailoverCandidate({
+        mode,
+        projectId: PROJECT_ID,
+        selection: { instanceId: personalCurrent.instanceId, model: "gemini-4-neon" },
+        providers: allProviders,
+        settings: settingsWithConfigOverride,
+        nowMs: NOW,
+      });
+      assert.equal(decision?.toInstanceId, personalHealthy.instanceId);
+
+      // Current instance whose config authMethod is non-personal also refuses failover.
+      const currentConfigMismatchSettings: ServerSettings = {
+        ...settingsWithConfigOverride,
+        providerInstances: {
+          ...settingsWithConfigOverride.providerInstances,
+          [personalCurrent.instanceId]: {
+            driver: ANTIGRAVITY_DRIVER,
+            enabled: true,
+            config: { authMethod: "gemini-api-key" },
+          },
+        },
+      };
+      assert.isNull(
+        AntigravityFailover.selectAntigravityFailoverCandidate({
+          mode,
+          projectId: PROJECT_ID,
+          selection: { instanceId: personalCurrent.instanceId, model: "gemini-4-neon" },
+          providers: [personalCurrent, personalHealthy],
+          settings: currentConfigMismatchSettings,
+          nowMs: NOW,
+        }),
+      );
+    }
   });
 });
 
@@ -1416,6 +1557,139 @@ describe("Antigravity auto-failover integration", () => {
           const afterLateArm = yield* orchestrator.getThreadProjection(waited.childThreadId!);
           assert.isNull(afterLateArm.thread.limitRecovery ?? null);
           assert.isNull(afterLateArm.thread.snoozedUntil ?? null);
+        }).pipe(Effect.provide(layer));
+      }),
+  );
+
+  it.live(
+    "skips pre-flight failover when target.providerInstanceId is pinned while keeping role-routed pre-flight active",
+    () =>
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("antigravity-explicit-pin");
+        const recordedTurns: Array<{
+          readonly instanceId: ProviderInstanceId;
+          readonly threadId: ThreadId;
+          readonly text: string;
+          readonly model: string;
+        }> = [];
+        const providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([
+              { id: "3p-5h", usedPercent: 100 },
+              { id: "gemini-5h", usedPercent: 10 },
+            ]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "3p-5h", usedPercent: 15 }]),
+          }),
+        ];
+        const parentThreadId = ThreadId.make("thread:parent-explicit-pin");
+        const layer = makeIntegrationLayer({
+          name: "antigravity-explicit-pin",
+          cwd,
+          providers,
+          settings: {
+            agentRoleModels: {
+              design: {
+                instanceId: ProviderInstanceId.make("antigravity"),
+                model: "claude-opus-5-5",
+              },
+            },
+          },
+          recordedTurns,
+          outcomeFor: () => ({ behavior: "succeed", assistantText: "Done." }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-parent-pin"),
+            threadId: parentThreadId,
+            projectId: PROJECT_ID,
+            title: "Parent pin",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-parent-pin"),
+            threadId: parentThreadId,
+            messageId: MessageId.make("message:parent-pin"),
+            text: "Start parent",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const scope: McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:antigravity-explicit-pin"),
+            requestNamespace: "provider-session:antigravity-explicit-pin",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "provider-session:antigravity-explicit-pin",
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+
+          const pinnedDelegation = yield* mcp.delegateTask(scope, {
+            target: {
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+            task: "Stay on explicitly pinned instance.",
+            mode: "async",
+            clientRequestId: "req-pinned-delegate",
+          });
+          assert.equal(pinnedDelegation.providerInstanceId, ProviderInstanceId.make("antigravity"));
+
+          const pinnedThread = yield* mcp.createThreads(scope, {
+            threads: [
+              {
+                title: "Pinned thread",
+                prompt: "Stay on pinned instance during initial dispatch.",
+                target: {
+                  providerInstanceId: ProviderInstanceId.make("antigravity"),
+                  model: "claude-opus-5-5",
+                },
+              },
+            ],
+            clientRequestId: "req-pinned-create-thread",
+          });
+          assert.equal(
+            pinnedThread.threads[0]?.providerInstanceId,
+            ProviderInstanceId.make("antigravity"),
+          );
+          const pinnedThreadProjection = yield* orchestrator.getThreadProjection(
+            pinnedThread.threads[0]!.threadId,
+          );
+          assert.equal(
+            pinnedThreadProjection.runs[0]?.providerInstanceId,
+            ProviderInstanceId.make("antigravity"),
+          );
+
+          const roleDelegation = yield* mcp.delegateTask(scope, {
+            role: "design",
+            task: "Role-routed work still pre-flight fails over.",
+            mode: "async",
+            clientRequestId: "req-role-delegate",
+          });
+          assert.equal(roleDelegation.providerInstanceId, ProviderInstanceId.make("antigravity_2"));
         }).pipe(Effect.provide(layer));
       }),
   );

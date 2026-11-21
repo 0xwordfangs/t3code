@@ -1029,4 +1029,168 @@ describe("makeManagedServerProvider", () => {
       }),
     ).pipe(Effect.provide(layerAlwaysRunTest)),
   );
+
+  it.effect(
+    "clears cached usage and plan label on auth boundary transitions in enrichment and refresh",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const publishEnrichedRef = yield* Ref.make<
+            ((snapshot: ServerProvider) => Effect.Effect<void>) | null
+          >(null);
+          const enrichmentReady = yield* Deferred.make<void>();
+          const probeRef = yield* Ref.make<ServerProvider>({
+            ...refreshedSnapshot,
+            auth: {
+              status: "authenticated",
+              email: "alice@example.com",
+              workspaceId: "ws-a",
+              label: "tier-1",
+            },
+            usageLimits: {
+              checkedAt: "2026-04-10T00:00:01.000Z",
+              credentialFingerprint: "fp-alice",
+              windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 30 }],
+            },
+          });
+          const provider = yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Ref.get(probeRef),
+            enrichSnapshot: ({ publishSnapshot }) =>
+              Ref.set(publishEnrichedRef, publishSnapshot).pipe(
+                Effect.andThen(Deferred.succeed(enrichmentReady, undefined).pipe(Effect.ignore)),
+              ),
+            refreshOnInterval: false,
+          });
+
+          yield* Stream.take(provider.streamChanges, 1).pipe(Stream.runDrain);
+          yield* Deferred.await(enrichmentReady);
+
+          yield* provider.applyUsageLimits({
+            checkedAt: "2026-04-10T00:00:02.000Z",
+            authLabel: "tier-2",
+            windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 60 }],
+          });
+
+          const publish = (yield* Ref.get(publishEnrichedRef))!;
+          // Same-account enrichment still preserves newer live usage and plan label.
+          const sameAccountUpdate = yield* Stream.take(provider.streamChanges, 1).pipe(
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          yield* Effect.yieldNow;
+          yield* publish({
+            ...refreshedSnapshot,
+            auth: {
+              status: "authenticated",
+              email: "ALICE@example.com",
+              workspaceId: "ws-a",
+              label: "tier-1",
+            },
+            models: enrichedSnapshot.models,
+          });
+          const [sameAccount] = Array.from(yield* Fiber.join(sameAccountUpdate));
+          assert.strictEqual(sameAccount?.usageLimits?.windows[0]?.usedPercent, 60);
+          assert.strictEqual(sameAccount?.auth.label, "tier-2");
+
+          // Enrichment transition to unauthenticated clears cached usage and plan label.
+          const signedOutUpdate = yield* Stream.take(provider.streamChanges, 1).pipe(
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          yield* Effect.yieldNow;
+          yield* publish({
+            ...refreshedSnapshot,
+            status: "warning",
+            auth: { status: "unauthenticated" },
+            usageLimits: undefined,
+          });
+          const [signedOut] = Array.from(yield* Fiber.join(signedOutUpdate));
+          assert.strictEqual(signedOut?.auth.status, "unauthenticated");
+          assert.strictEqual(signedOut?.usageLimits, undefined);
+          assert.strictEqual(signedOut?.auth.label, undefined);
+
+          // Enrichment transition from unauthenticated to a new account uses the incoming limits.
+          const signedInUpdate = yield* Stream.take(provider.streamChanges, 1).pipe(
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          yield* Effect.yieldNow;
+          const bobLimits = {
+            checkedAt: "2026-04-10T00:00:03.000Z",
+            credentialFingerprint: "fp-bob",
+            windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 10 }],
+          } as const;
+          yield* publish({
+            ...refreshedSnapshot,
+            auth: { status: "authenticated", email: "bob@example.com", label: "bob-plan" },
+            usageLimits: bobLimits,
+          });
+          const [signedIn] = Array.from(yield* Fiber.join(signedInUpdate));
+          assert.deepStrictEqual(signedIn?.usageLimits, bobLimits);
+          assert.strictEqual(signedIn?.auth.label, "bob-plan");
+
+          // Case-insensitive email switch in enrichment clears old usage and plan label.
+          const switchedEmailUpdate = yield* Stream.take(provider.streamChanges, 1).pipe(
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          yield* Effect.yieldNow;
+          yield* publish({
+            ...refreshedSnapshot,
+            auth: { status: "authenticated", email: "carol@example.com" },
+            usageLimits: undefined,
+          });
+          const [switchedEmail] = Array.from(yield* Fiber.join(switchedEmailUpdate));
+          assert.strictEqual(switchedEmail?.usageLimits, undefined);
+          assert.strictEqual(switchedEmail?.auth.label, undefined);
+
+          // Refresh returning unauthenticated clears cached usage, workspaceId, and plan label.
+          yield* Ref.set(probeRef, {
+            ...refreshedSnapshot,
+            auth: {
+              status: "authenticated",
+              email: "carol@example.com",
+              workspaceId: "ws-carol",
+              label: "tier-carol",
+            },
+            usageLimits: bobLimits,
+          });
+          yield* provider.refresh;
+          yield* provider.applyUsageLimits({
+            checkedAt: "2026-04-10T00:00:04.000Z",
+            authLabel: "tier-live",
+            windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 45 }],
+          });
+          yield* Ref.set(probeRef, {
+            ...refreshedSnapshot,
+            status: "warning",
+            auth: { status: "unauthenticated" },
+            usageLimits: bobLimits,
+          });
+          const unauthenticatedRefresh = yield* provider.refresh;
+          assert.strictEqual(unauthenticatedRefresh.usageLimits, undefined);
+          assert.strictEqual(unauthenticatedRefresh.auth.workspaceId, undefined);
+          assert.strictEqual(unauthenticatedRefresh.auth.label, undefined);
+
+          // Transitioning from unauthenticated to authenticated with probeFailed never inherits old limits.
+          const failedLimits = {
+            checkedAt: "2026-04-10T00:00:05.000Z",
+            windows: [],
+            unavailable: { reason: "probeFailed" },
+          } as const;
+          yield* Ref.set(probeRef, {
+            ...refreshedSnapshot,
+            auth: { status: "authenticated", email: "dave@example.com" },
+            usageLimits: failedLimits,
+          });
+          const recoveredRefresh = yield* provider.refresh;
+          assert.deepStrictEqual(recoveredRefresh.usageLimits, failedLimits);
+        }),
+      ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
 });

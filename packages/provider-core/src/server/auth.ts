@@ -52,6 +52,7 @@ export interface ProviderAuthController {
   ) => Effect.Effect<ProviderAuthState, ProviderSetupError>;
   readonly logout: (
     stopSessions: Effect.Effect<void, ProviderSetupError>,
+    actorSessionId?: string,
   ) => Effect.Effect<ProviderAuthState, ProviderSetupError>;
   readonly subscribe: (ownerSessionId: string) => Stream.Stream<ProviderAuthState>;
   readonly isLogoutPrompt?: (text: string, hasAttachments: boolean) => boolean;

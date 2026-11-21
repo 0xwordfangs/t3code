@@ -15,6 +15,8 @@ export interface AntigravityVerificationRequired {
 const isGoogleAccountVerificationUrl = Schema.is(GoogleAccountVerificationUrl);
 const EMBEDDED_ERROR_OBJECT_START = /\{\s*"error"\s*:/gu;
 const VALIDATION_REQUIRED_WORD = /\bVALIDATION_REQUIRED\b/;
+const MAX_VERIFICATION_TEXT_CHARS = 32_768;
+const MAX_CANDIDATE_JSON_MATCHES = 8;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -75,7 +77,10 @@ export function extractAntigravityVerificationRequired(
   };
 }
 
-function sliceBalancedJsonObject(text: string, startIndex: number): string | undefined {
+function sliceBalancedJsonObject(
+  text: string,
+  startIndex: number,
+): { readonly slice: string; readonly endIndex: number } | undefined {
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -98,7 +103,8 @@ function sliceBalancedJsonObject(text: string, startIndex: number): string | und
     } else if (ch === "}") {
       depth -= 1;
       if (depth === 0) {
-        return text.slice(startIndex, index + 1);
+        const endIndex = index + 1;
+        return { slice: text.slice(startIndex, endIndex), endIndex };
       }
     }
   }
@@ -108,15 +114,22 @@ function sliceBalancedJsonObject(text: string, startIndex: number): string | und
 export function extractAntigravityVerificationFromText(
   text: string,
 ): AntigravityVerificationRequired | undefined {
-  if (!VALIDATION_REQUIRED_WORD.test(text)) return undefined;
+  const bounded =
+    text.length > MAX_VERIFICATION_TEXT_CHARS ? text.slice(0, MAX_VERIFICATION_TEXT_CHARS) : text;
+  if (!VALIDATION_REQUIRED_WORD.test(bounded)) return undefined;
   let fallback: AntigravityVerificationRequired | undefined;
-  for (const match of text.matchAll(EMBEDDED_ERROR_OBJECT_START)) {
+  let inspected = 0;
+  let skipUntil = 0;
+  for (const match of bounded.matchAll(EMBEDDED_ERROR_OBJECT_START)) {
     const startIndex = match.index;
-    if (startIndex === undefined) continue;
-    const candidate = sliceBalancedJsonObject(text, startIndex);
+    if (startIndex === undefined || startIndex < skipUntil) continue;
+    if (inspected >= MAX_CANDIDATE_JSON_MATCHES) break;
+    inspected += 1;
+    const candidate = sliceBalancedJsonObject(bounded, startIndex);
     if (candidate === undefined) continue;
+    skipUntil = candidate.endIndex;
     try {
-      const parsed = extractAntigravityVerificationRequired(JSON.parse(candidate));
+      const parsed = extractAntigravityVerificationRequired(JSON.parse(candidate.slice));
       if (parsed === undefined) continue;
       if (parsed.verificationUrl !== undefined) return parsed;
       fallback ??= parsed;

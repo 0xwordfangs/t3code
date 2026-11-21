@@ -379,10 +379,16 @@ it.effect.each(["cancel", "logout"] as const)(
       const duplicate = yield* Effect.flip(harness.controller.respond!("owner", harness.input));
       assert.include(duplicate.detail, "already in progress");
       assert.equal(harness.responses(), 1);
+      for (const actor of ["other", undefined] as const) {
+        const denied = yield* Effect.flip(harness.controller.logout(Effect.void, actor));
+        assert.strictEqual(denied.operation, "logout");
+        assert.include(denied.detail, "Another session is currently signing in");
+      }
+      assert.isFalse(yield* Deferred.isDone(harness.cleanupStarted));
       const stopping = yield* (
         action === "cancel"
           ? harness.controller.cancel("owner", harness.input.flowId)
-          : harness.controller.logout(Effect.void)
+          : harness.controller.logout(Effect.void, "owner")
       ).pipe(Effect.forkChild);
       yield* Deferred.await(harness.cleanupStarted);
       assert.isTrue(yield* harness.controller.isChangingCredentials!);

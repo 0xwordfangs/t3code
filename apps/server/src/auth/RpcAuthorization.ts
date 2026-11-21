@@ -1,5 +1,6 @@
 import {
   CLIENT_GUARDED_RPC_SCOPES,
+  type ComposerContextRecord,
   type DeviceListInput,
   clientRpcRequiredScopes,
   containsSecretReference,
@@ -35,6 +36,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
 import type * as RpcGroup from "effect/rpc/RpcGroup";
+import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 
 type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
 
@@ -264,6 +266,65 @@ const requiredScopesForSettingsUpdate = (payload: unknown) => {
 const decodeProjectMutation = Schema.decodeUnknownSync(ProjectMutation);
 const decodeAssetCreateUrlInput = Schema.decodeUnknownSync(AssetCreateUrlInput);
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const isLogoutCommandText = (text: string): boolean => text.trim().toLowerCase() === "/logout";
+
+const isLogoutPromptText = (text: unknown, context?: unknown): boolean => {
+  if (typeof text !== "string") return false;
+  if (isLogoutCommandText(text)) return true;
+  if (!isRecord(context) || !Array.isArray(context.records)) return false;
+  return isLogoutCommandText(
+    projectComposerContextForProvider({
+      text,
+      records: context.records as ReadonlyArray<ComposerContextRecord>,
+    }),
+  );
+};
+
+const hasNoAttachments = (attachments: unknown, allowUndefined = false): boolean =>
+  (allowUndefined && attachments === undefined) ||
+  (Array.isArray(attachments) && attachments.length === 0);
+
+const requiresProviderManageForLogoutPrompt = (method: string, payload: unknown): boolean => {
+  if (!isRecord(payload)) return false;
+  if (method === ORCHESTRATION_V2_WS_METHODS.dispatchCommand) {
+    switch (payload.type) {
+      case "message.dispatch":
+        return (
+          hasNoAttachments(payload.attachments) && isLogoutPromptText(payload.text, payload.context)
+        );
+      case "queued-run.edit":
+        return (
+          hasNoAttachments(payload.attachments, true) &&
+          isLogoutPromptText(payload.text, payload.context)
+        );
+      case "thread.metadata.update":
+        return (
+          isRecord(payload.continuation) &&
+          isLogoutPromptText(payload.continuation.text, payload.continuation.context)
+        );
+      case "thread.create":
+        return (
+          isRecord(payload.initialMessage) &&
+          hasNoAttachments(payload.initialMessage.attachments) &&
+          isLogoutPromptText(payload.initialMessage.text, payload.initialMessage.context)
+        );
+      default:
+        return false;
+    }
+  }
+  if (method === ORCHESTRATION_V2_WS_METHODS.launchThread) {
+    return (
+      isRecord(payload.initialMessage) &&
+      hasNoAttachments(payload.initialMessage.attachments) &&
+      isLogoutPromptText(payload.initialMessage.text, payload.initialMessage.context)
+    );
+  }
+  return false;
+};
+
 const requiredScopesForRpcCall = (
   method: string,
   payload: unknown,
@@ -294,6 +355,9 @@ const requiredScopesForRpcCall = (
   }
   if (method === WS_METHODS.projectsMutate) {
     return requiredScopesForProjectMutation(decodeProjectMutation(payload));
+  }
+  if (requiresProviderManageForLogoutPrompt(method, payload)) {
+    return [AuthOrchestrationOperateScope, AuthProvidersManageScope];
   }
   const guarded = clientRpcRequiredScopes(method, payload);
   if (guarded.length > 0) return guarded;

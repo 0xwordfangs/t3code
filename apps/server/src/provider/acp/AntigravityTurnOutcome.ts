@@ -25,8 +25,12 @@ import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityPro
 const ERROR_STEP_TYPE = 17;
 // The harness error text leads the payload; a Go stack trace follows it.
 const MAX_ERROR_PAYLOAD_BYTES = 16_384;
+const MAX_ACP_ERROR_SCAN_CHARS = 32_768;
+const MAX_ACP_DATA_CANDIDATES = 8;
+const MAX_ACP_DATA_PROPERTIES = 64;
+const MAX_SERIALIZE_DEPTH = 16;
 // The Go harness's rendering of a Google API error, as the agent's api_errors.py reads it.
-const API_ERROR = /Error (\d{3}), Message: (.+?), Status: ([A-Z_]+)/s;
+const API_ERROR = /Error (\d{3}), Message: (.{1,4096}?), Status: ([A-Z_]+)/s;
 const QUOTA_EXHAUSTED = /\breason:QUOTA_EXHAUSTED\b/;
 const RESOURCE_EXHAUSTED = /\bRESOURCE_EXHAUSTED\b/;
 const HTTP_429 = /\bHTTP\s*429\b|\bstatus(?:\s*code)?\s*[:=]?\s*429\b/i;
@@ -214,37 +218,147 @@ function turnFailure(
   );
 }
 
-function serializeErrorData(data: unknown): string {
+function boundScanText(text: string, maxChars = MAX_ACP_ERROR_SCAN_CHARS): string {
+  return text.length > maxChars ? text.slice(0, maxChars) : text;
+}
+
+function serializeErrorData(data: unknown, maxChars = MAX_ACP_ERROR_SCAN_CHARS): string {
   if (data === undefined || data === null) return "";
-  if (typeof data === "string") return data;
+  if (typeof data === "string") return boundScanText(data, maxChars);
+  const chunks: Array<string> = [];
+  let length = 0;
+  const seen = new Set<object>();
+
+  const push = (chunk: string): boolean => {
+    if (length >= maxChars) return false;
+    const remaining = maxChars - length;
+    if (chunk.length <= remaining) {
+      chunks.push(chunk);
+      length += chunk.length;
+      return length < maxChars;
+    }
+    chunks.push(chunk.slice(0, remaining));
+    length = maxChars;
+    return false;
+  };
+
+  const visit = (value: unknown, depth: number): boolean => {
+    if (length >= maxChars) return false;
+    if (value === null) return push("null");
+    if (typeof value === "boolean") return push(value ? "true" : "false");
+    if (typeof value === "number") {
+      return push(Number.isFinite(value) ? String(value) : "null");
+    }
+    if (typeof value === "string") {
+      return push(JSON.stringify(boundScanText(value, maxChars - length + 2)));
+    }
+    if (typeof value === "bigint") return push(JSON.stringify(String(value)));
+    if (typeof value !== "object") return push("null");
+    if (value instanceof Date) return push(JSON.stringify(value.toISOString()));
+    if (depth >= MAX_SERIALIZE_DEPTH || seen.has(value)) return push('"[truncated]"');
+    seen.add(value);
+    try {
+      if (Array.isArray(value)) {
+        if (!push("[")) return false;
+        for (let index = 0; index < value.length; index++) {
+          if (index > 0 && !push(",")) return false;
+          const item = value[index];
+          if (item === undefined || typeof item === "function" || typeof item === "symbol") {
+            if (!push("null")) return false;
+          } else if (!visit(item, depth + 1)) {
+            return false;
+          }
+        }
+        return push("]");
+      }
+      if (!push("{")) return false;
+      let written = 0;
+      const record = value as Record<string, unknown>;
+      for (const key in record) {
+        if (!Object.hasOwn(record, key)) continue;
+        const entry = record[key];
+        if (entry === undefined || typeof entry === "function" || typeof entry === "symbol") {
+          continue;
+        }
+        if (written > 0 && !push(",")) return false;
+        written += 1;
+        if (!push(`${JSON.stringify(boundScanText(key, maxChars - length + 2))}:`)) {
+          return false;
+        }
+        if (!visit(entry, depth + 1)) return false;
+      }
+      return push("}");
+    } finally {
+      seen.delete(value);
+    }
+  };
+
   try {
-    return JSON.stringify(data);
+    visit(data, 0);
+    return chunks.join("");
   } catch {
     return "";
   }
 }
 
+function makeLazySerializedErrorData(data: unknown): () => string {
+  let cached: string | undefined;
+  return () => {
+    if (cached === undefined) {
+      cached = serializeErrorData(data);
+    }
+    return cached;
+  };
+}
+
 function extractVerificationFromAcpError(
   cause: EffectAcpErrors.AcpRequestError,
+  boundedErrorMessage: string,
+  readSerializedData: () => string,
 ): AntigravityVerificationRequired | undefined {
   const fromData = extractAntigravityVerificationRequired(cause.data);
   if (fromData?.verificationUrl !== undefined) return fromData;
   let fallback = fromData;
-  const candidates: Array<string> = [cause.errorMessage];
+
+  const fromMessage = extractAntigravityVerificationFromText(boundedErrorMessage);
+  if (fromMessage !== undefined) {
+    if (fromMessage.verificationUrl !== undefined) return fromMessage;
+    fallback ??= fromMessage;
+  }
+
   if (typeof cause.data === "string") {
-    candidates.push(cause.data);
-  } else if (typeof cause.data === "object" && cause.data !== null) {
-    for (const value of Object.values(cause.data)) {
-      if (typeof value === "string") candidates.push(value);
+    const parsed = extractAntigravityVerificationFromText(boundScanText(cause.data));
+    if (parsed !== undefined) {
+      if (parsed.verificationUrl !== undefined) return parsed;
+      fallback ??= parsed;
+    }
+    return fallback;
+  }
+
+  if (typeof cause.data === "object" && cause.data !== null) {
+    const record = cause.data as Record<string, unknown>;
+    let inspectedCandidates = 0;
+    let visitedProperties = 0;
+    for (const key in record) {
+      if (!Object.hasOwn(record, key)) continue;
+      if (
+        inspectedCandidates >= MAX_ACP_DATA_CANDIDATES ||
+        visitedProperties >= MAX_ACP_DATA_PROPERTIES
+      ) {
+        break;
+      }
+      visitedProperties += 1;
+      const value = record[key];
+      if (typeof value !== "string") continue;
+      inspectedCandidates += 1;
+      const parsed = extractAntigravityVerificationFromText(boundScanText(value));
+      if (parsed === undefined) continue;
+      if (parsed.verificationUrl !== undefined) return parsed;
+      fallback ??= parsed;
     }
   }
-  for (const candidate of candidates) {
-    const parsed = extractAntigravityVerificationFromText(candidate);
-    if (parsed === undefined) continue;
-    if (parsed.verificationUrl !== undefined) return parsed;
-    fallback ??= parsed;
-  }
-  return fallback ?? extractAntigravityVerificationFromText(serializeErrorData(cause.data));
+
+  return fallback ?? extractAntigravityVerificationFromText(readSerializedData());
 }
 
 /**
@@ -261,7 +375,13 @@ export function classifyAntigravityPromptFailure(
   if (!isAcpRequestError(cause)) {
     return makeProviderFailure({ cause, class: "provider_error" });
   }
-  const verification = extractVerificationFromAcpError(cause);
+  const boundedErrorMessage = boundScanText(cause.errorMessage);
+  const readSerializedData = makeLazySerializedErrorData(cause.data);
+  const verification = extractVerificationFromAcpError(
+    cause,
+    boundedErrorMessage,
+    readSerializedData,
+  );
   if (verification !== undefined) {
     return makeProviderFailure({
       cause,
@@ -274,13 +394,13 @@ export function classifyAntigravityPromptFailure(
         : { verificationUrl: verification.verificationUrl }),
     });
   }
-  const dataText = serializeErrorData(cause.data);
-  const combined = `${cause.errorMessage}\n${dataText}`;
+  const dataText = readSerializedData();
+  const combined = `${boundedErrorMessage}\n${dataText}`;
   const nonQuotaMatch = NON_QUOTA_PERMANENT.exec(combined);
   if (nonQuotaMatch !== null) {
     return makeProviderFailure({
       cause,
-      message: cause.errorMessage.trim() || undefined,
+      message: boundedErrorMessage.trim() || undefined,
       code: nonQuotaMatch[0].toUpperCase(),
       class: "provider_error",
       retryable: false,
@@ -295,7 +415,7 @@ export function classifyAntigravityPromptFailure(
     apiError?.[1] === "429" ||
     apiError?.[3] === "RESOURCE_EXHAUSTED";
   if (isQuotaError) {
-    const trimmed = cause.errorMessage.trim();
+    const trimmed = boundedErrorMessage.trim();
     return makeProviderFailure({
       cause,
       class: "usage_limit",
@@ -312,7 +432,7 @@ export function classifyAntigravityPromptFailure(
   }
   return makeProviderFailure({
     cause,
-    message: cause.errorMessage.trim() || undefined,
+    message: boundedErrorMessage.trim() || undefined,
     code: String(cause.code),
     class: "provider_error",
   });

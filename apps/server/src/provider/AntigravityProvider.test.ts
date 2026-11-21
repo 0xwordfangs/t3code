@@ -713,10 +713,14 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           windows: [],
           unavailable: { reason: "unsupported" },
         });
+        const refreshedSignedOut = yield* harness.provider.snapshot.refresh;
+        expect(refreshedSignedOut.auth.status).toBe("unauthenticated");
+        expect(refreshedSignedOut.usageLimits).toBeUndefined();
+        expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toBeUndefined();
         const unsupported = yield* harness.nextPublish(
           (snapshot) => snapshot.usageLimits?.unavailable?.reason === "unsupported",
         );
-        yield* harness.provider.snapshot.refresh;
+        yield* harness.provider.onSessionStarted(started);
         expect((yield* unsupported)?.usageLimits?.windows).toEqual([]);
       }),
   );
@@ -886,7 +890,11 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           usageLimits: failedLimits,
         });
 
-        // Switching accounts detected by checkProvider cancels an in-flight read and clears old limits.
+        // Switching accounts detected by checkProvider cancels an in-flight read and resets auth to unknown.
+        const verificationUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=switch-check",
+        );
+        yield* harness.provider.onVerificationRequired({ verificationUrl });
         const staleReadStarted = yield* Deferred.make<void>();
         const staleReadResult = yield* Deferred.make<ServerProviderUsageLimits>();
         yield* Ref.set(
@@ -904,12 +912,30 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
             snapshot.auth.email === "carol@example.com" &&
             snapshot.usageLimits?.windows[0]?.usedPercent === 5,
         );
-        yield* harness.provider.snapshot.refresh;
+        const switchedCheck = yield* harness.provider.snapshot.refresh;
+        expect(switchedCheck).toMatchObject({
+          status: "warning",
+          auth: { status: "unknown", email: "carol@example.com" },
+          models: [],
+          supportsTextGeneration: false,
+        });
+        expect(switchedCheck.usageLimits).toBeUndefined();
+        expect(switchedCheck.auth.verificationRequired).toBeUndefined();
+        expect(switchedCheck.auth.verificationUrl).toBeUndefined();
         yield* Deferred.succeed(staleReadResult, firstLimits);
         expect(yield* checkSwitchPublished).toMatchObject({
+          status: "warning",
+          auth: { status: "unknown", email: "carol@example.com" },
+          models: [],
+          usageLimits: thirdLimits,
+        });
+        yield* harness.provider.onSessionStarted(started);
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          status: "ready",
           auth: { status: "authenticated", email: "carol@example.com" },
           usageLimits: thirdLimits,
         });
+        expect((yield* harness.provider.snapshot.getSnapshot).models).toHaveLength(11);
 
         // onSignedIn clears the previous account's email even when the follow-up probe fails.
         yield* Ref.set(
@@ -1193,6 +1219,172 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           usageLimits: urlLessVerification.usageLimits,
         });
         expect((yield* urlLessPublished)?.auth.verificationUrl).toBeUndefined();
+      }),
+  );
+
+  it.effect(
+    "clears usageLimits and credentialFingerprint on sign-out and auth-required in snapshots and stream, without leaking to the next account",
+    () =>
+      Effect.gen(function* () {
+        const emailRef = yield* Ref.make<string | undefined>("alice@example.com");
+        const aliceLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          credentialFingerprint: "fp-alice",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 60 },
+          ],
+        };
+        const bobFailedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:05:00.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed", message: "Quota unavailable" },
+        };
+        const usage = yield* Ref.make<Effect.Effect<ServerProviderUsageLimits>>(
+          Effect.succeed(aliceLimits),
+        );
+        const harness = yield* makeHarness({
+          auth: { type: "oauth-personal", label: "Google account" },
+          readAccountEmail: Ref.get(emailRef),
+          probeUsage: Ref.get(usage).pipe(Effect.flatten),
+        });
+        const firstPublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.usageLimits?.credentialFingerprint === "fp-alice",
+        );
+        yield* harness.initialize;
+        expect((yield* firstPublished)?.usageLimits).toEqual(aliceLimits);
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+
+        for (const trigger of ["onSignedOut", "onAuthRequired"] as const) {
+          yield* Ref.set(emailRef, "alice@example.com");
+          yield* Ref.set(usage, Effect.succeed(aliceLimits));
+          const aliceReady = yield* harness.nextPublish(
+            (snapshot) =>
+              snapshot.auth.status === "authenticated" &&
+              snapshot.auth.email === "alice@example.com" &&
+              snapshot.usageLimits?.credentialFingerprint === "fp-alice",
+          );
+          yield* harness.provider.onSessionStarted(started);
+          expect((yield* aliceReady)?.usageLimits).toEqual(aliceLimits);
+
+          const clearedStream = yield* harness.nextPublish(
+            (snapshot) => snapshot.auth.status === "unauthenticated",
+          );
+          yield* trigger === "onSignedOut"
+            ? harness.provider.onSignedOut
+            : harness.provider.onAuthRequired;
+
+          const clearedSnapshot = yield* harness.provider.snapshot.getSnapshot;
+          expect(clearedSnapshot.auth.status).toBe("unauthenticated");
+          expect(clearedSnapshot.usageLimits).toBeUndefined();
+          const streamedCleared = yield* clearedStream;
+          expect(streamedCleared?.auth.status).toBe("unauthenticated");
+          expect(streamedCleared?.usageLimits).toBeUndefined();
+
+          yield* Ref.set(emailRef, "bob@example.com");
+          yield* Ref.set(usage, Effect.succeed(bobFailedLimits));
+          const bobPublished = yield* harness.nextPublish(
+            (snapshot) =>
+              snapshot.auth.status === "authenticated" &&
+              snapshot.auth.email === "bob@example.com" &&
+              snapshot.usageLimits?.unavailable?.reason === "probeFailed",
+          );
+          yield* harness.provider.onSessionStarted(started);
+          const bobStreamed = yield* bobPublished;
+          expect(bobStreamed?.usageLimits).toEqual(bobFailedLimits);
+          expect(bobStreamed?.usageLimits?.credentialFingerprint).toBeUndefined();
+          expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toEqual(
+            bobFailedLimits,
+          );
+        }
+      }),
+  );
+
+  it.effect("ignores a stale in-flight usage probe that finishes after authRevision advances", () =>
+    Effect.gen(function* () {
+      const emailRef = yield* Ref.make<string | undefined>("alice@example.com");
+      const staleReadStarted = yield* Deferred.make<void>();
+      const releaseStaleRead = yield* Deferred.make<ServerProviderUsageLimits>();
+      const staleLimits: ServerProviderUsageLimits = {
+        checkedAt: "2026-10-09T12:00:00.000Z",
+        credentialFingerprint: "fp-alice",
+        windows: [{ id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 90 }],
+      };
+      const bobFailedLimits: ServerProviderUsageLimits = {
+        checkedAt: "2026-10-09T12:01:00.000Z",
+        windows: [],
+        unavailable: { reason: "probeFailed" },
+      };
+      const usage = yield* Ref.make<Effect.Effect<ServerProviderUsageLimits>>(
+        Effect.uninterruptible(
+          Deferred.succeed(staleReadStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseStaleRead)),
+          ),
+        ),
+      );
+      const harness = yield* makeHarness({
+        auth: { type: "oauth-personal", label: "Google account" },
+        readAccountEmail: Ref.get(emailRef),
+        probeUsage: Ref.get(usage).pipe(Effect.flatten),
+      });
+      yield* harness.initialize;
+      yield* Deferred.await(staleReadStarted);
+      yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+
+      // Switch account while the uninterruptible probe for Alice is still running.
+      yield* Ref.set(emailRef, "bob@example.com");
+      yield* Ref.set(usage, Effect.succeed(bobFailedLimits));
+      const bobMetadataUpdated = yield* harness.nextPublish(
+        (snapshot) =>
+          snapshot.auth.status === "authenticated" && snapshot.auth.email === "bob@example.com",
+      );
+      const bobLimitsPublished = yield* harness.nextPublish(
+        (snapshot) =>
+          snapshot.auth.email === "bob@example.com" &&
+          snapshot.usageLimits?.unavailable?.reason === "probeFailed",
+      );
+      const sessionFiber = yield* harness.provider.onSessionStarted(started).pipe(Effect.forkChild);
+      yield* bobMetadataUpdated;
+
+      // Alice's probe completes after authRevision already advanced; it must be ignored.
+      yield* Deferred.succeed(releaseStaleRead, staleLimits);
+      yield* Fiber.join(sessionFiber);
+      const bobSnapshot = yield* bobLimitsPublished;
+      expect(bobSnapshot?.usageLimits).toEqual(bobFailedLimits);
+      expect(bobSnapshot?.usageLimits?.credentialFingerprint).toBeUndefined();
+      expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toEqual(bobFailedLimits);
+    }),
+  );
+
+  it.effect(
+    "does not probe or populate usageLimits on refresh while oauth-business is signed out",
+    () =>
+      Effect.gen(function* () {
+        const probeCount = yield* Ref.make(0);
+        const businessLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          credentialFingerprint: "fp-biz",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 15 },
+          ],
+        };
+        const harness = yield* makeHarness({
+          auth: { type: "oauth-business", label: "Gemini Enterprise" },
+          probeUsage: Ref.update(probeCount, (count) => count + 1).pipe(Effect.as(businessLimits)),
+        });
+        const initialPublished = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
+        yield* harness.initialize;
+        expect((yield* initialPublished)?.usageLimits).toEqual(businessLimits);
+
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+        yield* harness.provider.onSessionStarted(started);
+        yield* harness.provider.onSignedOut;
+        yield* Ref.set(probeCount, 0);
+
+        const refreshed = yield* harness.provider.snapshot.refresh;
+        expect(refreshed.auth.status).toBe("unauthenticated");
+        expect(refreshed.usageLimits).toBeUndefined();
+        expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toBeUndefined();
+        expect(yield* Ref.get(probeCount)).toBe(0);
       }),
   );
 });

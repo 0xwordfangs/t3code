@@ -29,6 +29,7 @@ import { ChildProcessSpawner } from "effect/process";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as DocumentText from "../../../provider/DocumentText.ts";
+import * as AntigravityFailover from "../../../orchestration-v2/AntigravityFailover.ts";
 import { OrchestratorRuntimeModeAboveCeilingError } from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -57,6 +58,7 @@ const clientLaunchHarness = (input: {
   /** Where Settings saves a project's model; the legacy project field stays null. */
   readonly overrideModel?: ModelSelection;
   readonly launched: Array<ThreadLaunch.ThreadLaunchInput>;
+  readonly suppressedPreflight?: Array<boolean>;
   readonly workspaceRoot?: string;
   readonly checkWorktreeBase?: ThreadLaunch.ThreadLaunchService["Service"]["checkWorktreeBase"];
   readonly hostedAppUrl?: string;
@@ -127,11 +129,14 @@ const clientLaunchHarness = (input: {
     }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({
       checkWorktreeBase: input.checkWorktreeBase ?? (() => Effect.void),
-      launch: (launch) => {
-        input.launched.push(launch);
-        if (input.refusedByCeiling) {
-          return Effect.fail(
-            new ThreadLaunch.ThreadLaunchError({
+      launch: (launch) =>
+        Effect.gen(function* () {
+          input.launched.push(launch);
+          if (input.suppressedPreflight !== undefined) {
+            input.suppressedPreflight.push(yield* AntigravityFailover.SuppressAntigravityPreflight);
+          }
+          if (input.refusedByCeiling) {
+            return yield* new ThreadLaunch.ThreadLaunchError({
               operation: "create-thread",
               commandId: launch.commandId,
               projectId: launch.projectId,
@@ -143,23 +148,22 @@ const clientLaunchHarness = (input: {
                 maxRuntimeMode: "approval-required",
                 organization: "Example Corp",
               }),
-            }),
-          );
-        }
-        return Effect.succeed({
-          threadId: launch.threadId,
-          projection: {
-            thread: {
-              id: launch.threadId,
-              projectId: launch.projectId,
-              title: launch.title,
-              modelSelection: launch.modelSelection,
+            });
+          }
+          return {
+            threadId: launch.threadId,
+            projection: {
+              thread: {
+                id: launch.threadId,
+                projectId: launch.projectId,
+                title: launch.title,
+                modelSelection: launch.modelSelection,
+              },
+              runs: [],
             },
-            runs: [],
-          },
-          resumed: false,
-        } as unknown as ThreadLaunch.ThreadLaunchResult);
-      },
+            resumed: false,
+          } as unknown as ThreadLaunch.ThreadLaunchResult;
+        }),
     }),
     Layer.mock(Project.ProjectService)({
       getById: (id) =>
@@ -899,6 +903,48 @@ it.effect("a client launches with the fallback for an exhausted default", () =>
     });
     expect(launched[0]?.modelSelection).toEqual(fallbackModel);
   }),
+);
+
+it.effect(
+  "suppresses Antigravity pre-flight failover only when t3_thread_launch explicitly passes modelSelection",
+  () =>
+    Effect.gen(function* () {
+      const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+      const suppressedPreflight: Array<boolean> = [];
+      const pinnedModel: ModelSelection = {
+        instanceId: ProviderInstanceId.make("antigravity"),
+        model: "gemini-4-neon",
+      };
+      const { projectId, dependencies } = clientLaunchHarness({
+        runtimeModeCeiling: "full-access",
+        launched,
+        suppressedPreflight,
+      });
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+            Layer.provide(dependencies),
+          ),
+        ),
+      );
+      yield* toolkit
+        .handle("t3_thread_launch", {
+          projectId,
+          title: "Pinned",
+          modelSelection: { provider: "antigravity", model: "gemini-4-neon" },
+          message: "hi",
+        })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+      yield* toolkit
+        .handle("t3_thread_launch", {
+          projectId,
+          title: "Defaulted",
+          message: "hi",
+        })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+      expect(launched[0]?.modelSelection).toEqual(pinnedModel);
+      expect(suppressedPreflight).toEqual([true, false]);
+    }),
 );
 
 it.effect("an agent's clone is not cut off while git is still transferring", () =>

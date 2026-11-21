@@ -212,6 +212,7 @@ export function providersWithLimits(
     (provider) =>
       provider.enabled &&
       provider.installed &&
+      provider.auth.status !== "unauthenticated" &&
       isProviderAvailable(provider) &&
       provider.usageLimits !== undefined,
   );
@@ -436,7 +437,7 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   const resolveKey = accountKeyResolver(
     [...presentations.values()].flatMap((presentation) => [
       ...(presentation.serverConfig?.providers ?? [])
-        .filter((provider) => provider.enabled)
+        .filter((provider) => provider.enabled && provider.auth.status !== "unauthenticated")
         .map(nativeReport),
       ...(presentation.serverConfig?.usageLimitSources ?? []).flatMap((source) => source.accounts),
     ]),
@@ -914,7 +915,9 @@ export function collectProviderUsageLimits(
   const selected = providers.find((provider) => provider.instanceId === instanceId);
   if (!selected || !hasProviderUsageLimits(selected.driver, providers, sources)) return null;
   const resolveKey = accountKeyResolver([
-    ...providers.filter((provider) => provider.enabled).map(nativeReport),
+    ...providers
+      .filter((provider) => provider.enabled && provider.auth.status !== "unauthenticated")
+      .map(nativeReport),
     ...sources.flatMap((source) => source.accounts),
   ]);
   type NativeSnapshot = { provider: ServerProvider; limits: ServerProviderUsageLimits };
