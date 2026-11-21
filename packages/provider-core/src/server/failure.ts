@@ -1,14 +1,15 @@
-import type {
-  NodeId,
-  OrchestrationV2ProviderFailure,
-  OrchestrationV2ProviderFailureClass,
-  OrchestrationV2ProviderRetry,
-  OrchestrationV2TurnItem,
-  ProviderDriverKind,
-  ProviderThreadId,
-  ProviderTurnId,
-  RunId,
-  ThreadId,
+import {
+  GoogleAccountVerificationUrl,
+  type NodeId,
+  type OrchestrationV2ProviderFailure,
+  type OrchestrationV2ProviderFailureClass,
+  type OrchestrationV2ProviderRetry,
+  type OrchestrationV2TurnItem,
+  type ProviderDriverKind,
+  type ProviderThreadId,
+  type ProviderTurnId,
+  type RunId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Cause from "effect/Cause";
@@ -282,6 +283,13 @@ function boundedText(value: string, maxLength: number): string {
   return `${redacted.slice(0, end)}…`;
 }
 
+const isGoogleAccountVerificationUrl = Schema.is(GoogleAccountVerificationUrl);
+
+function providerFailureTitle(failure: OrchestrationV2ProviderFailure): string {
+  if (failure.code === "VALIDATION_REQUIRED") return "Verification required";
+  return failure.class === "usage_limit" ? "Usage limit reached" : "Provider error";
+}
+
 export function makeProviderFailure(input: {
   readonly cause?: unknown;
   readonly message?: string | undefined;
@@ -289,6 +297,7 @@ export function makeProviderFailure(input: {
   readonly class?: OrchestrationV2ProviderFailureClass;
   readonly retryable?: boolean | null;
   readonly resetAt?: string | null;
+  readonly verificationUrl?: string | undefined;
 }): OrchestrationV2ProviderFailure {
   const curated = curatedCauseMessages(input.cause);
   const requestTooLarge =
@@ -301,6 +310,11 @@ export function makeProviderFailure(input: {
   const rawCode = input.code ?? stringField(input.cause, "code") ?? null;
   const code =
     rawCode === null ? null : boundedText(rawCode, MAX_PROVIDER_FAILURE_CODE_LENGTH) || null;
+  // Validated Google account verification links require query params (e.g. `?plt=...`), so skip URL redaction.
+  const verificationUrl =
+    input.verificationUrl !== undefined && isGoogleAccountVerificationUrl(input.verificationUrl)
+      ? input.verificationUrl
+      : undefined;
 
   return {
     class: input.class ?? "unknown",
@@ -312,6 +326,7 @@ export function makeProviderFailure(input: {
     Number.isFinite(Date.parse(input.resetAt))
       ? { resetAt: DateTime.formatIso(DateTime.makeUnsafe(input.resetAt)) }
       : {}),
+    ...(verificationUrl === undefined ? {} : { verificationUrl }),
   };
 }
 
@@ -342,7 +357,7 @@ export function makeProviderFailureTurnItem(input: {
     parentItemId: null,
     ordinal: input.itemOrdinal,
     status: "failed",
-    title: input.failure.class === "usage_limit" ? "Usage limit reached" : "Provider error",
+    title: providerFailureTitle(input.failure),
     startedAt: input.retryStartedAt ?? input.occurredAt,
     completedAt: input.occurredAt,
     updatedAt: input.occurredAt,
@@ -381,7 +396,7 @@ export function makeProviderRetryTurnItem(input: {
   if (input.status === "completed") {
     title = "Provider recovered";
   } else if (input.status === "failed") {
-    title = input.failure.class === "usage_limit" ? "Usage limit reached" : "Provider error";
+    title = providerFailureTitle(input.failure);
   } else if (input.status === "interrupted" || input.status === "cancelled") {
     title = "Provider retry stopped";
   }

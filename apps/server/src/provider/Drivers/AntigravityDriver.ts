@@ -560,7 +560,7 @@ export const AntigravityDriver: ProviderDriver<
       environment: processEnvironment,
       stampIdentity: classifyModels,
       probe,
-      probeUsage: usage.probe,
+      probeUsage: usage.probeDetailed,
       ...(auth.authMethod === "oauth-personal"
         ? {
             readAccountEmail: readAntigravityStoredEmail(profileDirectory).pipe(
@@ -609,6 +609,7 @@ export const AntigravityDriver: ProviderDriver<
           ? provider.onAvailableCommands(event.availableCommands)
           : Effect.void;
       },
+      onVerificationRequired: provider.onVerificationRequired,
       continuationRequests,
       nativeLogging: (threadId) =>
         makeNativeLogger({

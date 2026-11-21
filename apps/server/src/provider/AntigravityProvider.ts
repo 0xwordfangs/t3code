@@ -3,6 +3,7 @@ import {
   ANTIGRAVITY_DEFAULT_MODEL,
   ProviderDriverKind,
   type AntigravitySettings,
+  type GoogleAccountVerificationUrl,
   type ProviderSetupError,
   type ServerProvider,
   type ServerProviderModel,
@@ -35,9 +36,14 @@ import {
   isCommandMissingCause,
   type ServerProviderDraft,
 } from "@t3tools/provider-core/server/snapshotProbe";
-import { resolveUsageLimitsAfterProbe } from "@t3tools/provider-core/server/usageLimits";
+import {
+  makeUnavailableUsageLimits,
+  resolveUsageLimitsAfterProbe,
+} from "@t3tools/provider-core/server/usageLimits";
 
 import { antigravityThinkingConfig } from "./acp/AntigravityAcpSupport.ts";
+import type { AntigravityUsageProbeResult } from "./antigravityUsageLimits.ts";
+import { ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE } from "./antigravityVerification.ts";
 
 const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
 const MAX_WORKSPACE_SNAPSHOTS = 32;
@@ -153,6 +159,7 @@ function isMissingInstallation(error: EffectAcpErrors.AcpError | ProviderSetupEr
 interface AntigravityProviderState {
   readonly draft: ServerProviderDraft;
   readonly authRevision: number;
+  readonly verificationRequired: boolean;
 }
 
 interface AntigravityProviderOptions {
@@ -164,10 +171,16 @@ interface AntigravityProviderOptions {
   >;
   readonly supportsTextGeneration: Effect.Effect<boolean>;
   readonly readAccountEmail?: Effect.Effect<string | undefined>;
-  readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+  readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits | AntigravityUsageProbeResult>;
   readonly clearUsage?: Effect.Effect<void>;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
+}
+
+function normalizeUsageProbeResult(
+  result: ServerProviderUsageLimits | AntigravityUsageProbeResult,
+): AntigravityUsageProbeResult {
+  return "usageLimits" in result ? result : { usageLimits: result };
 }
 
 function withAuthEmail(
@@ -178,6 +191,21 @@ function withAuthEmail(
   if (trimmed) return { ...auth, email: trimmed };
   const { email: _previous, ...rest } = auth;
   return rest;
+}
+
+function withAuthVerification(
+  auth: ServerProviderDraft["auth"],
+  verification:
+    | { readonly required: true; readonly url?: GoogleAccountVerificationUrl | undefined }
+    | undefined,
+): ServerProviderDraft["auth"] {
+  const { verificationRequired: _previousRequired, verificationUrl: _previousUrl, ...rest } = auth;
+  if (verification === undefined) return rest;
+  return {
+    ...rest,
+    verificationRequired: true,
+    ...(verification.url !== undefined ? { verificationUrl: verification.url } : {}),
+  };
 }
 
 function isDifferentEmail(previous: string | undefined, next: string | undefined): boolean {
@@ -232,6 +260,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const metadata = yield* SubscriptionRef.make<AntigravityProviderState>({
     draft: initialDraft,
     authRevision: 0,
+    verificationRequired: false,
   });
   // Preserve disk-discovered skills when callbacks replace workspace commands; the registry will not rescan them.
   const discoveredSkills = new Map<string, ServerProvider["skills"]>();
@@ -261,21 +290,83 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     yield* FiberHandle.run(
       usageRead,
       options.probeUsage.pipe(
+        Effect.map(normalizeUsageProbeResult),
         Effect.flatMap((probed) =>
-          SubscriptionRef.update(metadata, (state) =>
-            isDifferentEmail(startedEmail, state.draft.auth.email)
-              ? state
-              : {
-                  ...state,
-                  draft: {
-                    ...state.draft,
-                    usageLimits: resolveUsageLimitsAfterProbe({
-                      published: state.draft.usageLimits,
-                      probed,
-                    }),
-                  },
+          SubscriptionRef.update(metadata, (state): AntigravityProviderState => {
+            if (isDifferentEmail(startedEmail, state.draft.auth.email)) {
+              return state;
+            }
+            if (probed.verificationRequired !== undefined) {
+              if (state.draft.auth.status === "unauthenticated") {
+                return state;
+              }
+              const verificationMessage =
+                probed.verificationRequired.message.trim() ||
+                ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
+              const verificationUrl =
+                probed.verificationRequired.verificationUrl ?? state.draft.auth.verificationUrl;
+              return {
+                ...state,
+                verificationRequired: true,
+                draft: {
+                  ...state.draft,
+                  auth: withAuthVerification(state.draft.auth, {
+                    required: true,
+                    url: verificationUrl,
+                  }),
+                  status: "warning",
+                  message: verificationMessage,
+                  usageLimits: probed.usageLimits,
                 },
-          ),
+              };
+            }
+            const shouldClearVerification = probed.usageLimits.windows.length > 0;
+            const nextUsageLimits =
+              state.verificationRequired && !shouldClearVerification
+                ? state.draft.usageLimits
+                : resolveUsageLimitsAfterProbe({
+                    published: state.draft.usageLimits,
+                    probed: probed.usageLimits,
+                  });
+            if (!shouldClearVerification) {
+              return {
+                ...state,
+                draft: {
+                  ...state.draft,
+                  usageLimits: nextUsageLimits,
+                },
+              };
+            }
+            const hadVerification =
+              state.verificationRequired ||
+              state.draft.auth.verificationRequired === true ||
+              state.draft.auth.verificationUrl !== undefined;
+            const { message: _previousMessage, ...draftWithoutMessage } = state.draft;
+            const clearedAuth = withAuthVerification(state.draft.auth, undefined);
+            const restoredMessage =
+              clearedAuth.status === "authenticated"
+                ? undefined
+                : clearedAuth.status === "unauthenticated"
+                  ? signInMessage
+                  : authUncheckedMessage;
+            return {
+              ...state,
+              verificationRequired: false,
+              draft: {
+                ...(hadVerification && state.draft.status === "warning"
+                  ? draftWithoutMessage
+                  : state.draft),
+                auth: clearedAuth,
+                ...(hadVerification && state.draft.status === "warning"
+                  ? {
+                      status: clearedAuth.status === "authenticated" ? "ready" : "warning",
+                      ...(restoredMessage ? { message: restoredMessage } : {}),
+                    }
+                  : {}),
+                usageLimits: nextUsageLimits,
+              },
+            };
+          }),
         ),
         // Enrichment cannot change published limits; a health check publishes them.
         Effect.andThen(
@@ -327,42 +418,74 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
         ? yield* options.readAccountEmail
         : undefined;
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
-    const { next, switchedAccount } = yield* SubscriptionRef.modify(
+    const { next, switchedAccount, authChanged } = yield* SubscriptionRef.modify(
       metadata,
       (
         state,
       ): readonly [
-        { readonly next: AntigravityProviderState; readonly switchedAccount: boolean },
+        {
+          readonly next: AntigravityProviderState;
+          readonly switchedAccount: boolean;
+          readonly authChanged: boolean;
+        },
         AntigravityProviderState,
       ] => {
         if (state.authRevision !== before.authRevision) {
-          return [{ next: state, switchedAccount: false }, state];
+          return [{ next: state, switchedAccount: false, authChanged: true }, state];
         }
-        const { message: _previousMessage, ...draft } = state.draft;
-        const auth =
+        const { message: previousMessage, ...draft } = state.draft;
+        const emailAuth =
           initialized !== undefined &&
           options.readAccountEmail !== undefined &&
           draft.auth.status !== "unauthenticated"
             ? withAuthEmail(draft.auth, accountEmail ?? draft.auth.email)
             : draft.auth;
-        const switchedAccount = isDifferentEmail(draft.auth.email, auth.email);
+        const switchedAccount = isDifferentEmail(draft.auth.email, emailAuth.email);
+        const clearVerification = switchedAccount || emailAuth.status === "unauthenticated";
+        const verificationRequired =
+          !clearVerification &&
+          (state.verificationRequired ||
+            emailAuth.verificationRequired === true ||
+            emailAuth.verificationUrl !== undefined);
+        const auth = clearVerification
+          ? withAuthVerification(emailAuth, undefined)
+          : verificationRequired
+            ? withAuthVerification(emailAuth, { required: true, url: emailAuth.verificationUrl })
+            : emailAuth;
         const authenticated = auth.status === "authenticated";
+        const verificationMessage =
+          state.draft.status === "warning" &&
+          previousMessage &&
+          previousMessage !== authUncheckedMessage &&
+          previousMessage !== signInMessage &&
+          previousMessage !== "Checking Antigravity availability."
+            ? previousMessage
+            : ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
         const message =
           errorMessage ??
-          (authenticated
-            ? undefined
-            : auth.status === "unauthenticated"
-              ? signInMessage
-              : authUncheckedMessage);
+          (verificationRequired
+            ? verificationMessage
+            : authenticated
+              ? undefined
+              : auth.status === "unauthenticated"
+                ? signInMessage
+                : authUncheckedMessage);
         const checked: AntigravityProviderState = {
           ...state,
+          verificationRequired,
           draft: {
             ...draft,
             auth,
             installed: !missingInstallation,
             // Lightweight custom-launcher probes lack versions; preserve the real handshake's version.
             version: version === "unknown" ? draft.version : version || draft.version,
-            status: errorMessage ? "error" : authenticated ? "ready" : "warning",
+            status: errorMessage
+              ? "error"
+              : verificationRequired
+                ? "warning"
+                : authenticated
+                  ? "ready"
+                  : "warning",
             checkedAt: updatedAt,
             usageLimits: missingInstallation || switchedAccount ? undefined : draft.usageLimits,
             ...(missingInstallation
@@ -383,11 +506,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             ...(message ? { message } : {}),
           },
         };
-        return [{ next: checked, switchedAccount }, checked];
+        return [{ next: checked, switchedAccount, authChanged: false }, checked];
       },
     );
     if (switchedAccount) yield* resetUsage;
-    if (initialized !== undefined) yield* refreshUsage();
+    if (initialized !== undefined && !authChanged) {
+      yield* refreshUsage();
+    }
     return yield* options.stampIdentity(next.draft);
   });
 
@@ -434,37 +559,60 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             state,
           ] as const;
         }
-        const { message: _previousMessage, ...draft } = state.draft;
+        const { message: previousMessage, ...draft } = state.draft;
         const wasUnauthenticated = draft.auth.status === "unauthenticated";
         const email =
           state.authRevision === before.authRevision
             ? (accountEmail ?? state.draft.auth.email)
             : state.draft.auth.email;
         const switchedAccount = isDifferentEmail(draft.auth.email, email);
+        const preserveVerification =
+          !switchedAccount &&
+          !wasUnauthenticated &&
+          (state.verificationRequired ||
+            draft.auth.verificationRequired === true ||
+            draft.auth.verificationUrl !== undefined);
+        const verificationUrl = preserveVerification ? draft.auth.verificationUrl : undefined;
+        const verificationMessage =
+          state.draft.status === "warning" &&
+          previousMessage &&
+          previousMessage !== authUncheckedMessage &&
+          previousMessage !== signInMessage &&
+          previousMessage !== "Checking Antigravity availability."
+            ? previousMessage
+            : ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
         const workspaces = draft.workspaceSnapshots ?? [];
         const workspace = cwd ? workspaces.find((entry) => entry.cwd === cwd) : undefined;
         const nextUsageLimits = switchedAccount ? undefined : draft.usageLimits;
         return [
           {
             shouldRefreshUsage:
-              wasUnauthenticated || !nextUsageLimits || Boolean(nextUsageLimits.unavailable),
+              preserveVerification ||
+              wasUnauthenticated ||
+              !nextUsageLimits ||
+              Boolean(nextUsageLimits.unavailable),
             switchedAccount,
             wasUnauthenticated,
           },
           {
             authRevision: state.authRevision + 1,
+            verificationRequired: preserveVerification,
             draft: {
               ...draft,
               installed: true,
-              status: "ready",
+              status: preserveVerification ? "warning" : "ready",
+              ...(preserveVerification ? { message: verificationMessage } : {}),
               version: started.initializeResult.agentInfo?.version || draft.version,
-              auth: withAuthEmail(
-                {
-                  status: "authenticated",
-                  type: options.auth?.type ?? "oauth-personal",
-                  label: options.auth?.label ?? "Google account",
-                },
-                email,
+              auth: withAuthVerification(
+                withAuthEmail(
+                  {
+                    status: "authenticated",
+                    type: options.auth?.type ?? "oauth-personal",
+                    label: options.auth?.label ?? "Google account",
+                  },
+                  email,
+                ),
+                preserveVerification ? { required: true, url: verificationUrl } : undefined,
               ),
               usageLimits: nextUsageLimits,
               checkedAt: updatedAt,
@@ -545,6 +693,47 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     });
   });
 
+  const onVerificationRequired = Effect.fn("AntigravityProvider.onVerificationRequired")(
+    function* (input: {
+      readonly verificationUrl?: GoogleAccountVerificationUrl;
+      readonly message?: string;
+    }) {
+      if (!settings.enabled) return;
+      yield* FiberHandle.clear(usageRead);
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      const verificationMessage =
+        input.message?.trim() || ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
+      yield* SubscriptionRef.update(metadata, (state) => {
+        if (state.draft.auth.status === "unauthenticated") return state;
+        const verificationUrl = input.verificationUrl ?? state.draft.auth.verificationUrl;
+        return {
+          authRevision: state.authRevision + 1,
+          verificationRequired: true,
+          draft: {
+            ...state.draft,
+            auth: withAuthVerification(state.draft.auth, {
+              required: true,
+              url: verificationUrl,
+            }),
+            status: "warning",
+            message: verificationMessage,
+            checkedAt: updatedAt,
+            usageLimits: makeUnavailableUsageLimits({
+              checkedAt: updatedAt,
+              reason: "probeFailed",
+              message: verificationMessage,
+            }),
+          },
+        } satisfies AntigravityProviderState;
+      });
+      yield* Deferred.await(republish).pipe(
+        Effect.flatten,
+        Effect.provideService(PublishingUsage, true),
+        Effect.ignoreCause({ log: true }),
+      );
+    },
+  );
+
   const clearAccountMetadata = Effect.fn("AntigravityProvider.clearAccountMetadata")(function* () {
     yield* resetUsage;
     if (!settings.enabled) return;
@@ -554,6 +743,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       (state) =>
         ({
           authRevision: state.authRevision + 1,
+          verificationRequired: false,
           draft: {
             ...state.draft,
             auth: {
@@ -609,6 +799,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     onSessionStarted,
     onConfigOptionsUpdated,
     onAvailableCommands,
+    onVerificationRequired,
     // The new sign-in may be another account. Clear and republish its limits so a failed read
     // cannot fall back to them; the session start then reads the new account's limits.
     onSignedIn: resetUsage.pipe(
@@ -617,7 +808,11 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           const { usageLimits: _previousAccount, ...draft } = state.draft;
           return {
             authRevision: state.authRevision + 1,
-            draft: { ...draft, auth: withAuthEmail(draft.auth, undefined) },
+            verificationRequired: false,
+            draft: {
+              ...draft,
+              auth: withAuthVerification(withAuthEmail(draft.auth, undefined), undefined),
+            },
           };
         }),
       ),

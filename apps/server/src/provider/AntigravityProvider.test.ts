@@ -4,6 +4,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
   AntigravitySettings,
+  GoogleAccountVerificationUrl,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSetupError,
@@ -26,6 +27,7 @@ import * as ProviderHostLive from "./ProviderHostLive.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import type { ServerProvider } from "@t3tools/contracts";
+import type { AntigravityUsageProbeResult } from "./antigravityUsageLimits.ts";
 import {
   buildAntigravityModelsFromSession,
   makeAntigravityProvider,
@@ -135,7 +137,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     readonly enabled?: boolean;
     readonly safe?: boolean;
     readonly readAccountEmail?: Effect.Effect<string | undefined>;
-    readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+    readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits | AntigravityUsageProbeResult>;
   } = {},
 ) {
   const initialProbe = yield* Deferred.make<EffectAcpSchema.InitializeResponse, ProbeError>();
@@ -971,5 +973,226 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       });
       expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toEqual(bobLimits);
     }),
+  );
+
+  it.effect(
+    "marks warning with verificationUrl when probe returns verificationRequired, clears cached quota windows, and restores ready once healthy",
+    () =>
+      Effect.gen(function* () {
+        const verificationUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=provider-probe-1",
+        );
+        const verificationMessage = "Verify your Google account to use Antigravity.";
+        const cachedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 15 },
+          ],
+        };
+        const verificationProbeResult: AntigravityUsageProbeResult = {
+          usageLimits: {
+            checkedAt: "2026-10-09T12:01:00.000Z",
+            windows: [],
+            unavailable: { reason: "probeFailed", message: verificationMessage },
+          },
+          verificationRequired: {
+            message: verificationMessage,
+            verificationUrl,
+          },
+        };
+        const genericProbeFailure: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:02:00.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed", message: "Temporary probe failure" },
+        };
+        const restoredLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:03:00.000Z",
+          windows: [{ id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 0 }],
+        };
+
+        const usage = yield* Ref.make<
+          Effect.Effect<ServerProviderUsageLimits | AntigravityUsageProbeResult>
+        >(Effect.succeed(cachedLimits));
+        const harness = yield* makeHarness({
+          auth: { type: "oauth-personal", label: "Google account" },
+          probeUsage: Ref.get(usage).pipe(Effect.flatten),
+        });
+        const initialCached = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
+        yield* harness.initialize;
+        expect((yield* initialCached)?.usageLimits).toEqual(cachedLimits);
+
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* harness.provider.snapshot.getSnapshot).status).toBe("ready");
+
+        // Probe returns verificationRequired -> warning + verificationUrl + clears cached quota windows.
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+        yield* Ref.set(usage, Effect.succeed(verificationProbeResult));
+        const verifiedPublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.auth.verificationUrl === verificationUrl,
+        );
+        yield* harness.provider.snapshot.refresh;
+        expect(yield* verifiedPublished).toMatchObject({
+          status: "warning",
+          message: verificationMessage,
+          auth: { status: "authenticated", verificationUrl },
+          usageLimits: verificationProbeResult.usageLimits,
+        });
+
+        // Subsequent checkProvider / refresh keeps warning and verificationUrl when probe fails generically.
+        yield* Ref.set(usage, Effect.succeed(genericProbeFailure));
+        const refreshedDuringWarning = yield* harness.provider.snapshot.refresh;
+        expect(refreshedDuringWarning).toMatchObject({
+          status: "warning",
+          message: verificationMessage,
+          auth: { status: "authenticated", verificationUrl },
+          usageLimits: verificationProbeResult.usageLimits,
+        });
+
+        // Healthy probe with quota windows clears verificationUrl and restores status to ready.
+        yield* Ref.set(usage, Effect.succeed(restoredLimits));
+        const restoredPublished = yield* harness.nextPublish(
+          (snapshot) =>
+            snapshot.status === "ready" &&
+            snapshot.auth.verificationUrl === undefined &&
+            snapshot.usageLimits?.windows.length === 1,
+        );
+        yield* harness.provider.snapshot.refresh;
+        const restored = yield* restoredPublished;
+        expect(restored).toMatchObject({
+          status: "ready",
+          auth: { status: "authenticated" },
+          usageLimits: restoredLimits,
+        });
+        expect(restored?.auth.verificationUrl).toBeUndefined();
+        expect(restored?.message).toBeUndefined();
+      }),
+  );
+
+  it.effect(
+    "onVerificationRequired sets warning and clears stale quota windows while sign-in/sign-out/auth-required clear verificationUrl",
+    () =>
+      Effect.gen(function* () {
+        const verificationUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=turn-event-1",
+        );
+        const cachedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 42 },
+          ],
+        };
+        const probeFailed: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:01:00.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed" },
+        };
+        const usage = yield* Ref.make<
+          Effect.Effect<ServerProviderUsageLimits | AntigravityUsageProbeResult>
+        >(Effect.succeed(cachedLimits));
+        const harness = yield* makeHarness({
+          auth: { type: "oauth-personal", label: "Google account" },
+          probeUsage: Ref.get(usage).pipe(Effect.flatten),
+        });
+        const initialCached = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
+        yield* harness.initialize;
+        expect((yield* initialCached)?.usageLimits).toEqual(cachedLimits);
+
+        yield* harness.provider.onSessionStarted(started);
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+        yield* Ref.set(usage, Effect.succeed(probeFailed));
+
+        const customMessage = "Verify your Google account to continue using Antigravity.";
+        yield* harness.provider.onVerificationRequired({
+          verificationUrl,
+          message: customMessage,
+        });
+        const warned = yield* harness.provider.snapshot.getSnapshot;
+        expect(warned).toMatchObject({
+          status: "warning",
+          message: customMessage,
+          auth: { status: "authenticated", verificationUrl },
+          usageLimits: {
+            windows: [],
+            unavailable: { reason: "probeFailed", message: customMessage },
+          },
+        });
+
+        // onSignedIn clears verificationUrl.
+        yield* harness.provider.onSignedIn;
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBeUndefined();
+
+        // Re-trigger verification, then confirm onSignedOut clears verificationUrl.
+        yield* harness.provider.onSessionStarted(started);
+        yield* harness.provider.onVerificationRequired({ verificationUrl, message: customMessage });
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBe(
+          verificationUrl,
+        );
+        yield* harness.provider.onSignedOut;
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          auth: { status: "unauthenticated" },
+        });
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBeUndefined();
+
+        // Re-trigger verification, then confirm onAuthRequired clears verificationUrl.
+        yield* harness.provider.onSessionStarted(started);
+        yield* harness.provider.onVerificationRequired({ verificationUrl, message: customMessage });
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBe(
+          verificationUrl,
+        );
+        yield* harness.provider.onAuthRequired;
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          auth: { status: "unauthenticated" },
+        });
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBeUndefined();
+        expect(
+          (yield* harness.provider.snapshot.getSnapshot).auth.verificationRequired,
+        ).toBeUndefined();
+
+        // A refresh while signed out must not stamp verificationRequired onto an unauthenticated account.
+        yield* Ref.set(
+          usage,
+          Effect.succeed({
+            usageLimits: {
+              checkedAt: "2026-10-09T12:02:00.000Z",
+              windows: [],
+              unavailable: { reason: "probeFailed", message: customMessage },
+            },
+            verificationRequired: { message: customMessage, verificationUrl },
+          }),
+        );
+        const afterSignedOutRefresh = yield* harness.provider.snapshot.refresh;
+        expect(afterSignedOutRefresh.auth.status).toBe("unauthenticated");
+        expect(afterSignedOutRefresh.auth.verificationRequired).toBeUndefined();
+        expect(afterSignedOutRefresh.auth.verificationUrl).toBeUndefined();
+
+        // verificationRequired without a valid URL still clears stale cached quota windows and sets auth.verificationRequired.
+        yield* Ref.set(usage, Effect.succeed(cachedLimits));
+        const recached = yield* harness.nextPublish(
+          (snapshot) => snapshot.usageLimits?.windows.length === 1,
+        );
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* recached)?.usageLimits).toEqual(cachedLimits);
+
+        const urlLessVerification: AntigravityUsageProbeResult = {
+          usageLimits: {
+            checkedAt: "2026-10-09T12:03:00.000Z",
+            windows: [],
+            unavailable: { reason: "probeFailed", message: customMessage },
+          },
+          verificationRequired: { message: customMessage },
+        };
+        yield* Ref.set(usage, Effect.succeed(urlLessVerification));
+        const urlLessPublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.auth.verificationRequired === true,
+        );
+        yield* harness.provider.snapshot.refresh;
+        expect(yield* urlLessPublished).toMatchObject({
+          status: "warning",
+          message: customMessage,
+          auth: { status: "authenticated", verificationRequired: true },
+          usageLimits: urlLessVerification.usageLimits,
+        });
+        expect((yield* urlLessPublished)?.auth.verificationUrl).toBeUndefined();
+      }),
   );
 });

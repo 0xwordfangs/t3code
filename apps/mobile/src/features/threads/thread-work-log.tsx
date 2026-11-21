@@ -35,6 +35,7 @@ import {
 import {
   Animated as NativeAnimated,
   type ColorValue,
+  Linking,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -965,6 +966,20 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
             <Text selectable className="ml-7 text-sm text-foreground">
               {failureItem.failure.message}
             </Text>
+          ) : null}
+          {failureItem.failure.verificationUrl ? (
+            <View className="ml-7 mt-2">
+              <Button
+                label={gt("Verify account")}
+                tone="secondary"
+                size="compact"
+                icon="arrow.up.right"
+                onPress={() => {
+                  void Haptics.selectionAsync();
+                  void Linking.openURL(failureItem.failure.verificationUrl!).catch(() => undefined);
+                }}
+              />
+            </View>
           ) : null}
           {failureItem.failure.code === ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE &&
           failureItem.runId !== null ? (

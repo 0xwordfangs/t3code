@@ -105,7 +105,10 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
               ...nextSnapshot,
               auth: { ...nextSnapshot.auth, label: state.usageAuthLabel ?? undefined },
             },
-        state.snapshot.usageLimits,
+        nextSnapshot.auth.verificationRequired === true ||
+          nextSnapshot.auth.verificationUrl !== undefined
+          ? nextSnapshot.usageLimits
+          : state.snapshot.usageLimits,
       );
       if (Equal.equals(state.snapshot, merged)) {
         return [null, state] as const;
@@ -205,15 +208,18 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
           differs(probedSnapshot.auth.email?.toLowerCase(), previous.email?.toLowerCase()) ||
           (probedSnapshot.auth.workspaceId !== undefined &&
             probedSnapshot.auth.workspaceId !== previous.workspaceId);
-        const usageLimits = switchedAccount
-          ? probedSnapshot.usageLimits
-          : probedSnapshot.usageLimits === undefined &&
-              state.snapshot.usageLimits !== usageBeforeProbe
-            ? state.snapshot.usageLimits
-            : resolveUsageLimitsAfterProbe({
-                published: state.snapshot.usageLimits,
-                probed: probedSnapshot.usageLimits,
-              });
+        const usageLimits =
+          switchedAccount ||
+          probedSnapshot.auth.verificationRequired === true ||
+          probedSnapshot.auth.verificationUrl !== undefined
+            ? probedSnapshot.usageLimits
+            : probedSnapshot.usageLimits === undefined &&
+                state.snapshot.usageLimits !== usageBeforeProbe
+              ? state.snapshot.usageLimits
+              : resolveUsageLimitsAfterProbe({
+                  published: state.snapshot.usageLimits,
+                  probed: probedSnapshot.usageLimits,
+                });
         const workspaceId =
           usageLimits === probedSnapshot.usageLimits ? undefined : state.snapshot.auth.workspaceId;
         const usageAuthLabel =

@@ -1,6 +1,10 @@
 import * as NodeModule from "node:module";
 
-import type { AntigravitySettings, ServerProviderUsageWindow } from "@t3tools/contracts";
+import type {
+  AntigravitySettings,
+  ServerProviderUsageLimits,
+  ServerProviderUsageWindow,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -20,7 +24,16 @@ import {
 } from "@t3tools/provider-core/server/usageLimits";
 
 import * as ProcessRunner from "../processRunner.ts";
+import {
+  extractAntigravityVerificationRequired,
+  type AntigravityVerificationRequired,
+} from "./antigravityVerification.ts";
 import { readWindowsGenericCredential } from "./windowsCredential.ts";
+
+export interface AntigravityUsageProbeResult {
+  readonly usageLimits: ServerProviderUsageLimits;
+  readonly verificationRequired?: AntigravityVerificationRequired;
+}
 
 export function antigravityUserAgent(platform: NodeJS.Platform, architecture: NodeJS.Architecture) {
   return `antigravity/hub/2.24.0 (aidev_client; os_type=${platform}; arch=${architecture}; cl=963137146)`;
@@ -334,7 +347,8 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const client = (yield* HttpClient.HttpClient).pipe(HttpClient.filterStatusOk);
+  const rawClient = yield* HttpClient.HttpClient;
+  const client = rawClient.pipe(HttpClient.filterStatusOk);
   const crypto = yield* Digest.Digest;
   const platform = yield* HostProcess.Platform;
   const architecture = yield* HostProcess.Architecture;
@@ -355,10 +369,12 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       Effect.flatMap((response) => response.json),
       Effect.timeout("10 seconds"),
     );
-  const read = Effect.gen(function* () {
+  const readDetailed = Effect.gen(function* () {
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
     if (input.authMethod !== "oauth-personal" && input.authMethod !== "oauth-business") {
-      return makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
+      return {
+        usageLimits: makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" }),
+      } satisfies AntigravityUsageProbeResult;
     }
     const now = yield* Clock.currentTimeMillis;
     // Google account instances bypass the keyring, whose one entry every profile shares.
@@ -370,20 +386,24 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
         ),
       );
     if (stored === undefined) {
-      return makeUnavailableUsageLimits({
-        checkedAt,
-        reason: "unsupported",
-        message: "Sign in with Google to see Antigravity limits.",
-      });
+      return {
+        usageLimits: makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "unsupported",
+          message: "Sign in with Google to see Antigravity limits.",
+        }),
+      };
     }
     const { token } = yield* decodeCliToken(stored);
     if (!(Date.parse(token.expiry ?? "") > now + 60_000)) {
-      return makeUnavailableUsageLimits({
-        checkedAt,
-        reason: "probeFailed",
-        message:
-          "Antigravity's saved sign-in has expired. Start an Antigravity turn to renew it, then refresh limits.",
-      });
+      return {
+        usageLimits: makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "probeFailed",
+          message:
+            "Antigravity's saved sign-in has expired. Start an Antigravity turn to renew it, then refresh limits.",
+        }),
+      };
     }
     const accessToken = token.access_token;
     // Use Google account IDs to merge accounts across environments; refresh tokens differ per machine.
@@ -397,6 +417,70 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     );
     const endpoints = ENDPOINTS[input.authMethod];
     // Merge endpoints because quota groups differ; the metered host's reading of a bucket wins.
+    const fetchSummary = Effect.fn("AntigravityUsageProbe.fetchSummary")(function* () {
+      const responses = yield* Effect.forEach(
+        endpoints,
+        (endpoint) =>
+          Effect.gen(function* () {
+            // Capture each request after auth, so refresh latency does not widen the tolerance.
+            const requestedAt = yield* Clock.currentTimeMillis;
+            const response = yield* rawClient
+              .execute(
+                HttpClientRequest.post(`${endpoint}/v1internal:retrieveUserQuotaSummary`).pipe(
+                  HttpClientRequest.setHeaders({
+                    Authorization: `Bearer ${accessToken}`,
+                    "User-Agent": antigravityUserAgent(platform, architecture),
+                  }),
+                  HttpClientRequest.bodyJsonUnsafe({}),
+                ),
+              )
+              .pipe(
+                Effect.provideService(FetchHttpClient.RequestInit, MANUAL_REDIRECT),
+                Effect.timeout("10 seconds"),
+              );
+            if (response.status >= 200 && response.status < 300) {
+              const body = yield* response.json;
+              const windows = yield* antigravitySummaryWindows(body, requestedAt);
+              return { windows, verificationRequired: undefined };
+            }
+            if (response.status === 403) {
+              const body = yield* response.json.pipe(Effect.orElseSucceed(() => undefined));
+              return {
+                windows: [] as ServerProviderUsageWindow[],
+                verificationRequired: extractAntigravityVerificationRequired(body),
+              };
+            }
+            yield* response.text.pipe(Effect.ignore);
+            return {
+              windows: [] as ServerProviderUsageWindow[],
+              verificationRequired: undefined,
+            };
+          }).pipe(
+            Effect.orElseSucceed(() => ({
+              windows: [] as ServerProviderUsageWindow[],
+              verificationRequired: undefined,
+            })),
+          ),
+        { concurrency: "unbounded" },
+      );
+      const windows = new Map<string, ServerProviderUsageWindow>();
+      let verificationRequired: AntigravityVerificationRequired | undefined;
+      for (const entry of responses) {
+        for (const window of entry.windows) {
+          if (!windows.has(window.id)) windows.set(window.id, window);
+        }
+        if (entry.verificationRequired !== undefined) {
+          if (
+            verificationRequired === undefined ||
+            (verificationRequired.verificationUrl === undefined &&
+              entry.verificationRequired.verificationUrl !== undefined)
+          ) {
+            verificationRequired = entry.verificationRequired;
+          }
+        }
+      }
+      return { windows: [...windows.values()], verificationRequired };
+    });
     const fetchWindows = Effect.fn("AntigravityUsageProbe.fetchWindows")(function* <E>(
       operation: string,
       parse: (
@@ -431,33 +515,50 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       }
       return [...windows.values()];
     });
-    const summary = yield* fetchWindows("retrieveUserQuotaSummary", antigravitySummaryWindows);
-    const windows = summary.length
-      ? summary
+    const summary = yield* fetchSummary();
+    if (summary.windows.length === 0 && summary.verificationRequired !== undefined) {
+      return {
+        usageLimits: makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "probeFailed",
+          message: summary.verificationRequired.message,
+        }),
+        verificationRequired: summary.verificationRequired,
+      };
+    }
+    const windows = summary.windows.length
+      ? summary.windows
       : yield* fetchWindows("fetchAvailableModels", (response) =>
           decodeModels(response).pipe(Effect.map(modelWindows)),
         );
     if (windows.length === 0) {
-      return makeUnavailableUsageLimits({
-        checkedAt,
-        reason: "probeFailed",
-        message: "Antigravity did not return usable quota information.",
-      });
+      return {
+        usageLimits: makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "probeFailed",
+          message: "Antigravity did not return usable quota information.",
+        }),
+      };
     }
-    return { ...makeUsageLimits({ checkedAt, windows }), credentialFingerprint: account };
+    return {
+      usageLimits: { ...makeUsageLimits({ checkedAt, windows }), credentialFingerprint: account },
+    };
   });
-  const probe = read.pipe(
+  const probeDetailed: Effect.Effect<AntigravityUsageProbeResult> = readDetailed.pipe(
     Effect.provideService(Digest.Digest, crypto),
     Effect.timeout("30 seconds"),
     Effect.catch(() =>
-      Effect.gen(function* () {
-        return makeUnavailableUsageLimits({
-          checkedAt: DateTime.formatIso(yield* DateTime.now),
-          reason: "probeFailed",
-          message: "Could not read Antigravity limits. Refresh provider status to retry.",
-        });
+      Effect.gen(function* (): Effect.fn.Return<AntigravityUsageProbeResult> {
+        return {
+          usageLimits: makeUnavailableUsageLimits({
+            checkedAt: DateTime.formatIso(yield* DateTime.now),
+            reason: "probeFailed",
+            message: "Could not read Antigravity limits. Refresh provider status to retry.",
+          }),
+        };
       }),
     ),
   );
-  return { probe };
+  const probe = probeDetailed.pipe(Effect.map((result) => result.usageLimits));
+  return { probe, probeDetailed };
 });

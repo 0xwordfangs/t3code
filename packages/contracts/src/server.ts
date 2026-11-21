@@ -61,12 +61,50 @@ export const ServerProviderAuthStatus = Schema.Literals([
 ]);
 export type ServerProviderAuthStatus = typeof ServerProviderAuthStatus.Type;
 
+const GOOGLE_ACCOUNT_VERIFICATION_ORIGIN = "https://accounts.google.com";
+
+function hasUnsafeVerificationUrlCharacter(value: string): boolean {
+  if (/[\s\\]/u.test(value)) return true;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 0x1f || codePoint === 0x7f) return true;
+  }
+  return false;
+}
+
+function isGoogleAccountVerificationUrl(value: string): boolean {
+  if (hasUnsafeVerificationUrlCharacter(value)) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "accounts.google.com" &&
+      url.origin === GOOGLE_ACCOUNT_VERIFICATION_ORIGIN &&
+      url.username === "" &&
+      url.password === "" &&
+      url.pathname.startsWith("/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+export const GoogleAccountVerificationUrl = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(4_096),
+  Schema.makeFilter(isGoogleAccountVerificationUrl, {
+    expected: "a Google Accounts HTTPS verification URL",
+  }),
+);
+export type GoogleAccountVerificationUrl = typeof GoogleAccountVerificationUrl.Type;
+
 export const ServerProviderAuth = Schema.Struct({
   status: ServerProviderAuthStatus,
   type: Schema.optional(TrimmedNonEmptyString),
   label: Schema.optional(TrimmedNonEmptyString),
   email: Schema.optional(TrimmedNonEmptyString),
   action: Schema.optional(AcpRegistryUrlAuthAction),
+  verificationRequired: Schema.optional(Schema.Boolean),
+  verificationUrl: Schema.optional(GoogleAccountVerificationUrl),
   canLogout: Schema.optional(Schema.Boolean),
   subscriptionSharing: Schema.optional(Schema.Boolean),
   profileId: Schema.optional(TrimmedNonEmptyString),

@@ -5,6 +5,7 @@ import {
   CommandId,
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
+  GoogleAccountVerificationUrl,
   MessageId,
   ProjectId,
   ProviderDriverKind,
@@ -374,11 +375,81 @@ describe("selectAntigravityFailoverCandidate", () => {
     });
     assert.isNull(afterResetProbe);
   });
+
+  it("excludes candidates with auth.verificationUrl in both preflight and failover modes", () => {
+    const verificationUrl = GoogleAccountVerificationUrl.make(
+      "https://accounts.google.com/v3/signin/continue?plt=failover-exclude",
+    );
+    const currentExhausted = makeAntigravityProvider("antigravity", {
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+    });
+    const unverifiedAccount = makeAntigravityProvider("antigravity_2", {
+      status: "warning",
+      auth: { status: "authenticated", email: "b@example.com", verificationUrl },
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+    });
+    const unverifiedWithoutUrl = makeAntigravityProvider("antigravity_4", {
+      status: "warning",
+      auth: { status: "authenticated", email: "d@example.com", verificationRequired: true },
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+    });
+    const healthyAccount = makeAntigravityProvider("antigravity_3", {
+      usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 30 }]),
+    });
+
+    const providers = [currentExhausted, unverifiedAccount, unverifiedWithoutUrl, healthyAccount];
+    const settings = settingsForProviders(providers);
+
+    const preflightDecision = AntigravityFailover.selectAntigravityFailoverCandidate({
+      mode: "preflight",
+      projectId: PROJECT_ID,
+      selection: { instanceId: currentExhausted.instanceId, model: "gemini-4-neon" },
+      providers,
+      settings,
+      nowMs: NOW,
+    });
+    assert.equal(preflightDecision?.toInstanceId, healthyAccount.instanceId);
+
+    const failoverDecision = AntigravityFailover.selectAntigravityFailoverCandidate({
+      mode: "failover",
+      projectId: PROJECT_ID,
+      selection: { instanceId: currentExhausted.instanceId, model: "gemini-4-neon" },
+      providers,
+      settings,
+      nowMs: NOW,
+    });
+    assert.equal(failoverDecision?.toInstanceId, healthyAccount.instanceId);
+
+    // When only accounts needing verification remain, neither mode routes to them.
+    const onlyUnverified = [currentExhausted, unverifiedAccount, unverifiedWithoutUrl];
+    const onlyUnverifiedSettings = settingsForProviders(onlyUnverified);
+    assert.isNull(
+      AntigravityFailover.selectAntigravityFailoverCandidate({
+        mode: "preflight",
+        projectId: PROJECT_ID,
+        selection: { instanceId: currentExhausted.instanceId, model: "gemini-4-neon" },
+        providers: onlyUnverified,
+        settings: onlyUnverifiedSettings,
+        nowMs: NOW,
+      }),
+    );
+    assert.isNull(
+      AntigravityFailover.selectAntigravityFailoverCandidate({
+        mode: "failover",
+        projectId: PROJECT_ID,
+        selection: { instanceId: currentExhausted.instanceId, model: "gemini-4-neon" },
+        providers: onlyUnverified,
+        settings: onlyUnverifiedSettings,
+        nowMs: NOW,
+      }),
+    );
+  });
 });
 
 interface MockTurnOutcome {
   readonly behavior: "succeed" | "usage_limit" | "validation_required";
   readonly assistantText?: string;
+  readonly verificationUrl?: GoogleAccountVerificationUrl;
 }
 
 function makeFakeAntigravityAdapter(input: {
@@ -580,10 +651,13 @@ function makeFakeAntigravityAdapter(input: {
                 threadDisposition: "reusable",
                 failureItemOrdinal: turn.runOrdinal * 100 + 5,
                 failure: makeProviderFailure({
-                  class: "provider_error",
-                  message: "Account requires verification.",
+                  class: "permission_error",
+                  message: "Verify your Google account to continue using Antigravity.",
                   code: "VALIDATION_REQUIRED",
                   retryable: false,
+                  ...(outcome.verificationUrl === undefined
+                    ? {}
+                    : { verificationUrl: outcome.verificationUrl }),
                 }),
               });
             }),
@@ -925,14 +999,17 @@ describe("Antigravity auto-failover integration", () => {
           );
         }).pipe(Effect.provide(exhaustedLayer));
 
-        // Case 2: Non-quota permanent error (VALIDATION_REQUIRED) -> stops immediately on attempt 1.
+        // Case 2: Non-quota permanent error (VALIDATION_REQUIRED) -> stops immediately on attempt 1 and surfaces verificationUrl.
         const permanentTurns: typeof recordedTurns = [];
+        const verificationUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=failover-case2",
+        );
         const permanentLayer = makeIntegrationLayer({
           name: "antigravity-validation-required",
           cwd,
           providers,
           recordedTurns: permanentTurns,
-          outcomeFor: () => ({ behavior: "validation_required" }),
+          outcomeFor: () => ({ behavior: "validation_required", verificationUrl }),
         });
         yield* Effect.gen(function* () {
           const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -983,6 +1060,22 @@ describe("Antigravity auto-failover integration", () => {
             projection.attempts.map((attempt) => attempt.providerInstanceId),
             [ProviderInstanceId.make("antigravity")],
           );
+          assert.isFalse(
+            projection.turnItems.some(
+              (item) =>
+                item.type === "system_notice" &&
+                item.message.includes("All available Antigravity accounts reached quota limits"),
+            ),
+          );
+          const errorItem = projection.turnItems.find((item) => item.type === "error");
+          assert.equal(errorItem?.type, "error");
+          if (errorItem?.type === "error") {
+            assert.equal(errorItem.title, "Verification required");
+            assert.equal(errorItem.failure?.class, "permission_error");
+            assert.equal(errorItem.failure?.code, "VALIDATION_REQUIRED");
+            assert.equal(errorItem.failure?.retryable, false);
+            assert.equal(errorItem.failure?.verificationUrl, verificationUrl);
+          }
         }).pipe(Effect.provide(permanentLayer));
       }),
   );

@@ -2,6 +2,7 @@ import {
   ANTIGRAVITY_DEFAULT_MODEL,
   ProviderDriverKind,
   ProviderInstanceId,
+  type GoogleAccountVerificationUrl,
   type OrchestrationV2ProviderCapabilities,
   type ProviderSetupError,
 } from "@t3tools/contracts";
@@ -11,8 +12,10 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
+import * as Queue from "effect/Queue";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
+import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -50,6 +53,7 @@ import {
   normalizeAntigravityToolCall,
 } from "../../provider/acp/AntigravityProtocol.ts";
 import { isAntigravitySignInRequiredError } from "../../provider/antigravityAuthSupport.ts";
+import { ANTIGRAVITY_VERIFICATION_REQUIRED_CODE } from "../../provider/antigravityVerification.ts";
 import {
   AcpProviderCapabilitiesV2,
   makeAcpAdapterV2,
@@ -100,6 +104,10 @@ export interface AntigravityAdapterV2Options {
     cwd: string,
   ) => Effect.Effect<void>;
   readonly onSessionEvent?: AcpAdapterV2Flavor["onSessionEvent"];
+  readonly onVerificationRequired?: (input: {
+    readonly verificationUrl?: GoogleAccountVerificationUrl;
+    readonly message?: string;
+  }) => Effect.Effect<void>;
   readonly nativeLogging?: Parameters<typeof makeAcpAdapterV2>[0]["nativeLogging"];
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
   /** The agent's GEMINI_HOME. Its session logs show turns that ended on an upstream error. */
@@ -136,11 +144,17 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
   };
 };
 
+interface AntigravityVerificationNotification {
+  readonly verificationUrl?: GoogleAccountVerificationUrl;
+  readonly message?: string;
+}
+
 interface AntigravityFlavorServices {
   readonly random: SecureRandom.SecureRandom["Service"];
   readonly fileSystem: FileSystem.FileSystem;
   readonly path: Path.Path;
   readonly host: ProviderHost.ProviderHost["Service"];
+  readonly notifyVerificationRequired?: (input: AntigravityVerificationNotification) => void;
 }
 
 export function makeAntigravityAcpAdapterFlavor(
@@ -296,7 +310,25 @@ export function makeAntigravityAcpAdapterFlavor(
     // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,
     requiresSignIn: isAntigravitySignInRequiredError,
-    promptFailure: (cause) => classifyAntigravityPromptFailure(cause),
+    promptFailure: (cause) => {
+      const failure = classifyAntigravityPromptFailure(cause);
+      if (failure.code === ANTIGRAVITY_VERIFICATION_REQUIRED_CODE) {
+        const notice: AntigravityVerificationNotification = {
+          message: failure.message,
+          ...(failure.verificationUrl === undefined
+            ? {}
+            : { verificationUrl: failure.verificationUrl }),
+        };
+        if (options.notifyVerificationRequired) {
+          options.notifyVerificationRequired(notice);
+        } else if (options.onVerificationRequired) {
+          Effect.runFork(
+            options.onVerificationRequired(notice).pipe(Effect.ignoreCause({ log: true })),
+          );
+        }
+      }
+      return failure;
+    },
     // Antigravity can leave a prompt open without updates; long tools and approvals pause this.
     promptInactivityTimeout: "15 minutes",
     // 1.4.5 returns the root trajectory's Gemini usageMetadata delta; 1.4.1 returns none.
@@ -306,7 +338,37 @@ export function makeAntigravityAcpAdapterFlavor(
       ? {}
       : {
           watchPromptOutcome: (sessionId: string) =>
-            watchAntigravityPromptOutcome(profileDirectory, sessionId),
+            watchAntigravityPromptOutcome(profileDirectory, sessionId).pipe(
+              Effect.map(
+                (check) => (result: EffectAcpSchema.PromptResponse) =>
+                  check(result).pipe(
+                    Effect.tap((outcome) => {
+                      if (outcome?.failure.code !== ANTIGRAVITY_VERIFICATION_REQUIRED_CODE) {
+                        return Effect.void;
+                      }
+                      const notice: AntigravityVerificationNotification = {
+                        message: outcome.failure.message,
+                        ...(outcome.failure.verificationUrl === undefined
+                          ? {}
+                          : { verificationUrl: outcome.failure.verificationUrl }),
+                      };
+                      if (options.notifyVerificationRequired) {
+                        return Effect.sync(() => options.notifyVerificationRequired!(notice));
+                      }
+                      if (options.onVerificationRequired) {
+                        return options
+                          .onVerificationRequired(notice)
+                          .pipe(
+                            Effect.ignoreCause({ log: true }),
+                            Effect.forkDetach,
+                            Effect.asVoid,
+                          );
+                      }
+                      return Effect.void;
+                    }),
+                  ),
+              ),
+            ),
           resolveBackgroundTaskIds: ({ sessionId, taskIds }) =>
             resolveAntigravityBackgroundTaskToolCallIds({ profileDirectory, sessionId, taskIds }),
         }),
@@ -316,11 +378,28 @@ export function makeAntigravityAcpAdapterFlavor(
 export const makeAntigravityAdapterV2 = Effect.fn("makeAntigravityAdapterV2")(function* (
   options: AntigravityAdapterV2Options,
 ) {
+  let notifyVerificationRequired:
+    | ((input: AntigravityVerificationNotification) => void)
+    | undefined;
+  if (options.onVerificationRequired) {
+    const onVerificationRequired = options.onVerificationRequired;
+    const notifications = yield* Queue.unbounded<AntigravityVerificationNotification>();
+    yield* Effect.forever(
+      Queue.take(notifications).pipe(
+        Effect.flatMap(onVerificationRequired),
+        Effect.ignoreCause({ log: true }),
+      ),
+    ).pipe(Effect.forkScoped);
+    notifyVerificationRequired = (notice) => {
+      Queue.offerUnsafe(notifications, notice);
+    };
+  }
   const services: AntigravityFlavorServices = {
     random: yield* SecureRandom.SecureRandom,
     fileSystem: yield* FileSystem.FileSystem,
     path: yield* Path.Path,
     host: yield* ProviderHost.ProviderHost,
+    ...(notifyVerificationRequired === undefined ? {} : { notifyVerificationRequired }),
   };
   return yield* makeAcpAdapterV2({
     instanceId: options.instanceId,

@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  GoogleAccountVerificationUrl,
   NodeId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -358,3 +359,61 @@ it.effect("keys terminal failure items by provider turn across retries and fallb
     assert.equal(firstAttempt.ordinal, 101);
   }).pipe(Effect.provide(IdAllocator.layer)),
 );
+
+it("preserves only valid Google Accounts verification URLs with query params and titles VALIDATION_REQUIRED", () => {
+  const validUrl =
+    "https://accounts.google.com/v3/signin/continue?plt=abc&continue=https%3A%2F%2Fdevelopers.google.com%2Fprofile";
+  const failure = makeProviderFailure({
+    class: "permission_error",
+    code: "VALIDATION_REQUIRED",
+    message: "Verify your Google account to continue using Antigravity.",
+    retryable: false,
+    verificationUrl: validUrl,
+  });
+
+  assert.equal(failure.verificationUrl, GoogleAccountVerificationUrl.make(validUrl));
+
+  for (const invalidUrl of [
+    "http://accounts.google.com/v3/signin/continue?plt=abc",
+    "https://evil.example.com/v3/signin/continue?plt=abc",
+    "https://accounts.google.com@evil.com/v3/signin/continue?plt=1",
+    "javascript:alert(1)",
+    "https://accounts.google.com/v3/signin/continue?plt=1\n",
+    "https://accounts.google.com/v3/signin/continue?plt=1 extra",
+  ]) {
+    const rejected = makeProviderFailure({
+      class: "permission_error",
+      code: "VALIDATION_REQUIRED",
+      message: "Verify your Google account.",
+      retryable: false,
+      verificationUrl: invalidUrl,
+    });
+    assert.isUndefined(rejected.verificationUrl);
+  }
+
+  const item = makeProviderFailureTurnItem({
+    driver: ProviderDriverKind.make("antigravity"),
+    threadId: ThreadId.make("thread:validation-required"),
+    runId: RunId.make("run:validation-required"),
+    nodeId: NodeId.make("node:validation-required"),
+    providerThreadId: ProviderThreadId.make("provider-thread:validation-required"),
+    providerTurnId: ProviderTurnId.make("provider-turn:validation-required"),
+    itemOrdinal: 1,
+    failure,
+    occurredAt: DateTime.makeUnsafe("2026-11-21T12:00:00.000Z"),
+  });
+  assert.equal(item.title, "Verification required");
+
+  const regularItem = makeProviderFailureTurnItem({
+    driver: ProviderDriverKind.make("antigravity"),
+    threadId: ThreadId.make("thread:validation-required"),
+    runId: RunId.make("run:validation-required"),
+    nodeId: NodeId.make("node:validation-required"),
+    providerThreadId: ProviderThreadId.make("provider-thread:validation-required"),
+    providerTurnId: ProviderTurnId.make("provider-turn:validation-required-other"),
+    itemOrdinal: 2,
+    failure: makeProviderFailure({ class: "provider_error", message: "Other error" }),
+    occurredAt: DateTime.makeUnsafe("2026-11-21T12:00:00.000Z"),
+  });
+  assert.equal(regularItem.title, "Provider error");
+});

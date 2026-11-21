@@ -9,6 +9,7 @@ import {
   ExternalLinkIcon,
   LayersIcon,
   PlusIcon,
+  RefreshCwIcon,
   Trash2Icon,
   XIcon,
   LockIcon,
@@ -732,6 +733,8 @@ interface ProviderInstanceCardProps {
   readonly onInstallRecommended?: (() => void) | undefined;
   readonly isUpdating?: boolean | undefined;
   readonly onAcceptUrlAuth?: ((action: AcpRegistryUrlAuthAction) => void) | undefined;
+  readonly onRefreshProviders?: (() => void) | undefined;
+  readonly isRefreshingProviders?: boolean | undefined;
   readonly environmentId?: EnvironmentId | undefined;
   readonly secretSources?: ReadonlyArray<SecretSource>;
   readonly projectOverride?: ProjectOverrideControl | undefined;
@@ -803,6 +806,8 @@ export function ProviderInstanceCard({
   onInstallRecommended,
   isUpdating = false,
   onAcceptUrlAuth,
+  onRefreshProviders,
+  isRefreshingProviders = false,
   environmentId,
   acpProjects = EMPTY_ACP_PROJECTS,
   secretSources = NO_SECRET_SOURCES,
@@ -855,6 +860,13 @@ export function ProviderInstanceCard({
       ? onInstallRecommended
       : onRunUpdate;
   const urlAuthAction = liveProvider?.auth.action;
+  const verificationUrl =
+    enabled &&
+    liveProvider?.installed &&
+    liveProvider.auth.status !== "unauthenticated" &&
+    liveProvider.status !== "error"
+      ? liveProvider.auth.verificationUrl
+      : undefined;
   const displayName =
     instance.displayName?.trim() || driverOption?.label || String(instance.driver);
   const accentColor = normalizeProviderAccentColor(instance.accentColor);
@@ -1302,6 +1314,30 @@ export function ProviderInstanceCard({
         <p aria-live="polite" className="text-xs leading-snug [overflow-wrap:anywhere]">
           {restartNotice}
         </p>
+      ) : null}
+      {verificationUrl ? (
+        <div className="flex flex-wrap items-center gap-2 pt-1">
+          <Button
+            render={<a href={verificationUrl} target="_blank" rel="noopener noreferrer" />}
+            size="xs"
+            variant="outline"
+          >
+            <ExternalLinkIcon aria-hidden />
+            <T>Verify account</T>
+          </Button>
+          {onRefreshProviders ? (
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              disabled={isRefreshingProviders}
+              onClick={onRefreshProviders}
+            >
+              <RefreshCwIcon aria-hidden />
+              <T>Refresh</T>
+            </Button>
+          ) : null}
+        </div>
       ) : null}
       {urlAuthAction && onAcceptUrlAuth ? (
         <div className="grid max-w-xl gap-1.5 pt-1 text-xs">

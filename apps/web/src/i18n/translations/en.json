@@ -4314,6 +4314,7 @@
       "c": "”"
     }
   ],
+  "7b33663c48eb04a3": "Verify account",
   "a2aaca7ff8310186": "Open chat",
   "a3048aaa541b7744": "Activity",
   "4a3cbccb2beedeb0": "image",
@@ -11372,6 +11373,8 @@
   "a887d07963e1f028": "Not found",
   "d49898dcd40e6332": "CLI not detected on PATH.",
   "b2768aa900b19198": "Not authenticated · {method}",
+  "e3e7fd8ed4ebcfb9": "Verification required",
+  "b1edda47de73afe4": "Verify your Google account to use Antigravity.",
   "24a4bbee246a576f": "Installed · Sign-in not checked",
   "0e56ea6a22e303ca": "Needs attention",
   "9469080828cdc899": "The provider is installed, but the server could not fully verify it.",

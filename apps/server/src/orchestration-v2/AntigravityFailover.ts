@@ -190,6 +190,12 @@ function isEligibleAntigravityCandidate(input: {
   if (!candidate.enabled || !candidate.installed || !isProviderAvailable(candidate)) return false;
   if (candidate.status === "error" || candidate.status === "disabled") return false;
   if (candidate.auth.status === "unauthenticated") return false;
+  if (
+    candidate.auth.verificationRequired === true ||
+    candidate.auth.verificationUrl !== undefined
+  ) {
+    return false;
+  }
   if (!resolveProjectProviderInstanceEnabled(settings, projectId, candidate.instanceId)) {
     return false;
   }

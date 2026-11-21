@@ -7,7 +7,10 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
-import type { OrchestrationV2ProviderFailure } from "@t3tools/contracts";
+import {
+  GoogleAccountVerificationUrl,
+  type OrchestrationV2ProviderFailure,
+} from "@t3tools/contracts";
 
 import {
   classifyAntigravityPromptFailure,
@@ -284,7 +287,7 @@ describe("watchAntigravityPromptOutcome", () => {
           [USER_INPUT, Buffer.from("design")],
           [ERROR_MESSAGE, validationRequired],
         ]);
-        assert.equal(validationOutcome?.failure.class, "provider_error");
+        assert.equal(validationOutcome?.failure.class, "permission_error");
         assert.equal(validationOutcome?.failure.code, "VALIDATION_REQUIRED");
         assert.equal(validationOutcome?.failure.retryable, false);
 
@@ -295,6 +298,77 @@ describe("watchAntigravityPromptOutcome", () => {
         ]);
         assert.equal(resourceExhaustedOutcome?.failure.class, "usage_limit");
         assert.equal(resourceExhaustedOutcome?.failure.code, "RESOURCE_EXHAUSTED");
+
+        // Go 1.5.x trajectory payload with PERMISSION_DENIED (code 403) + pretty-printed JSON VALIDATION_REQUIRED.
+        const validUrl =
+          "https://accounts.google.com/v3/signin/continue?plt=traj-1&continue=https%3A%2F%2Fantigravity.google%2F";
+        const prettyValidationJson = JSON.stringify(
+          {
+            error: {
+              code: 403,
+              message: "Verify your Google account to continue.",
+              status: "PERMISSION_DENIED",
+              details: [
+                {
+                  "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                  reason: "VALIDATION_REQUIRED",
+                  metadata: {
+                    validation_url: validUrl,
+                    validation_error_message: "Verify your Google account to continue.",
+                  },
+                },
+              ],
+            },
+          },
+          null,
+          2,
+        );
+        const go15Validation = errorPayload(
+          `PERMISSION_DENIED (code 403): upstream error:\n${prettyValidationJson}`,
+        );
+        const go15Outcome = yield* turn([
+          [USER_INPUT, Buffer.from("design")],
+          [ERROR_MESSAGE, go15Validation],
+        ]);
+        assert.deepEqual(
+          go15Outcome,
+          reusable({
+            class: "permission_error",
+            code: "VALIDATION_REQUIRED",
+            message: "Verify your Google account to continue.",
+            retryable: false,
+            verificationUrl: GoogleAccountVerificationUrl.make(validUrl),
+          }),
+        );
+
+        const nonGoogleValidationJson = JSON.stringify(
+          {
+            error: {
+              code: 403,
+              message: "Verify your Google account to continue.",
+              status: "PERMISSION_DENIED",
+              details: [
+                {
+                  "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                  reason: "VALIDATION_REQUIRED",
+                  metadata: {
+                    validation_url: "https://evil.example.com/verify",
+                  },
+                },
+              ],
+            },
+          },
+          null,
+          2,
+        );
+        const nonGoogleOutcome = yield* turn([
+          [USER_INPUT, Buffer.from("design")],
+          [ERROR_MESSAGE, errorPayload(`PERMISSION_DENIED (code 403): ${nonGoogleValidationJson}`)],
+        ]);
+        assert.equal(nonGoogleOutcome?.failure.class, "permission_error");
+        assert.equal(nonGoogleOutcome?.failure.code, "VALIDATION_REQUIRED");
+        assert.equal(nonGoogleOutcome?.failure.retryable, false);
+        assert.isUndefined(nonGoogleOutcome?.failure.verificationUrl);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
@@ -316,9 +390,59 @@ describe("classifyAntigravityPromptFailure", () => {
         errorMessage: "Error 403: VALIDATION_REQUIRED (account verification needed)",
       }),
     );
-    assert.equal(validation.class, "provider_error");
+    assert.equal(validation.class, "permission_error");
     assert.equal(validation.code, "VALIDATION_REQUIRED");
     assert.equal(validation.retryable, false);
+
+    const rpcValidationUrl =
+      "https://accounts.google.com/v3/signin/continue?plt=rpc-1&continue=https%3A%2F%2Fantigravity.google%2F";
+    const rpcValidation = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `PERMISSION_DENIED (code 403): ${JSON.stringify({
+          error: {
+            code: 403,
+            status: "PERMISSION_DENIED",
+            details: [
+              {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                reason: "VALIDATION_REQUIRED",
+                metadata: {
+                  validation_url: rpcValidationUrl,
+                  validation_error_message: "Verify your Google account.",
+                },
+              },
+            ],
+          },
+        })}`,
+      }),
+    );
+    assert.equal(rpcValidation.class, "permission_error");
+    assert.equal(rpcValidation.code, "VALIDATION_REQUIRED");
+    assert.equal(rpcValidation.retryable, false);
+    assert.equal(rpcValidation.verificationUrl, rpcValidationUrl);
+
+    const rpcInvalidUrl = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Error 403: VALIDATION_REQUIRED",
+        data: {
+          error: {
+            code: 403,
+            details: [
+              {
+                reason: "VALIDATION_REQUIRED",
+                metadata: { validation_url: "https://evil.example.com/verify" },
+              },
+            ],
+          },
+        },
+      }),
+    );
+    assert.equal(rpcInvalidUrl.class, "permission_error");
+    assert.equal(rpcInvalidUrl.code, "VALIDATION_REQUIRED");
+    assert.equal(rpcInvalidUrl.retryable, false);
+    assert.isUndefined(rpcInvalidUrl.verificationUrl);
 
     const authRequired = classifyAntigravityPromptFailure(
       new EffectAcpErrors.AcpRequestError({

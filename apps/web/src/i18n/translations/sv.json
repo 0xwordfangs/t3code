@@ -4313,6 +4313,7 @@
       "c": "”"
     }
   ],
+  "7b33663c48eb04a3": "Verifiera konto",
   "a2aaca7ff8310186": "Öppna chatt",
   "a3048aaa541b7744": "Aktivitet",
   "4a3cbccb2beedeb0": "bild",
@@ -11370,6 +11371,8 @@
   "a887d07963e1f028": "Hittades inte",
   "d49898dcd40e6332": "CLI:t hittades inte i PATH.",
   "b2768aa900b19198": "Inte autentiserad · {method}",
+  "e3e7fd8ed4ebcfb9": "Verifiering krävs",
+  "b1edda47de73afe4": "Verifiera ditt Google-konto för att använda Antigravity.",
   "24a4bbee246a576f": "Installerad · Inloggning inte kontrollerad",
   "0e56ea6a22e303ca": "Behöver åtgärdas",
   "9469080828cdc899": "Leverantören är installerad, men servern kunde inte verifiera den helt.",

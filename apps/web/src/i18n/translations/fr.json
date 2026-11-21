@@ -4313,6 +4313,7 @@
       "c": " »"
     }
   ],
+  "7b33663c48eb04a3": "Vérifier le compte",
   "a2aaca7ff8310186": "Ouvrir la discussion",
   "a3048aaa541b7744": "Activité",
   "4a3cbccb2beedeb0": "image",
@@ -11362,6 +11363,8 @@
   "a887d07963e1f028": "Introuvable",
   "d49898dcd40e6332": "CLI non détectée dans le PATH.",
   "b2768aa900b19198": "Non authentifié · {method}",
+  "e3e7fd8ed4ebcfb9": "Vérification requise",
+  "b1edda47de73afe4": "Vérifiez votre compte Google pour utiliser Antigravity.",
   "24a4bbee246a576f": "Installé · Connexion non vérifiée",
   "0e56ea6a22e303ca": "Requiert votre attention",
   "9469080828cdc899": "Le fournisseur est installé, mais le serveur n’a pas pu le vérifier entièrement.",

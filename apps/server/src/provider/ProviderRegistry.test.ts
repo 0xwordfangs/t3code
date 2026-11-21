@@ -29,6 +29,7 @@ import {
   ClaudeSettings,
   CodexSettings,
   DEFAULT_SERVER_SETTINGS,
+  GoogleAccountVerificationUrl,
   PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -2112,6 +2113,62 @@ it.layer(
         });
         assert.equal(switched.status, "warning");
         assert.deepStrictEqual(switched.models, []);
+      });
+
+      it("preserves warning and verificationUrl across restart probes until quota windows arrive", () => {
+        const verificationUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=registry-1",
+        );
+        const verificationMessage = "Verify your Google account to use Antigravity.";
+        const pendingVerification: ServerProvider = {
+          ...signedIn,
+          status: "warning",
+          auth: { ...signedIn.auth, verificationUrl },
+          message: verificationMessage,
+          usageLimits: {
+            checkedAt: "2026-09-05T00:00:30.000Z",
+            windows: [],
+            unavailable: { reason: "probeFailed", message: verificationMessage },
+          },
+        };
+
+        const mergedRestart = ProviderRegistry.mergeProviderSnapshot(
+          pendingVerification,
+          restartProbe,
+        );
+        assert.equal(mergedRestart.status, "warning");
+        assert.equal(mergedRestart.auth.verificationUrl, verificationUrl);
+        assert.equal(mergedRestart.message, verificationMessage);
+
+        const unknownAuthVerification: ServerProvider = {
+          ...pendingVerification,
+          auth: { status: "unknown", type: "oauth-personal", verificationUrl },
+        };
+        const mergedUnknownRestart = ProviderRegistry.mergeProviderSnapshot(
+          unknownAuthVerification,
+          restartProbe,
+        );
+        assert.equal(mergedUnknownRestart.status, "warning");
+        assert.equal(mergedUnknownRestart.auth.verificationUrl, verificationUrl);
+        assert.equal(mergedUnknownRestart.message, verificationMessage);
+
+        const healthyProbe: ServerProvider = {
+          ...restartProbe,
+          checkedAt: "2026-09-05T00:02:00.000Z",
+          usageLimits: {
+            checkedAt: "2026-09-05T00:02:00.000Z",
+            windows: [
+              { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 12 },
+            ],
+          },
+        };
+        const mergedHealthy = ProviderRegistry.mergeProviderSnapshot(
+          pendingVerification,
+          healthyProbe,
+        );
+        assert.equal(mergedHealthy.status, "ready");
+        assert.isUndefined(mergedHealthy.auth.verificationUrl);
+        assert.equal("message" in mergedHealthy, false);
       });
     });
 

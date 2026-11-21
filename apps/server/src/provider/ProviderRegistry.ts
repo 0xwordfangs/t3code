@@ -306,14 +306,16 @@ const hasSwitchedAntigravityAccount = (
 const carrySavedAntigravityAccount = (
   previousProvider: ServerProvider,
   nextProvider: ServerProvider,
-): Pick<ServerProvider, "auth" | "status"> | undefined => {
+): Pick<ServerProvider, "auth" | "status" | "message"> | undefined => {
   const antigravity = ProviderDriverKind.make("antigravity");
   if (
     nextProvider.driver !== antigravity ||
     previousProvider.driver !== antigravity ||
     !nextProvider.enabled ||
     nextProvider.auth.status !== "unknown" ||
-    previousProvider.auth.status !== "authenticated" ||
+    (previousProvider.auth.status !== "authenticated" &&
+      previousProvider.auth.verificationRequired !== true &&
+      previousProvider.auth.verificationUrl === undefined) ||
     (nextProvider.auth.type !== undefined &&
       nextProvider.auth.type !== previousProvider.auth.type) ||
     (!nextProvider.installed && nextProvider.status !== "warning") ||
@@ -321,12 +323,49 @@ const carrySavedAntigravityAccount = (
   ) {
     return undefined;
   }
-  const status =
-    nextProvider.installed && nextProvider.status === "warning" ? "ready" : nextProvider.status;
+  const usageClearedVerification = (nextProvider.usageLimits?.windows.length ?? 0) > 0;
+  const nextVerificationRequired =
+    nextProvider.auth.verificationRequired === true ||
+    nextProvider.auth.verificationUrl !== undefined;
+  const previousVerificationRequired =
+    previousProvider.auth.verificationRequired === true ||
+    previousProvider.auth.verificationUrl !== undefined;
+  const verificationRequired =
+    nextVerificationRequired || (!usageClearedVerification && previousVerificationRequired);
+  const verificationUrl =
+    nextProvider.auth.verificationUrl ??
+    (usageClearedVerification ? undefined : previousProvider.auth.verificationUrl);
+  const status = verificationRequired
+    ? nextProvider.status === "error"
+      ? "error"
+      : "warning"
+    : previousProvider.auth.status === "authenticated" &&
+        nextProvider.installed &&
+        nextProvider.status === "warning"
+      ? "ready"
+      : nextProvider.status;
   const email = nextProvider.auth.email?.trim() || previousProvider.auth.email?.trim();
+  const {
+    verificationRequired: _previousVerificationRequired,
+    verificationUrl: _previousVerificationUrl,
+    ...baseAuth
+  } = previousProvider.auth;
+  const auth: ServerProvider["auth"] = {
+    ...baseAuth,
+    ...(email ? { email } : {}),
+    ...(verificationRequired ? { verificationRequired: true } : {}),
+    ...(verificationUrl !== undefined ? { verificationUrl } : {}),
+  };
+  const message =
+    verificationRequired && nextProvider.status !== "error"
+      ? nextVerificationRequired
+        ? (nextProvider.message ?? previousProvider.message)
+        : (previousProvider.message ?? nextProvider.message)
+      : undefined;
   return {
-    auth: email ? { ...previousProvider.auth, email } : previousProvider.auth,
+    auth,
     status,
+    ...(message ? { message } : {}),
   };
 };
 

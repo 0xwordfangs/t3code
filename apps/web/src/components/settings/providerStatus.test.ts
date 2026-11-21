@@ -1,4 +1,9 @@
-import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
+import {
+  GoogleAccountVerificationUrl,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -69,6 +74,38 @@ describe("Antigravity with unchecked sign-in", () => {
       });
       expect(getProviderStatusKey(candidate)).toBe("neutral");
     }
+  });
+
+  it("reports warning and Verification required when auth.verificationUrl is set", () => {
+    const verificationUrl = GoogleAccountVerificationUrl.make(
+      "https://accounts.google.com/v3/signin/continue?plt=ui-1",
+    );
+    for (const auth of [
+      { status: "unknown", verificationUrl },
+      { status: "unknown", type: "oauth-personal", verificationUrl },
+      { status: "authenticated", type: "oauth-personal", verificationUrl },
+    ] as const) {
+      const candidate: ServerProvider = {
+        ...unchecked,
+        status: "warning",
+        auth,
+        message: "Verify your Google account to use Antigravity.",
+      };
+      expect(getProviderStatusKey(candidate)).toBe("warning");
+      expect(getProviderSummary(candidate)).toEqual({
+        headline: "Verification required",
+        detail: "Verify your Google account to use Antigravity.",
+      });
+    }
+
+    const errored: ServerProvider = {
+      ...unchecked,
+      status: "error",
+      auth: { status: "unknown", verificationUrl },
+      message: "Probe failed.",
+    };
+    expect(getProviderStatusKey(errored)).toBe("error");
+    expect(getProviderSummary(errored).headline).toBe("Unavailable");
   });
 
   // regression: #18623 neutral unchecked-sign-in display must not mask real warnings

@@ -664,7 +664,7 @@ export function EnvironmentProviderSettings({
   );
   const defaultProviderHealthRefreshIntervalSeconds = durationToSeconds(providerHealthPreset);
 
-  const refreshProviders = () => {
+  const refreshProviders = useStableCallback(() => {
     if (refreshingRef.current || !readEnvironmentScope(environmentId, AuthOrchestrationReadScope))
       return;
     refreshingRef.current = true;
@@ -684,7 +684,7 @@ export function EnvironmentProviderSettings({
         });
       }
     })();
-  };
+  });
 
   const runProviderUpdate = useStableCallback(
     async (
@@ -965,6 +965,7 @@ export function EnvironmentProviderSettings({
   const stableToggleModelFavorite = useStableCallback(toggleModelFavorite);
   const actions: ProviderInstanceRowActions = {
     acceptUrlAuthentication,
+    refreshProviders,
     runProviderUpdate,
     updateInstance,
     enableInstance,
@@ -996,6 +997,8 @@ export function EnvironmentProviderSettings({
         selected={mode === "list" && selectedRow?.instanceId === row.instanceId}
         readOnly={readOnly}
         canWriteSettings={canWriteSettings}
+        canRefreshProviders={mode === "editor" && canRefreshProviders}
+        isRefreshingProviders={mode === "editor" && isRefreshingProviders}
         liveProvider={serverProviders.find((candidate) => candidate.instanceId === row.instanceId)}
         isUpdateDispatching={updatingProviderInstanceIds.has(row.instanceId)}
         showProjectOverride={showProjectOverride}
@@ -1257,6 +1260,7 @@ interface ProviderInstanceRowActions {
     instanceId: ProviderInstanceId,
     action: AcpRegistryUrlAuthAction,
   ) => void;
+  readonly refreshProviders: () => void;
   readonly runProviderUpdate: (
     candidate: Pick<ProviderSettingsUpdateCandidate, "driver" | "instanceId">,
     targetVersion?: string,
@@ -1299,6 +1303,8 @@ function ProviderInstanceRow({
   selected,
   readOnly,
   canWriteSettings,
+  canRefreshProviders,
+  isRefreshingProviders,
   liveProvider,
   isUpdateDispatching,
   showProjectOverride,
@@ -1319,6 +1325,8 @@ function ProviderInstanceRow({
   readonly selected: boolean;
   readonly readOnly: boolean;
   readonly canWriteSettings: boolean;
+  readonly canRefreshProviders: boolean;
+  readonly isRefreshingProviders: boolean;
   readonly liveProvider: ServerProvider | undefined;
   readonly isUpdateDispatching: boolean;
   readonly showProjectOverride: boolean;
@@ -1377,6 +1385,8 @@ function ProviderInstanceRow({
       onAcceptUrlAuth={
         readOnly ? undefined : (action) => actions.acceptUrlAuthentication(instanceId, action)
       }
+      onRefreshProviders={canRefreshProviders ? actions.refreshProviders : undefined}
+      isRefreshingProviders={isRefreshingProviders}
       instanceId={instanceId}
       instance={instance}
       driverOption={driverOption}

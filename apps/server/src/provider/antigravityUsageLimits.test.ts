@@ -10,6 +10,7 @@ import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
 
+import { GoogleAccountVerificationUrl } from "@t3tools/contracts";
 import {
   AntigravityKeyringError,
   decodeGoKeyringSecret,
@@ -934,4 +935,117 @@ describe("Antigravity subscription limits", () => {
     expect(() => decodeGoKeyringSecret(bytes("go-keyring-encoded:7b7d0"))).toThrow();
     expect(() => decodeGoKeyringSecret([0xff, 0xfe])).toThrow();
   });
+
+  it.effect(
+    "returns verificationRequired on HTTP 403 VALIDATION_REQUIRED without calling fetchAvailableModels",
+    () =>
+      Effect.gen(function* () {
+        const validUrl =
+          "https://accounts.google.com/v3/signin/continue?plt=quota-check&continue=https%3A%2F%2Fantigravity.google%2F";
+        const { probeDetailed, requests } = yield* fixture({
+          summaryStatus: 403,
+          summary: {
+            error: {
+              code: 403,
+              message: "Verify your account to continue.",
+              status: "PERMISSION_DENIED",
+              details: [
+                {
+                  "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                  reason: "VALIDATION_REQUIRED",
+                  metadata: {
+                    validation_url: validUrl,
+                    validation_error_message: "Verify your Google account to use Antigravity.",
+                  },
+                },
+              ],
+            },
+          },
+        });
+        const result = yield* probeDetailed;
+        expect(result.usageLimits.windows).toEqual([]);
+        expect(result.usageLimits.unavailable).toEqual({
+          reason: "probeFailed",
+          message: "Verify your Google account to use Antigravity.",
+        });
+        expect(result.verificationRequired).toEqual({
+          message: "Verify your Google account to use Antigravity.",
+          verificationUrl: GoogleAccountVerificationUrl.make(validUrl),
+        });
+        expect(requests.some((request) => request.url.includes("fetchAvailableModels"))).toBe(
+          false,
+        );
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect(
+    "blocks fetchAvailableModels and drops non-Google validation_url while falling back to google.rpc.Help links",
+    () =>
+      Effect.gen(function* () {
+        const invalidUrlProbe = yield* fixture({
+          summaryStatus: 403,
+          summary: {
+            error: {
+              code: 403,
+              message: "Account verification required.",
+              status: "PERMISSION_DENIED",
+              details: [
+                {
+                  "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                  reason: "VALIDATION_REQUIRED",
+                  metadata: {
+                    validation_url: "https://evil.example.com/phish",
+                  },
+                },
+              ],
+            },
+          },
+        });
+        const invalidResult = yield* invalidUrlProbe.probeDetailed;
+        expect(invalidResult.usageLimits.unavailable?.reason).toBe("probeFailed");
+        expect(invalidResult.verificationRequired).toEqual({
+          message: "Account verification required.",
+        });
+        expect(invalidResult.verificationRequired?.verificationUrl).toBeUndefined();
+        expect(
+          invalidUrlProbe.requests.some((request) => request.url.includes("fetchAvailableModels")),
+        ).toBe(false);
+
+        const helpUrl = "https://accounts.google.com/v3/signin/continue?plt=help-link";
+        for (const metadata of [{}, { validation_url: "https://evil.example.com/phish" }]) {
+          const helpProbe = yield* fixture({
+            summaryStatus: 403,
+            summary: {
+              error: {
+                code: 403,
+                message: "Account verification required.",
+                status: "PERMISSION_DENIED",
+                details: [
+                  {
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    reason: "VALIDATION_REQUIRED",
+                    metadata,
+                  },
+                  {
+                    "@type": "type.googleapis.com/google.rpc.Help",
+                    links: [
+                      { description: "Ignore", url: "https://evil.example.com/ignore" },
+                      { description: "Verify", url: helpUrl },
+                    ],
+                  },
+                ],
+              },
+            },
+          });
+          const helpResult = yield* helpProbe.probeDetailed;
+          expect(helpResult.verificationRequired).toEqual({
+            message: "Account verification required.",
+            verificationUrl: GoogleAccountVerificationUrl.make(helpUrl),
+          });
+          expect(
+            helpProbe.requests.some((request) => request.url.includes("fetchAvailableModels")),
+          ).toBe(false);
+        }
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
 });

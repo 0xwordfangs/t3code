@@ -13,6 +13,12 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import { isAntigravitySignInRequiredError } from "../antigravityAuthSupport.ts";
+import {
+  ANTIGRAVITY_VERIFICATION_REQUIRED_CODE,
+  extractAntigravityVerificationFromText,
+  extractAntigravityVerificationRequired,
+  type AntigravityVerificationRequired,
+} from "../antigravityVerification.ts";
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
 
 // CORTEX_STEP_TYPE_ERROR_MESSAGE in the native trajectory.
@@ -133,10 +139,24 @@ function turnFailure(
   // The agent maps only the SDK's QUOTA_EXHAUSTED stop reason to `refusal`.
   if (errorText === undefined && stopReason !== "refusal") return undefined;
   const text = errorText ?? "";
-  const apiError = API_ERROR.exec(text);
-  const nonQuotaPermanent = NON_QUOTA_PERMANENT.test(text);
   const reusable = (failure: OrchestrationV2ProviderFailure) =>
     ({ failure, threadDisposition: "reusable" }) as const;
+  const verification = extractAntigravityVerificationFromText(text);
+  if (verification !== undefined) {
+    return reusable(
+      makeProviderFailure({
+        class: "permission_error",
+        code: ANTIGRAVITY_VERIFICATION_REQUIRED_CODE,
+        message: verification.message,
+        retryable: false,
+        ...(verification.verificationUrl === undefined
+          ? {}
+          : { verificationUrl: verification.verificationUrl }),
+      }),
+    );
+  }
+  const apiError = API_ERROR.exec(text);
+  const nonQuotaPermanent = NON_QUOTA_PERMANENT.test(text);
   if (!nonQuotaPermanent && (stopReason === "refusal" || QUOTA_EXHAUSTED.test(text))) {
     return reusable(
       makeProviderFailure({
@@ -204,9 +224,32 @@ function serializeErrorData(data: unknown): string {
   }
 }
 
+function extractVerificationFromAcpError(
+  cause: EffectAcpErrors.AcpRequestError,
+): AntigravityVerificationRequired | undefined {
+  const fromData = extractAntigravityVerificationRequired(cause.data);
+  if (fromData?.verificationUrl !== undefined) return fromData;
+  let fallback = fromData;
+  const candidates: Array<string> = [cause.errorMessage];
+  if (typeof cause.data === "string") {
+    candidates.push(cause.data);
+  } else if (typeof cause.data === "object" && cause.data !== null) {
+    for (const value of Object.values(cause.data)) {
+      if (typeof value === "string") candidates.push(value);
+    }
+  }
+  for (const candidate of candidates) {
+    const parsed = extractAntigravityVerificationFromText(candidate);
+    if (parsed === undefined) continue;
+    if (parsed.verificationUrl !== undefined) return parsed;
+    fallback ??= parsed;
+  }
+  return fallback ?? extractAntigravityVerificationFromText(serializeErrorData(cause.data));
+}
+
 /**
  * Classifies ACP RPC errors returned directly by `prompt()` or idle `stopReason: "error"`.
- * Permanent non-quota failures (e.g. `VALIDATION_REQUIRED`, sign-in required) stay `provider_error`.
+ * Permanent non-quota failures stay non-retryable and never trigger quota failover.
  */
 export function classifyAntigravityPromptFailure(
   cause: unknown,
@@ -217,6 +260,19 @@ export function classifyAntigravityPromptFailure(
   }
   if (!isAcpRequestError(cause)) {
     return makeProviderFailure({ cause, class: "provider_error" });
+  }
+  const verification = extractVerificationFromAcpError(cause);
+  if (verification !== undefined) {
+    return makeProviderFailure({
+      cause,
+      class: "permission_error",
+      code: ANTIGRAVITY_VERIFICATION_REQUIRED_CODE,
+      message: verification.message,
+      retryable: false,
+      ...(verification.verificationUrl === undefined
+        ? {}
+        : { verificationUrl: verification.verificationUrl }),
+    });
   }
   const dataText = serializeErrorData(cause.data);
   const combined = `${cause.errorMessage}\n${dataText}`;

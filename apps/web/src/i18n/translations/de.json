@@ -4315,6 +4315,7 @@
       "c": "“ wird gelesen"
     }
   ],
+  "7b33663c48eb04a3": "Konto verifizieren",
   "a2aaca7ff8310186": "Chat öffnen",
   "a3048aaa541b7744": "Aktivität",
   "4a3cbccb2beedeb0": "Bild",
@@ -11364,6 +11365,8 @@
   "a887d07963e1f028": "Nicht gefunden",
   "d49898dcd40e6332": "CLI nicht im PATH gefunden.",
   "b2768aa900b19198": "Nicht authentifiziert · {method}",
+  "e3e7fd8ed4ebcfb9": "Verifizierung erforderlich",
+  "b1edda47de73afe4": "Verifiziere dein Google-Konto, um Antigravity zu verwenden.",
   "24a4bbee246a576f": "Installiert · Anmeldung nicht geprüft",
   "0e56ea6a22e303ca": "Erfordert Aufmerksamkeit",
   "9469080828cdc899": "Der Anbieter ist installiert, aber der Server konnte ihn nicht vollständig verifizieren.",

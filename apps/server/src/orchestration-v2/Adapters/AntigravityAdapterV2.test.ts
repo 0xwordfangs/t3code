@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   ChatFileAttachment,
+  GoogleAccountVerificationUrl,
   MessageId,
   NodeId,
   ProjectId,
@@ -2154,7 +2155,154 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
         errorMessage: "VALIDATION_REQUIRED",
       }),
     );
-    assert.equal(permanent?.class, "provider_error");
+    assert.equal(permanent?.class, "permission_error");
     assert.equal(permanent?.retryable, false);
   });
+
+  it.effect(
+    "invokes onVerificationRequired with validated verificationUrl when a turn fails with VALIDATION_REQUIRED",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const verificationUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=adapter-turn-1",
+        );
+        const notified = yield* Deferred.make<{
+          readonly verificationUrl?: GoogleAccountVerificationUrl;
+          readonly message?: string;
+        }>();
+        const instanceId = ProviderInstanceId.make("antigravity-verification-test");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          onVerificationRequired: (input) => Deferred.succeed(notified, input).pipe(Effect.asVoid),
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: { T3_ACP_ANTIGRAVITY: "1" },
+              },
+            }).pipe(
+              Effect.provideService(SecureRandom.SecureRandom, crypto),
+              Effect.map((runtime) => ({
+                ...runtime,
+                prompt: () =>
+                  Effect.fail(
+                    new EffectAcpErrors.AcpRequestError({
+                      code: -32603,
+                      errorMessage: `PERMISSION_DENIED (code 403): ${JSON.stringify({
+                        error: {
+                          code: 403,
+                          status: "PERMISSION_DENIED",
+                          details: [
+                            {
+                              "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                              reason: "VALIDATION_REQUIRED",
+                              metadata: {
+                                validation_url: verificationUrl,
+                                validation_error_message:
+                                  "Verify your Google account to continue using Antigravity.",
+                              },
+                            },
+                          ],
+                        },
+                      })}`,
+                    }),
+                  ),
+              })),
+            ),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+        const threadId = ThreadId.make("thread-antigravity-verification");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-verification"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const terminalFiber = yield* session.events.pipe(
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.runHead,
+          Effect.forkScoped,
+        );
+        yield* session.startTurn({
+          appThread: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project-antigravity-verification"),
+            title: "Antigravity verification",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          threadId,
+          runId: RunId.make("run-antigravity-verification"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-verification"),
+          rootNodeId: NodeId.make("node-antigravity-verification"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-verification"),
+            text: "hello",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+
+        const notice = yield* Deferred.await(notified);
+        assert.deepEqual(notice, {
+          verificationUrl,
+          message: "Verify your Google account to continue using Antigravity.",
+        });
+        const terminal = yield* Fiber.join(terminalFiber);
+        assert.equal(terminal._tag, "Some");
+        if (terminal._tag === "Some" && terminal.value.type === "turn.terminal") {
+          assert.equal(terminal.value.status, "failed");
+          assert.equal(terminal.value.failure?.class, "permission_error");
+          assert.equal(terminal.value.failure?.code, "VALIDATION_REQUIRED");
+          assert.equal(terminal.value.failure?.retryable, false);
+          assert.equal(terminal.value.failure?.verificationUrl, verificationUrl);
+        }
+      }).pipe(Effect.provide(layerSession)),
+  );
 });

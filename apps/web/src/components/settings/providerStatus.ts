@@ -44,6 +44,8 @@ function isAntigravitySignInUnchecked(provider: ServerProvider): boolean {
     provider.installed &&
     provider.status === "warning" &&
     provider.auth.status === "unknown" &&
+    provider.auth.verificationRequired !== true &&
+    provider.auth.verificationUrl === undefined &&
     (provider.auth.type === undefined ||
       provider.auth.type === "oauth-personal" ||
       provider.auth.type === "oauth-business")
@@ -89,6 +91,15 @@ export function getProviderSummary(
         ? resolve(msg("Not authenticated · {method}", { method: authLabel }))
         : resolve(msg("Not authenticated")),
       detail: provider.message ?? null,
+    };
+  }
+  if (
+    provider.status !== "error" &&
+    (provider.auth.verificationRequired === true || provider.auth.verificationUrl !== undefined)
+  ) {
+    return {
+      headline: resolve(msg("Verification required")),
+      detail: provider.message ?? resolve(msg("Verify your Google account to use Antigravity.")),
     };
   }
   if (isAntigravitySignInUnchecked(provider)) {
