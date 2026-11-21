@@ -10,7 +10,9 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as EffectAcpSchema from "effect-acp/compat";
+import * as EffectAcpErrors from "effect-acp/errors";
 
+import { isAntigravitySignInRequiredError } from "../antigravityAuthSupport.ts";
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
 
 // CORTEX_STEP_TYPE_ERROR_MESSAGE in the native trajectory.
@@ -20,6 +22,14 @@ const MAX_ERROR_PAYLOAD_BYTES = 16_384;
 // The Go harness's rendering of a Google API error, as the agent's api_errors.py reads it.
 const API_ERROR = /Error (\d{3}), Message: (.+?), Status: ([A-Z_]+)/s;
 const QUOTA_EXHAUSTED = /\breason:QUOTA_EXHAUSTED\b/;
+const RESOURCE_EXHAUSTED = /\bRESOURCE_EXHAUSTED\b/;
+const HTTP_429 = /\bHTTP\s*429\b|\bstatus(?:\s*code)?\s*[:=]?\s*429\b/i;
+const QUOTA_MESSAGE =
+  /\b(?:individual quota reached|quota exhausted|usage limit reached|quota limit reached)\b/i;
+// Permanent account/auth/policy blocks must never be classified as quota limits.
+const NON_QUOTA_PERMANENT =
+  /\b(?:VALIDATION_REQUIRED|PERMISSION_DENIED|UNAUTHENTICATED|ACCOUNT_RESTRICTED)\b/i;
+const isAcpRequestError = Schema.is(EffectAcpErrors.AcpRequestError);
 // Claude rejects a saved thinking block without a valid signature. It sits in the native
 // history, so every later prompt to that session fails the same way.
 const INVALID_THINKING_SIGNATURE =
@@ -124,9 +134,10 @@ function turnFailure(
   if (errorText === undefined && stopReason !== "refusal") return undefined;
   const text = errorText ?? "";
   const apiError = API_ERROR.exec(text);
+  const nonQuotaPermanent = NON_QUOTA_PERMANENT.test(text);
   const reusable = (failure: OrchestrationV2ProviderFailure) =>
     ({ failure, threadDisposition: "reusable" }) as const;
-  if (stopReason === "refusal" || QUOTA_EXHAUSTED.test(text)) {
+  if (!nonQuotaPermanent && (stopReason === "refusal" || QUOTA_EXHAUSTED.test(text))) {
     return reusable(
       makeProviderFailure({
         class: "usage_limit",
@@ -150,6 +161,17 @@ function turnFailure(
     };
   }
   if (apiError === null) {
+    if (!nonQuotaPermanent && (QUOTA_MESSAGE.test(text) || RESOURCE_EXHAUSTED.test(text))) {
+      return reusable(
+        makeProviderFailure({
+          class: "usage_limit",
+          message: "You have reached your Antigravity quota for this period.",
+          code: RESOURCE_EXHAUSTED.test(text) ? "RESOURCE_EXHAUSTED" : "QUOTA_EXHAUSTED",
+          retryable: true,
+          resetAt: resetAtFrom(text, now) ?? null,
+        }),
+      );
+    }
     return reusable(
       makeProviderFailure({
         class: "provider_error",
@@ -158,16 +180,86 @@ function turnFailure(
     );
   }
   const [, httpStatus, message, status] = apiError;
-  const rateLimited = httpStatus === "429" || status === "RESOURCE_EXHAUSTED";
+  const rateLimited =
+    !nonQuotaPermanent &&
+    (httpStatus === "429" || status === "RESOURCE_EXHAUSTED" || QUOTA_MESSAGE.test(message ?? ""));
   return reusable(
     makeProviderFailure({
       class: rateLimited ? "usage_limit" : "provider_error",
       message: message!.trim(),
       code: status ?? null,
-      retryable: rateLimited || Number(httpStatus) >= 500,
-      resetAt: resetAtFrom(text, now) ?? null,
+      retryable: rateLimited || (!nonQuotaPermanent && Number(httpStatus) >= 500),
+      resetAt: rateLimited ? (resetAtFrom(text, now) ?? null) : null,
     }),
   );
+}
+
+function serializeErrorData(data: unknown): string {
+  if (data === undefined || data === null) return "";
+  if (typeof data === "string") return data;
+  try {
+    return JSON.stringify(data);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Classifies ACP RPC errors returned directly by `prompt()` or idle `stopReason: "error"`.
+ * Permanent non-quota failures (e.g. `VALIDATION_REQUIRED`, sign-in required) stay `provider_error`.
+ */
+export function classifyAntigravityPromptFailure(
+  cause: unknown,
+  now: DateTime.Utc = DateTime.nowUnsafe(),
+): OrchestrationV2ProviderFailure {
+  if (isAntigravitySignInRequiredError(cause)) {
+    return makeProviderFailure({ cause, class: "provider_error", retryable: false });
+  }
+  if (!isAcpRequestError(cause)) {
+    return makeProviderFailure({ cause, class: "provider_error" });
+  }
+  const dataText = serializeErrorData(cause.data);
+  const combined = `${cause.errorMessage}\n${dataText}`;
+  const nonQuotaMatch = NON_QUOTA_PERMANENT.exec(combined);
+  if (nonQuotaMatch !== null) {
+    return makeProviderFailure({
+      cause,
+      message: cause.errorMessage.trim() || undefined,
+      code: nonQuotaMatch[0].toUpperCase(),
+      class: "provider_error",
+      retryable: false,
+    });
+  }
+  const apiError = API_ERROR.exec(combined);
+  const isQuotaError =
+    QUOTA_EXHAUSTED.test(combined) ||
+    QUOTA_MESSAGE.test(combined) ||
+    RESOURCE_EXHAUSTED.test(combined) ||
+    HTTP_429.test(combined) ||
+    apiError?.[1] === "429" ||
+    apiError?.[3] === "RESOURCE_EXHAUSTED";
+  if (isQuotaError) {
+    const trimmed = cause.errorMessage.trim();
+    return makeProviderFailure({
+      cause,
+      class: "usage_limit",
+      message:
+        apiError?.[2]?.trim() ||
+        trimmed ||
+        "You have reached your Antigravity quota for this period.",
+      code:
+        apiError?.[3] ??
+        (RESOURCE_EXHAUSTED.test(combined) ? "RESOURCE_EXHAUSTED" : "QUOTA_EXHAUSTED"),
+      retryable: true,
+      resetAt: resetAtFrom(combined, now) ?? null,
+    });
+  }
+  return makeProviderFailure({
+    cause,
+    message: cause.errorMessage.trim() || undefined,
+    code: String(cause.code),
+    class: "provider_error",
+  });
 }
 
 const conversationSegments = ["antigravity-acp", "conversations"];

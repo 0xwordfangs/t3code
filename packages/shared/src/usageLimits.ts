@@ -23,6 +23,63 @@ import { isLocalLoopbackHost, isWildcardHost } from "./hostClassification.ts";
 
 const MINUTE = 60_000;
 
+export type AntigravityQuotaFamily = "gemini-argon" | "gemini-carbon" | "gemini" | "claude" | "gpt";
+
+export type AntigravityQuotaPool = AntigravityQuotaFamily | "3p";
+
+export function antigravityModelQuotaFamily(model: string): AntigravityQuotaFamily | undefined {
+  const normalized = model.trim().toLowerCase();
+  if (/^gemini-.*(?:^|[-_])argon(?:$|[-_])/.test(normalized)) return "gemini-argon";
+  if (/^gemini-.*(?:^|[-_])carbon(?:$|[-_])/.test(normalized)) return "gemini-carbon";
+  if (normalized.startsWith("gemini-")) return "gemini";
+  if (normalized.startsWith("claude-")) return "claude";
+  if (normalized.startsWith("gpt-")) return "gpt";
+  return undefined;
+}
+
+function antigravityWindowQuotaPool(windowId: string): AntigravityQuotaPool | undefined {
+  const normalized = windowId.trim().toLowerCase();
+  if (normalized.startsWith("gemini-argon-")) return "gemini-argon";
+  if (normalized.startsWith("gemini-carbon-")) return "gemini-carbon";
+  if (normalized.startsWith("gemini-")) return "gemini";
+  if (normalized.startsWith("3p-")) return "3p";
+  if (normalized.startsWith("claude-")) return "claude";
+  if (normalized.startsWith("gpt-")) return "gpt";
+  return undefined;
+}
+
+export function antigravityWindowMatchesModel(windowId: string, model: string): boolean {
+  const family = antigravityModelQuotaFamily(model);
+  const pool = antigravityWindowQuotaPool(windowId);
+  return (
+    pool === undefined ||
+    family === undefined ||
+    pool === family ||
+    (pool === "3p" && (family === "claude" || family === "gpt"))
+  );
+}
+
+export function antigravityModelUsedPercent(
+  provider: ServerProvider | undefined,
+  now: number,
+  model: string,
+): number | null {
+  if (provider?.driver !== "antigravity") return null;
+  const windows = provider.usageLimits?.windows ?? [];
+  const matching = windows.filter(
+    (window) =>
+      antigravityWindowMatchesModel(window.id, model) &&
+      (window.modelIds === undefined || window.modelIds.includes(model)) &&
+      (window.providerIds === undefined ||
+        window.providerIds.includes(model.split("/")[0] ?? "")) &&
+      (!window.resetsAt ||
+        !Number.isFinite(Date.parse(window.resetsAt)) ||
+        Date.parse(window.resetsAt) > now),
+  );
+  if (matching.length === 0) return null;
+  return matching.reduce((max, window) => Math.max(max, window.usedPercent ?? 0), 0);
+}
+
 export function exhaustedUsageWindow(
   provider: ServerProvider | undefined,
   now: number,
@@ -47,18 +104,8 @@ export function exhaustedUsageWindow(
       const auto = exhausted.find((window) => window.id === "autoPercentUsed");
       return /^(auto|default|grok|composer)/.test(model) ? auto && api : api;
     }
-    case "antigravity": {
-      const family = model.match(/^(gemini|claude|gpt)-/)?.[1];
-      return exhausted.find((window) => {
-        const pool = window.id.match(/^(gemini|claude|gpt|3p)-/)?.[1];
-        return (
-          pool === undefined ||
-          family === undefined ||
-          pool === family ||
-          (pool === "3p" && (family === "claude" || family === "gpt"))
-        );
-      });
-    }
+    case "antigravity":
+      return exhausted.find((window) => antigravityWindowMatchesModel(window.id, model));
     case "codex": {
       // Seat-based plans spend credits only past their plan windows, so the credit cap blocks only plans without them.
       const hasPlanWindows = windows.some(

@@ -1,4 +1,5 @@
 import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
+import * as AntigravityFailover from "./AntigravityFailover.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
@@ -420,6 +421,7 @@ export const layerProduction = Layer.mergeAll(
 ).pipe(
   Layer.provide(layerThreadLaunchProvided),
   Layer.provide(ResourceCleanupService.layer.pipe(Layer.provide(layerScheduledTaskProvided))),
+  Layer.provideMerge(AntigravityFailover.layer),
   Layer.provideMerge(layerProjectService),
   Layer.provide(Scheduler.layer),
   Layer.provideMerge(layerEventInfrastructure),

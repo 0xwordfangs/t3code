@@ -95,6 +95,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as AntigravityFailover from "../orchestration-v2/AntigravityFailover.ts";
 import {
   subagentResultForRun,
   delegatedTaskProgress,
@@ -1281,6 +1282,7 @@ const make = Effect.gen(function* () {
   const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const antigravityFailover = yield* AntigravityFailover.AntigravityFailover;
   const remoteDelegation = yield* RemoteDelegation.RemoteDelegation;
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -1710,9 +1712,27 @@ const make = Effect.gen(function* () {
       }
       options = [...selections.values()];
     }
+    let resolvedSelection: ModelSelection = {
+      instanceId,
+      model,
+      ...(options === undefined ? {} : { options }),
+    };
+    let supportedRuntimeModes = provider.supportedRuntimeModes;
+    if (provider.driver === "antigravity" && input.skipProjectEnablementFilter !== true) {
+      const preflight = yield* antigravityFailover.preflightSelection({
+        projectId: input.parent.thread.projectId,
+        selection: resolvedSelection,
+        providers: input.providers,
+        orchestrationCapableInstanceIds,
+      });
+      if (preflight !== null) {
+        resolvedSelection = preflight.modelSelection;
+        supportedRuntimeModes = preflight.candidate.supportedRuntimeModes;
+      }
+    }
     return {
-      modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
-      supportedRuntimeModes: provider.supportedRuntimeModes,
+      modelSelection: resolvedSelection,
+      supportedRuntimeModes,
     };
   });
 

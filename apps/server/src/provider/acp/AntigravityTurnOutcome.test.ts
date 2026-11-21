@@ -6,9 +6,13 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import type * as EffectAcpSchema from "effect-acp/compat";
+import * as EffectAcpErrors from "effect-acp/errors";
 import type { OrchestrationV2ProviderFailure } from "@t3tools/contracts";
 
-import { watchAntigravityPromptOutcome } from "./AntigravityTurnOutcome.ts";
+import {
+  classifyAntigravityPromptFailure,
+  watchAntigravityPromptOutcome,
+} from "./AntigravityTurnOutcome.ts";
 
 const USER_INPUT = 14;
 const PLANNER_RESPONSE = 15;
@@ -233,4 +237,105 @@ describe("watchAntigravityPromptOutcome", () => {
       );
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect(
+    "classifies Individual quota reached as usage_limit and keeps VALIDATION_REQUIRED permanent",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const profileDirectory = yield* fs.makeTempDirectoryScoped();
+        const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+        yield* fs.makeDirectory(conversations, { recursive: true });
+        const sessionId = "a1b2c3d4-1111-4222-8333-444455556666";
+        let nextIndex = 0;
+        const appendSteps = (steps: ReadonlyArray<readonly [number, Uint8Array]>) => {
+          const database = new NodeSqlite.DatabaseSync(path.join(conversations, `${sessionId}.db`));
+          try {
+            database.exec(
+              "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB)",
+            );
+            const insert = database.prepare("INSERT INTO steps VALUES (?, ?, ?)");
+            for (const [type, payload] of steps) insert.run(nextIndex++, type, payload);
+          } finally {
+            database.close();
+          }
+        };
+        const turn = (steps: ReadonlyArray<readonly [number, Uint8Array]>) =>
+          Effect.gen(function* () {
+            const check = yield* watchAntigravityPromptOutcome(profileDirectory, sessionId);
+            appendSteps(steps);
+            return yield* check({ stopReason: "end_turn" });
+          });
+
+        const individualQuota = errorPayload("Individual quota reached for claude-opus-5-5.");
+        const validationRequired = errorPayload(
+          "Error 403, Message: Account requires verification., Status: VALIDATION_REQUIRED, Details: []",
+        );
+
+        const quotaOutcome = yield* turn([
+          [USER_INPUT, Buffer.from("design")],
+          [ERROR_MESSAGE, individualQuota],
+        ]);
+        assert.equal(quotaOutcome?.failure.class, "usage_limit");
+        assert.equal(quotaOutcome?.failure.code, "QUOTA_EXHAUSTED");
+
+        const validationOutcome = yield* turn([
+          [USER_INPUT, Buffer.from("design")],
+          [ERROR_MESSAGE, validationRequired],
+        ]);
+        assert.equal(validationOutcome?.failure.class, "provider_error");
+        assert.equal(validationOutcome?.failure.code, "VALIDATION_REQUIRED");
+        assert.equal(validationOutcome?.failure.retryable, false);
+
+        const bareResourceExhausted = errorPayload("Upstream returned RESOURCE_EXHAUSTED.");
+        const resourceExhaustedOutcome = yield* turn([
+          [USER_INPUT, Buffer.from("design")],
+          [ERROR_MESSAGE, bareResourceExhausted],
+        ]);
+        assert.equal(resourceExhaustedOutcome?.failure.class, "usage_limit");
+        assert.equal(resourceExhaustedOutcome?.failure.code, "RESOURCE_EXHAUSTED");
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("classifyAntigravityPromptFailure", () => {
+  it("classifies ACP RPC quota errors as usage_limit and permanent blocks as provider_error", () => {
+    const quota = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Individual quota reached for model claude-opus-5-5",
+      }),
+    );
+    assert.equal(quota.class, "usage_limit");
+    assert.equal(quota.retryable, true);
+
+    const validation = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Error 403: VALIDATION_REQUIRED (account verification needed)",
+      }),
+    );
+    assert.equal(validation.class, "provider_error");
+    assert.equal(validation.code, "VALIDATION_REQUIRED");
+    assert.equal(validation.retryable, false);
+
+    const authRequired = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32000,
+        errorMessage: "Sign in required",
+      }),
+    );
+    assert.equal(authRequired.class, "provider_error");
+    assert.equal(authRequired.retryable, false);
+
+    const http429 = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "HTTP 429 Too Many Requests",
+      }),
+    );
+    assert.equal(http429.class, "usage_limit");
+    assert.equal(http429.retryable, true);
+  });
 });

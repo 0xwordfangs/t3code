@@ -2138,4 +2138,23 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
         }
       }).pipe(Effect.provide(layerSession)),
   );
+
+  it("classifies Antigravity RPC quota errors via flavor.promptFailure and excludes VALIDATION_REQUIRED", () => {
+    const quota = flavor.promptFailure?.(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Individual quota reached",
+      }),
+    );
+    assert.equal(quota?.class, "usage_limit");
+
+    const permanent = flavor.promptFailure?.(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "VALIDATION_REQUIRED",
+      }),
+    );
+    assert.equal(permanent?.class, "provider_error");
+    assert.equal(permanent?.retryable, false);
+  });
 });

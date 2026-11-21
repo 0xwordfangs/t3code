@@ -10,6 +10,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   type LimitAccount,
+  antigravityModelQuotaFamily,
+  antigravityModelUsedPercent,
+  antigravityWindowMatchesModel,
   displayLimitWindows,
   cursorUsageWindowDetails,
   collectProviderUsageLimits,
@@ -132,6 +135,12 @@ describe("new thread model fallback", () => {
     ["antigravity", ["gemini-weekly"], "claude-opus-5-5", false, undefined, undefined],
     ["antigravity", ["3p-weekly"], "claude-opus-5-5", true, undefined, undefined],
     ["antigravity", ["gemini-weekly"], "antigravity-default", true, undefined, undefined],
+    ["antigravity", ["gemini-argon-wtu-weekly"], "gemini-4-argon", true, undefined, undefined],
+    ["antigravity", ["gemini-argon-wtu-weekly"], "gemini-4-neon", false, undefined, undefined],
+    ["antigravity", ["gemini-weekly"], "gemini-4-argon", false, undefined, undefined],
+    ["antigravity", ["gemini-weekly"], "gemini-4-neon", true, undefined, undefined],
+    ["antigravity", ["gemini-carbon-5h"], "gemini-4-carbon", true, undefined, undefined],
+    ["antigravity", ["gemini-carbon-5h"], "gemini-4-neon", false, undefined, undefined],
     ["codex", ["individual"], "gpt-5.5", true, undefined, undefined],
     ["opencode", ["go_weekly"], "opencode/big-pickle", false, undefined, undefined],
     ["opencode", ["go_weekly"], "opencode-go/big-pickle", true, undefined, undefined],
@@ -208,6 +217,49 @@ describe("new thread model fallback", () => {
       ).toEqual(usesFallback ? fallback : defaultSelection);
     },
   );
+});
+
+describe("antigravity quota family helpers", () => {
+  it("maps Antigravity models to isolated quota families and computes effective usedPercent", () => {
+    expect(antigravityModelQuotaFamily("gemini-4-argon")).toBe("gemini-argon");
+    expect(antigravityModelQuotaFamily("gemini-4-carbon")).toBe("gemini-carbon");
+    expect(antigravityModelQuotaFamily("gemini-4-neon")).toBe("gemini");
+    expect(antigravityModelQuotaFamily("claude-opus-5-5")).toBe("claude");
+    expect(antigravityModelQuotaFamily("gpt-5")).toBe("gpt");
+    expect(antigravityModelQuotaFamily("antigravity-default")).toBeUndefined();
+
+    expect(antigravityWindowMatchesModel("gemini-argon-wtu-weekly", "gemini-4-argon")).toBe(true);
+    expect(antigravityWindowMatchesModel("gemini-argon-wtu-weekly", "gemini-4-neon")).toBe(false);
+    expect(antigravityWindowMatchesModel("gemini-5h", "gemini-4-argon")).toBe(false);
+    expect(antigravityWindowMatchesModel("3p-5h", "claude-opus-5-5")).toBe(true);
+
+    const checkedAt = "2026-09-03T11:00:00.000Z";
+    const agy = provider({
+      driver: ProviderDriverKind.make("antigravity"),
+      usageLimits: {
+        checkedAt,
+        windows: [
+          { ...window, id: "gemini-5h", usedPercent: 30 },
+          { ...window, id: "gemini-weekly", usedPercent: 70 },
+          { ...window, id: "gemini-argon-wtu-weekly", usedPercent: 100 },
+          { ...window, id: "3p-5h", usedPercent: 15 },
+        ],
+      },
+    });
+    expect(antigravityModelUsedPercent(agy, now, "gemini-4-neon")).toBe(70);
+    expect(antigravityModelUsedPercent(agy, now, "gemini-4-argon")).toBe(100);
+    expect(antigravityModelUsedPercent(agy, now, "claude-opus-5-5")).toBe(15);
+
+    const probeFailed = provider({
+      driver: ProviderDriverKind.make("antigravity"),
+      usageLimits: {
+        checkedAt,
+        windows: [],
+        unavailable: { reason: "probeFailed", message: "Expired access token" },
+      },
+    });
+    expect(antigravityModelUsedPercent(probeFailed, now, "gemini-4-neon")).toBeNull();
+  });
 });
 
 describe("pace", () => {

@@ -94,6 +94,7 @@ import {
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -189,6 +190,7 @@ import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
+import * as AntigravityFailover from "./AntigravityFailover.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import { usesTrialWorkspace } from "./trialWorkspace.ts";
 import { isRuntimePolicyAboveCeilingError, RuntimePolicyV2 } from "./RuntimePolicy.ts";
@@ -1552,6 +1554,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
+  const antigravityFailover = yield* AntigravityFailover.AntigravityFailover;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
@@ -2433,7 +2436,66 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const queuedMessage = projection.messages.find(
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
-      const modelSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const originalModelSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      // Failed worktree creation would run queued work in the project checkout; wait for the user.
+      const failedRun = latestExecutedRun(projection.runs);
+      const endedRunId = options?.latestRunEnded === true ? failedRun?.id : options?.endedRunId;
+      const failedRunId =
+        options?.latestRunEnded === true && failedRun?.status === "failed"
+          ? failedRun.id
+          : options?.failedRunId;
+      const failureClass =
+        failedRun && failedRunId !== undefined && failedRun.id === failedRunId
+          ? latestRootProviderFailure(failedRun, projection.turnItems)?.class
+          : undefined;
+      const worktreeMissing =
+        endedRunId !== undefined &&
+        failedRun?.id === endedRunId &&
+        failedRun?.workspacePreparation?.type === "worktree" &&
+        projection.thread.worktreePath === null;
+      const originalProviderNonQuotaFailed =
+        failureClass !== undefined &&
+        failureClass !== "validation_error" &&
+        failureClass !== "usage_limit" &&
+        failedRun?.providerInstanceId === originalModelSelection.instanceId;
+      let modelSelection = originalModelSelection;
+      const queuedPreflightAllowed =
+        !worktreeMissing &&
+        !originalProviderNonQuotaFailed &&
+        storedQueuedRun.usageLimitContinuationOfRunId === undefined &&
+        storedQueuedRun.restartContinuationOfRunId === undefined &&
+        (queuedMessage === undefined ||
+          (!isNativeMaintenanceCommand(queuedMessage) &&
+            !isBufferedProviderNotification(queuedMessage)));
+      if (queuedPreflightAllowed) {
+        const currentSessions = projection.providerSessions.filter(
+          (session) =>
+            session.providerInstanceId === modelSelection.instanceId &&
+            session.status !== "stopped" &&
+            session.status !== "error",
+        );
+        let hasActiveBackgroundWork = false;
+        for (const session of currentSessions) {
+          if (yield* sessionHasBackgroundWork(session, projection.providerThreads)) {
+            hasActiveBackgroundWork = true;
+            break;
+          }
+        }
+        if (!hasActiveBackgroundWork) {
+          const decision = yield* antigravityFailover.preflightSelection({
+            projectId: projection.thread.projectId,
+            selection: modelSelection,
+          });
+          if (
+            decision !== null &&
+            (yield* Effect.isSuccess(
+              Effect.exit(providerAdapters.get(decision.modelSelection.instanceId)),
+            ))
+          ) {
+            modelSelection = decision.modelSelection;
+          }
+        }
+      }
       const queuedRun = {
         ...storedQueuedRun,
         modelSelection,
@@ -2453,22 +2515,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (isRuntimeModeAbove(projection.thread.runtimeMode, runtimeModeCeiling?.maxRuntimeMode)) {
         return;
       }
-      // Failed worktree creation would run queued work in the project checkout; wait for the user.
-      const failedRun = latestExecutedRun(projection.runs);
-      const endedRunId = options?.latestRunEnded === true ? failedRun?.id : options?.endedRunId;
-      const failedRunId =
-        options?.latestRunEnded === true && failedRun?.status === "failed"
-          ? failedRun.id
-          : options?.failedRunId;
-      const failureClass =
-        failedRun && failedRunId !== undefined && failedRun.id === failedRunId
-          ? latestRootProviderFailure(failedRun, projection.turnItems)?.class
-          : undefined;
-      const worktreeMissing =
-        endedRunId !== undefined &&
-        failedRun?.id === endedRunId &&
-        failedRun?.workspacePreparation?.type === "worktree" &&
-        projection.thread.worktreePath === null;
       const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
       const projectOverride =
         settings.projectSettingsOverrides[projection.thread.projectId]?.providerInstances?.[
@@ -7529,11 +7575,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
-    const activeProviderThread = dispatchProviderThread(
-      projection,
-      { ...command, delegatedCompletion },
-      freshContext,
-    );
     const activeRun = projection.runs.find(isActiveRun);
     // Messages after failed or stopped worktree setup must wait for a worktree,
     // rather than start in the project checkout.
@@ -7584,6 +7625,53 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       modelSelection = queueTailModelSelection(projection);
     }
+    const shouldPreflightAntigravity =
+      !shouldQueue &&
+      command.usageLimitContinuationOfRunId === undefined &&
+      command.restartContinuationOfRunId === undefined &&
+      !isNativeMaintenanceCommand(command) &&
+      !isBufferedProviderNotification(incomingMessage);
+    if (shouldPreflightAntigravity) {
+      const currentSessions = projection.providerSessions.filter(
+        (session) =>
+          session.providerInstanceId === modelSelection.instanceId &&
+          session.status !== "stopped" &&
+          session.status !== "error",
+      );
+      let hasActiveBackgroundWork = false;
+      for (const session of currentSessions) {
+        if (yield* sessionHasBackgroundWork(session, projection.providerThreads)) {
+          hasActiveBackgroundWork = true;
+          break;
+        }
+      }
+      if (!hasActiveBackgroundWork) {
+        const preflight = yield* antigravityFailover.preflightSelection({
+          projectId: projection.thread.projectId,
+          selection: modelSelection,
+        });
+        if (
+          preflight !== null &&
+          (yield* Effect.isSuccess(
+            Effect.exit(providerAdapters.get(preflight.modelSelection.instanceId)),
+          ))
+        ) {
+          modelSelection = preflight.modelSelection;
+          if (
+            activeProviderInstanceId !== undefined &&
+            activeProviderInstanceId !== modelSelection.instanceId &&
+            command.idleCompaction === undefined
+          ) {
+            projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+          }
+        }
+      }
+    }
+    const activeProviderThread = dispatchProviderThread(
+      projection,
+      { ...command, delegatedCompletion },
+      freshContext,
+    );
     yield* ensureGoalCommandSupported(command, command, modelSelection.instanceId);
     // Client messages resume held queues; server continuations and scheduled tasks do not.
     // Provider failure or usage limits re-hold the queue.
@@ -15867,6 +15955,823 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       : dispatch;
   });
 
+  const activeAntigravityFailoverRuns = new Set<RunId>();
+  const settledAntigravityFailoverAttempts = new Set<string>();
+  const antigravityFailoverWaiters = new Map<string, Deferred.Deferred<void>>();
+  const failoverAttemptKey = (run: Pick<OrchestrationV2Run, "id" | "activeAttemptId">) =>
+    `${run.id}:${run.activeAttemptId ?? ""}`;
+
+  const runAwaitsAntigravityFailover = Effect.fn("Orchestrator.runAwaitsAntigravityFailover")(
+    function* (threadId: ThreadId, run: OrchestrationV2Run) {
+      if (run.status !== "failed") return false;
+      const key = failoverAttemptKey(run);
+      if (settledAntigravityFailoverAttempts.has(key)) return false;
+      if (activeAntigravityFailoverRuns.has(run.id)) {
+        if (!antigravityFailoverWaiters.has(key)) {
+          antigravityFailoverWaiters.set(key, yield* Deferred.make<void>());
+        }
+        return true;
+      }
+      if (!(yield* antigravityFailover.isAntigravityInstance(run.providerInstanceId))) {
+        return false;
+      }
+      const projection = yield* projectionStore
+        .getThreadRecords(
+          threadId,
+          [
+            "runs",
+            "attempts",
+            "providerSessions",
+            "providerThreads",
+            "runtimeRequests",
+            "turnItems",
+          ],
+          {
+            turnItemTypes: ["error", "run_interrupt_request"],
+            turnItemRunIds: [run.id],
+          },
+        )
+        .pipe(Effect.orElseSucceed(() => null));
+      if (
+        projection === null ||
+        projection.thread.archivedAt !== null ||
+        projection.thread.deletedAt !== null ||
+        projection.thread.settledOverride === "settled" ||
+        latestExecutedRun(projection.runs)?.id !== run.id ||
+        projection.runtimeRequests.some((request) => request.status === "pending")
+      ) {
+        return false;
+      }
+      if (projection.turnItems.some((item) => item.type === "run_interrupt_request")) return false;
+      const failure = latestRootProviderFailure(run, projection.turnItems);
+      if (failure?.class !== "usage_limit") return false;
+      const currentSessions = projection.providerSessions.filter(
+        (session) =>
+          session.providerInstanceId === run.providerInstanceId &&
+          session.status !== "stopped" &&
+          session.status !== "error",
+      );
+      for (const session of currentSessions) {
+        if (yield* sessionHasBackgroundWork(session, projection.providerThreads)) {
+          return false;
+        }
+      }
+      const excluded = new Set<ProviderInstanceId>([
+        ...projection.attempts
+          .filter((attempt) => attempt.runId === run.id)
+          .map((attempt) => attempt.providerInstanceId),
+        run.providerInstanceId,
+      ]);
+      while (true) {
+        const candidate = yield* antigravityFailover.nextFailoverSelection({
+          projectId: projection.thread.projectId,
+          selection: run.modelSelection,
+          triedInstanceIds: excluded,
+        });
+        if (candidate === null) return false;
+        const adapterExit = yield* Effect.exit(
+          providerAdapters.get(candidate.modelSelection.instanceId),
+        );
+        if (Exit.isSuccess(adapterExit)) {
+          if (!antigravityFailoverWaiters.has(key)) {
+            antigravityFailoverWaiters.set(key, yield* Deferred.make<void>());
+          }
+          return true;
+        }
+        excluded.add(candidate.modelSelection.instanceId);
+      }
+    },
+  );
+
+  const attemptAntigravityQuotaFailover = Effect.fn("Orchestrator.attemptAntigravityQuotaFailover")(
+    function* (threadId: ThreadId, failedRunId: RunId) {
+      activeAntigravityFailoverRuns.add(failedRunId);
+      let attemptKey: string | undefined;
+      let didFailover = false;
+      return yield* Effect.gen(function* () {
+        const projection = yield* readCommandProjection(threadId).pipe(
+          Effect.orElseSucceed(() => null),
+        );
+        if (
+          projection === null ||
+          projection.thread.archivedAt !== null ||
+          projection.thread.deletedAt !== null ||
+          projection.thread.settledOverride === "settled"
+        ) {
+          return false;
+        }
+        const run = projection.runs.find((candidate) => candidate.id === failedRunId);
+        if (run !== undefined) {
+          attemptKey = failoverAttemptKey(run);
+        }
+        if (
+          run === undefined ||
+          run.status !== "failed" ||
+          latestExecutedRun(projection.runs)?.id !== failedRunId ||
+          projection.runtimeRequests.some((request) => request.status === "pending")
+        ) {
+          return false;
+        }
+        if (!(yield* antigravityFailover.isAntigravityInstance(run.providerInstanceId))) {
+          return false;
+        }
+        const { turnItems: runErrorItems } = yield* projectionStore
+          .getThreadRecords(threadId, ["turnItems"], {
+            turnItemTypes: ["error", "run_interrupt_request"],
+            turnItemRunIds: [run.id],
+          })
+          .pipe(
+            Effect.orElseSucceed(() => ({
+              turnItems: [] as ReadonlyArray<OrchestrationV2TurnItem>,
+            })),
+          );
+        if (runErrorItems.some((item) => item.type === "run_interrupt_request")) {
+          return false;
+        }
+        const failure = latestRootProviderFailure(run, runErrorItems);
+        if (failure?.class !== "usage_limit") {
+          return false;
+        }
+        yield* antigravityFailover.recordQuotaExhausted({
+          instanceId: run.providerInstanceId,
+          model: run.modelSelection.model,
+          resetAt: failure.resetAt ?? null,
+        });
+
+        const currentSessions = projection.providerSessions.filter(
+          (session) =>
+            session.providerInstanceId === run.providerInstanceId &&
+            session.status !== "stopped" &&
+            session.status !== "error",
+        );
+        for (const session of currentSessions) {
+          if (yield* sessionHasBackgroundWork(session, projection.providerThreads)) {
+            return false;
+          }
+        }
+
+        const triedInstanceIds = new Set<ProviderInstanceId>([
+          ...projection.attempts
+            .filter((attempt) => attempt.runId === run.id)
+            .map((attempt) => attempt.providerInstanceId),
+          run.providerInstanceId,
+        ]);
+
+        let chosenDecision: AntigravityFailover.AntigravityFailoverDecision | null = null;
+        let targetAdapter: ProviderAdapter.ProviderAdapterV2["Service"] | null = null;
+        const excluded = new Set<ProviderInstanceId>(triedInstanceIds);
+        while (true) {
+          const candidate = yield* antigravityFailover.nextFailoverSelection({
+            projectId: projection.thread.projectId,
+            selection: run.modelSelection,
+            triedInstanceIds: excluded,
+          });
+          if (candidate === null) break;
+          const adapterExit = yield* Effect.exit(
+            providerAdapters.get(candidate.modelSelection.instanceId),
+          );
+          if (Exit.isSuccess(adapterExit)) {
+            chosenDecision = candidate;
+            targetAdapter = adapterExit.value;
+            break;
+          }
+          excluded.add(candidate.modelSelection.instanceId);
+        }
+
+        const now = yield* DateTime.now;
+        if (chosenDecision === null || targetAdapter === null) {
+          if (triedInstanceIds.size > 1) {
+            const triedLabels = yield* Effect.forEach([...triedInstanceIds], (id) =>
+              antigravityFailover.getDisplayName(id),
+            );
+            const exhaustedOrdinal = yield* nextTurnItemOrdinal(projection).pipe(
+              Effect.orElseSucceed(() => run.ordinal * 100 + 99),
+            );
+            yield* writeSystemEvents([
+              {
+                type: "turn-item.updated",
+                threadId,
+                runId: run.id,
+                ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: now,
+                payload: {
+                  id: idAllocator.derive.runSignalTurnItem({
+                    runId: run.id,
+                    signal: `antigravity-failover-exhausted:${triedInstanceIds.size}`,
+                  }),
+                  threadId,
+                  runId: run.id,
+                  nodeId: run.rootNodeId,
+                  providerThreadId: run.providerThreadId,
+                  providerTurnId: null,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: exhaustedOrdinal,
+                  status: "completed",
+                  title: "Antigravity quota exhausted across accounts",
+                  startedAt: now,
+                  completedAt: now,
+                  updatedAt: now,
+                  type: "system_notice",
+                  level: "warning",
+                  message: `All available Antigravity accounts reached quota limits (tried: ${triedLabels.join(", ")}).`,
+                },
+              },
+            ]).pipe(Effect.ignoreCause({ log: true }));
+          }
+          return false;
+        }
+
+        const nextModelSelection = chosenDecision.modelSelection;
+        const attemptOrdinal =
+          Math.max(
+            0,
+            ...projection.attempts
+              .filter((attempt) => attempt.runId === run.id)
+              .map((attempt) => attempt.attemptOrdinal),
+          ) + 1;
+        const nextAttemptId = idAllocator.derive.runAttempt({
+          runId: run.id,
+          attemptOrdinal,
+        });
+        const nextRootNodeId = idAllocator.derive.rootNodeAttempt({
+          runId: run.id,
+          attemptOrdinal,
+        });
+        const existingTargetProviderThread = rootProviderThreadsForProvider(
+          projection,
+          nextModelSelection.instanceId,
+        )[0];
+        const existingTargetSession =
+          existingTargetProviderThread === undefined
+            ? undefined
+            : projection.providerSessions.find(
+                (session) => session.id === existingTargetProviderThread.providerSessionId,
+              );
+        const reusableTargetSessionId =
+          existingTargetSession !== undefined &&
+          existingTargetSession.status !== "stopped" &&
+          existingTargetSession.status !== "error"
+            ? existingTargetSession.id
+            : null;
+        const nextProviderSessionId =
+          reusableTargetSessionId ??
+          (yield* providerSessionIdFor({
+            adapter: targetAdapter,
+            providerInstanceId: nextModelSelection.instanceId,
+            threadId,
+          }).pipe(Effect.orElseSucceed(() => null)));
+        if (nextProviderSessionId === null) return false;
+
+        const targetProviderThreadBase: OrchestrationV2ProviderThread =
+          existingTargetProviderThread === undefined
+            ? {
+                id: idAllocator.derive.providerThread({
+                  driver: targetAdapter.driver,
+                  nativeThreadId: `pending:${run.id}:attempt:${attemptOrdinal}`,
+                }),
+                driver: targetAdapter.driver,
+                providerInstanceId: nextModelSelection.instanceId,
+                providerSessionId: nextProviderSessionId,
+                appThreadId: threadId,
+                ownerNodeId: null,
+                nativeThreadRef: null,
+                nativeConversationHeadRef: null,
+                status: "not_loaded",
+                firstRunOrdinal: run.ordinal,
+                lastRunOrdinal: run.ordinal,
+                handoffIds: [],
+                forkedFrom: null,
+                createdAt: now,
+                updatedAt: now,
+              }
+            : {
+                ...existingTargetProviderThread,
+                providerSessionId: nextProviderSessionId,
+                firstRunOrdinal: existingTargetProviderThread.firstRunOrdinal ?? run.ordinal,
+                lastRunOrdinal: run.ordinal,
+                updatedAt: now,
+              };
+
+        const contextBoundary = contextBoundaryOrdinal(projection);
+        const targetLastDeliveredRun =
+          existingTargetProviderThread === undefined
+            ? undefined
+            : lastDeliveredRunForProviderThread(projection, existingTargetProviderThread.id);
+        const needsFullContext =
+          existingTargetProviderThread === undefined ||
+          existingTargetProviderThread.nativeThreadRef === null;
+        const priorCoveredRuns = projection.runs.filter(
+          (candidate) =>
+            candidate.ordinal < run.ordinal &&
+            isHandoffSourceRun(candidate) &&
+            candidate.ordinal >= contextBoundary &&
+            candidate.ordinal > (needsFullContext ? 0 : (targetLastDeliveredRun?.ordinal ?? 0)),
+        );
+        const priorItems =
+          priorCoveredRuns.length === 0
+            ? []
+            : yield* readHandoffItems(
+                threadId,
+                priorCoveredRuns.map((candidate) => candidate.id),
+              ).pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<OrchestrationV2TurnItem>));
+        const inheritedItems =
+          needsFullContext && contextBoundary === 0
+            ? yield* readInheritedItems(projection.thread).pipe(
+                Effect.orElseSucceed(() => [] as ReadonlyArray<OrchestrationV2TurnItem>),
+              )
+            : [];
+        const legacyImportItems =
+          needsFullContext &&
+          contextBoundary === 0 &&
+          projection.thread.historyOrigin === "v1_import"
+            ? yield* readHandoffItems(threadId, [null]).pipe(
+                Effect.orElseSucceed(() => [] as ReadonlyArray<OrchestrationV2TurnItem>),
+              )
+            : [];
+        const currentRunItems = (yield* readHandoffItems(threadId, [run.id]).pipe(
+          Effect.orElseSucceed(() => [] as ReadonlyArray<OrchestrationV2TurnItem>),
+        )).filter(
+          (item) =>
+            item.type !== "error" &&
+            item.type !== "system_notice" &&
+            item.type !== "handoff" &&
+            !(item.type === "user_message" && item.messageId === run.userMessageId),
+        );
+        const handoffItems = visibleConversationItems(projection, [
+          ...inheritedItems,
+          ...legacyImportItems,
+          ...priorItems,
+          ...currentRunItems,
+        ]);
+
+        let failoverHandoff: OrchestrationV2ContextHandoff | null = null;
+        let failoverTransfer: OrchestrationV2ContextTransfer | null = null;
+        if (handoffItems.length > 0) {
+          const transferId = yield* idAllocator.allocate
+            .contextTransfer({
+              sourceThreadId: threadId,
+              targetThreadId: threadId,
+              type: "provider_handoff",
+            })
+            .pipe(Effect.orElseSucceed(() => null));
+          if (transferId === null) {
+            yield* Effect.logWarning(
+              "Aborting Antigravity failover because context transfer allocation failed",
+              { threadId, runId: run.id },
+            );
+            return false;
+          }
+          const fromProviderThreadIds = Array.from(
+            new Set(
+              [...priorCoveredRuns, run].flatMap((candidate) =>
+                candidate.providerThreadId === null ? [] : [candidate.providerThreadId],
+              ),
+            ),
+          );
+          const coveredFrom =
+            priorCoveredRuns.length > 0
+              ? priorCoveredRuns[0]!.ordinal
+              : Math.max(1, contextBoundary, run.ordinal);
+          const coveredTo =
+            currentRunItems.length > 0
+              ? run.ordinal
+              : (priorCoveredRuns.at(-1)?.ordinal ?? run.ordinal);
+          failoverHandoff = yield* contextHandoffService
+            .prepareProviderHandoff({
+              threadId,
+              targetRunId: run.id,
+              transferId,
+              fromProviderThreadIds,
+              toProviderThreadId: targetProviderThreadBase.id,
+              fromProviderInstanceId: run.providerInstanceId,
+              toProviderInstanceId: nextModelSelection.instanceId,
+              coveredRunOrdinals: { from: coveredFrom, to: coveredTo },
+              strategy: needsFullContext ? "full_thread_summary" : "delta_since_target_last_seen",
+              items: handoffItems,
+              runs: projection.runs,
+              createdAt: now,
+            })
+            .pipe(Effect.orElseSucceed(() => null));
+          if (failoverHandoff === null) {
+            yield* Effect.logWarning(
+              "Aborting Antigravity failover because context handoff preparation failed",
+              { threadId, runId: run.id },
+            );
+            return false;
+          }
+          failoverTransfer = {
+            id: transferId,
+            type: "provider_handoff",
+            sourceThreadId: threadId,
+            targetThreadId: threadId,
+            sourcePoint: contextSourcePointForRun(projection, run),
+            basePoint: null,
+            sourceProviderInstanceId: run.providerInstanceId,
+            targetProviderInstanceId: nextModelSelection.instanceId,
+            targetRunId: run.id,
+            status: "consumed",
+            resolution: {
+              strategy: "portable_context",
+              contextHandoffId: failoverHandoff.id,
+            },
+            createdBy: "system",
+            error: null,
+            createdAt: now,
+            updatedAt: now,
+            consumedAt: now,
+          };
+        }
+
+        const { contextHandoffs: existingHandoffs } = yield* projectionStore
+          .getThreadRecords(threadId, ["contextHandoffs"])
+          .pipe(
+            Effect.orElseSucceed(() => ({
+              contextHandoffs: [] as ReadonlyArray<OrchestrationV2ContextHandoff>,
+            })),
+          );
+        const readyHandoffsForOtherThreads = existingHandoffs.filter(
+          (handoff) =>
+            handoff.targetRunId === run.id &&
+            handoff.status === "ready" &&
+            handoff.toProviderThreadId !== targetProviderThreadBase.id &&
+            !(
+              projection.thread.lineage.sideChat === true &&
+              handoff.strategy === "manual_context" &&
+              handoff.transferId != null
+            ),
+        );
+        // Cross-thread merge-back handoffs (`fork_delta_summary`) come from another thread and
+        // cannot be reconstructed from this thread's items; retarget them to the failover thread.
+        const retargetedHandoffs: Array<OrchestrationV2ContextHandoff> = [];
+        const supersededHandoffs: Array<OrchestrationV2ContextHandoff> = [];
+        for (const handoff of readyHandoffsForOtherThreads) {
+          if (handoff.strategy === "fork_delta_summary") {
+            const { delivery: _clearedDelivery, ...retargetedBase } = handoff;
+            retargetedHandoffs.push({
+              ...retargetedBase,
+              toProviderThreadId: targetProviderThreadBase.id,
+              updatedAt: now,
+            });
+          } else {
+            supersededHandoffs.push(handoff);
+          }
+        }
+        const supersededHandoffIds = new Set(supersededHandoffs.map((handoff) => handoff.id));
+
+        const nextProviderThread: OrchestrationV2ProviderThread = {
+          ...targetProviderThreadBase,
+          status: targetProviderThreadBase.status === "error" ? "error" : "active",
+          handoffIds: Array.from(
+            new Set([
+              ...targetProviderThreadBase.handoffIds,
+              ...retargetedHandoffs.map((handoff) => handoff.id),
+              ...(failoverHandoff === null ? [] : [failoverHandoff.id]),
+            ]),
+          ),
+        };
+        const resolvedRuntimePolicy = yield* runtimePolicy
+          .resolve({ thread: projection.thread, modelSelection: nextModelSelection })
+          .pipe(Effect.orElseSucceed(() => null));
+        if (resolvedRuntimePolicy === null) return false;
+        const checkpointScope = yield* checkpointService
+          .prepareRootRunScope({
+            threadId,
+            runId: run.id,
+            rootNodeId: nextRootNodeId,
+            providerThreadId: nextProviderThread.id,
+            cwd:
+              resolvedRuntimePolicy.cwd ??
+              projection.thread.worktreePath ??
+              currentSessions[0]?.cwd ??
+              process.cwd(),
+            createdAt: now,
+          })
+          .pipe(Effect.orElseSucceed(() => null));
+        if (checkpointScope === null) return false;
+
+        const nextContextHandoffId =
+          failoverHandoff?.id ??
+          (run.contextHandoffId !== null && supersededHandoffIds.has(run.contextHandoffId)
+            ? (retargetedHandoffs[0]?.id ?? null)
+            : run.contextHandoffId);
+        const updatedRun: OrchestrationV2Run = {
+          ...run,
+          providerInstanceId: nextModelSelection.instanceId,
+          modelSelection: nextModelSelection,
+          providerThreadId: nextProviderThread.id,
+          rootNodeId: nextRootNodeId,
+          activeAttemptId: nextAttemptId,
+          status: "starting",
+          completedAt: null,
+          contextHandoffId: nextContextHandoffId,
+        };
+        const nextAttempt: OrchestrationV2RunAttempt = {
+          id: nextAttemptId,
+          runId: run.id,
+          attemptOrdinal,
+          rootNodeId: nextRootNodeId,
+          providerInstanceId: nextModelSelection.instanceId,
+          providerThreadId: nextProviderThread.id,
+          providerTurnId: null,
+          reason: "provider_recovery",
+          status: "pending",
+          startedAt: null,
+          completedAt: null,
+        };
+        const nextRootNode: OrchestrationV2ExecutionNode = {
+          id: nextRootNodeId,
+          threadId,
+          runId: run.id,
+          parentNodeId: null,
+          rootNodeId: nextRootNodeId,
+          kind: "root_turn",
+          status: "pending",
+          countsForRun: true,
+          providerThreadId: nextProviderThread.id,
+          providerTurnId: null,
+          nativeItemRef: null,
+          runtimeRequestId: null,
+          checkpointScopeId: checkpointScope.id,
+          startedAt: null,
+          completedAt: null,
+        };
+        const baseOrdinal = yield* nextTurnItemOrdinal(projection).pipe(
+          Effect.orElseSucceed(() => run.ordinal * 100 + attemptOrdinal * 10),
+        );
+        const failoverCommandId = CommandId.make(
+          `command:system:antigravity-failover:${run.id}:attempt:${attemptOrdinal}`,
+        );
+
+        const armedForThisRun = projection.thread.limitRecovery?.runId === run.id;
+        const snoozedByThisRun =
+          armedForThisRun &&
+          projection.thread.limitRecovery?.snooze === true &&
+          projection.thread.snoozedUntil != null &&
+          DateTime.toEpochMillis(projection.thread.snoozedUntil) ===
+            Date.parse(projection.thread.limitRecovery.resetAt);
+
+        const failoverEvents: Array<Omit<OrchestrationV2DomainEvent, "id">> = [
+          {
+            type: "thread.provider-switched",
+            threadId,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              ...projection.thread,
+              ...(armedForThisRun ? { limitRecovery: null } : {}),
+              ...(snoozedByThisRun
+                ? { snoozedUntil: null, snoozedAt: null, lastSnoozeWakeAt: now }
+                : {}),
+              providerInstanceId: nextModelSelection.instanceId,
+              modelSelection: nextModelSelection,
+              activeProviderThreadId: nextProviderThread.id,
+              updatedAt: now,
+            },
+          },
+          {
+            type: "provider-thread.updated",
+            threadId,
+            driver: nextProviderThread.driver,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: nextProviderThread,
+          },
+          ...retargetedHandoffs.map((handoff) => ({
+            type: "context-handoff.updated" as const,
+            threadId,
+            runId: run.id,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: handoff,
+          })),
+          ...supersededHandoffs.map((handoff) => ({
+            type: "context-handoff.updated" as const,
+            threadId,
+            runId: run.id,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              ...handoff,
+              status: "superseded" as const,
+              updatedAt: now,
+            },
+          })),
+        ];
+        if (failoverHandoff !== null) {
+          failoverEvents.push({
+            type: "context-handoff.updated",
+            threadId,
+            runId: run.id,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: failoverHandoff,
+          });
+        }
+        if (failoverTransfer !== null) {
+          failoverEvents.push({
+            type: "context-transfer.created",
+            threadId,
+            runId: run.id,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: failoverTransfer,
+          });
+        }
+        failoverEvents.push(
+          {
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            nodeId: nextRootNodeId,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: updatedRun,
+          },
+          {
+            type: "run-attempt.created",
+            threadId,
+            runId: run.id,
+            nodeId: nextRootNodeId,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: nextAttempt,
+          },
+          {
+            type: "node.updated",
+            threadId,
+            runId: run.id,
+            nodeId: nextRootNodeId,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: nextRootNode,
+          },
+          {
+            type: "checkpoint-scope.created",
+            threadId,
+            runId: run.id,
+            nodeId: nextRootNodeId,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: checkpointScope,
+          },
+        );
+        let nextItemOrdinal = baseOrdinal;
+        if (failoverHandoff !== null) {
+          const covered = failoverHandoff.coveredRunOrdinals;
+          const coveredRuns = projection.runs.filter(
+            (candidate) => candidate.ordinal >= covered.from && candidate.ordinal <= covered.to,
+          );
+          failoverEvents.push({
+            type: "turn-item.updated",
+            threadId,
+            runId: run.id,
+            nodeId: nextRootNodeId,
+            providerInstanceId: nextModelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: idAllocator.derive.runSignalTurnItem({
+                runId: run.id,
+                signal: `context-handoff:${failoverHandoff.id}`,
+              }),
+              threadId,
+              runId: run.id,
+              nodeId: nextRootNodeId,
+              providerThreadId: nextProviderThread.id,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: nextItemOrdinal++,
+              status: "completed",
+              title: "Provider handoff",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              type: "handoff",
+              contextHandoffId: failoverHandoff.id,
+              fromProviderThreadIds: failoverHandoff.fromProviderThreadIds,
+              toProviderThreadId: failoverHandoff.toProviderThreadId,
+              fromProviderInstanceIds: Array.from(
+                new Set(coveredRuns.map((candidate) => candidate.providerInstanceId)),
+              ),
+              toProviderInstanceId: nextModelSelection.instanceId,
+              fromModelSelections: Array.from(
+                new Map(
+                  coveredRuns.map((candidate) => [
+                    `${candidate.modelSelection.instanceId}\0${candidate.modelSelection.model}`,
+                    candidate.modelSelection,
+                  ]),
+                ).values(),
+              ),
+              toModel: nextModelSelection.model,
+              strategy: failoverHandoff.strategy,
+              summary: failoverHandoff.summaryText,
+            },
+          });
+        }
+        failoverEvents.push({
+          type: "turn-item.updated",
+          threadId,
+          runId: run.id,
+          nodeId: nextRootNodeId,
+          providerInstanceId: nextModelSelection.instanceId,
+          occurredAt: now,
+          payload: {
+            id: idAllocator.derive.runSignalTurnItem({
+              runId: run.id,
+              signal: `antigravity-failover:${attemptOrdinal}`,
+            }),
+            threadId,
+            runId: run.id,
+            nodeId: nextRootNodeId,
+            providerThreadId: nextProviderThread.id,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: nextItemOrdinal,
+            status: "completed",
+            title: "Antigravity account failover",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "system_notice",
+            level: "info",
+            message: `Switched Antigravity account from ${chosenDecision.fromDisplayName} to ${chosenDecision.toDisplayName} after reaching quota limit.`,
+          },
+        });
+
+        const failoverEffects: Array<PendingOrchestrationEffectV2> = [];
+        for (const session of currentSessions) {
+          if (session.id === nextProviderSessionId) continue;
+          failoverEvents.push({
+            type: "provider-session.detached",
+            threadId,
+            driver: session.driver,
+            providerInstanceId: session.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              providerSessionId: session.id,
+              detachedAt: now,
+              reason: "Detached for Antigravity quota failover.",
+            },
+          });
+          failoverEffects.push({
+            id: `effect:antigravity-failover:${run.id}:attempt:${attemptOrdinal}:detach:${session.id}`,
+            commandId: failoverCommandId,
+            threadId,
+            request: {
+              type: "provider-session.detach",
+              providerSessionId: session.id,
+              detail: "Detached for Antigravity quota failover.",
+            },
+          });
+        }
+        failoverEffects.push({
+          id: `effect:antigravity-failover:${run.id}:attempt:${attemptOrdinal}:provider-turn.start`,
+          commandId: failoverCommandId,
+          threadId,
+          request: {
+            type: "provider-turn.start",
+            runId: run.id,
+          },
+        });
+
+        yield* writeSystemEvents(failoverEvents, failoverEffects);
+        didFailover = true;
+        return true;
+      }).pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            activeAntigravityFailoverRuns.delete(failedRunId);
+            if (attemptKey !== undefined) {
+              if (!didFailover) {
+                if (settledAntigravityFailoverAttempts.size >= 1000) {
+                  const oldest = settledAntigravityFailoverAttempts.values().next().value;
+                  if (oldest !== undefined) settledAntigravityFailoverAttempts.delete(oldest);
+                }
+                settledAntigravityFailoverAttempts.add(attemptKey);
+              }
+              const waiter = antigravityFailoverWaiters.get(attemptKey);
+              if (waiter !== undefined) {
+                antigravityFailoverWaiters.delete(attemptKey);
+                yield* Deferred.succeed(waiter, undefined).pipe(Effect.ignore);
+              }
+            } else {
+              const prefix = `${failedRunId}:`;
+              for (const [key, waiter] of antigravityFailoverWaiters) {
+                if (key.startsWith(prefix)) {
+                  antigravityFailoverWaiters.delete(key);
+                  yield* Deferred.succeed(waiter, undefined).pipe(Effect.ignore);
+                }
+              }
+            }
+          }),
+        ),
+      );
+    },
+  );
+
   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
     function* (stored: OrchestrationV2StoredEvent) {
       if (stored.event.type !== "run.updated") return;
@@ -15876,6 +16781,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // while writing child events, so nesting parent inside child would invert the order.
       // The keyed semaphores are neither reentrant nor deadlock-aware.
       if (delegatedTaskTerminalStatus(run.status) !== null) {
+        if (run.status === "failed") {
+          const failedOver = yield* threadDispatch
+            .withLock(threadId, attemptAntigravityQuotaFailover(threadId, run.id))
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Failed to attempt Antigravity quota failover", {
+                  threadId,
+                  runId: run.id,
+                  cause,
+                }).pipe(Effect.as(false)),
+              ),
+            );
+          if (failedOver) return;
+        }
         // Before the parent hears of the failure: a pending continuation keeps the task open.
         if (run.status === "failed" && run.restartContinuationOfRunId !== undefined) {
           yield* threadDispatch.withLock(threadId, retryContinuationStart(threadId, run.id)).pipe(
@@ -16186,12 +17105,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           delegatedTaskAwaitsWork(runs, child)
         )
           return true;
-        return yield* childAwaitsRestartContinuation(runs, run);
+        if (yield* childAwaitsRestartContinuation(runs, run)) return true;
+        return yield* runAwaitsAntigravityFailover(childThreadId, run);
       }
       const progress = delegatedTaskProgress(child);
       if (progress.state !== "result_available") return true;
       if (progress.resultRun === undefined) return false;
-      return yield* childAwaitsRestartContinuation(child.runs, progress.resultRun);
+      if (yield* childAwaitsRestartContinuation(child.runs, progress.resultRun)) return true;
+      return yield* runAwaitsAntigravityFailover(childThreadId, progress.resultRun);
     },
     (effect, childThreadId, _taskId?) =>
       effect.pipe(
@@ -16347,25 +17268,45 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     cancelDelegatedTask,
     delegatedTaskResultPending,
     restartContinuationPending: Effect.fn("OrchestratorV2.restartContinuationPending")(
-      function (run) {
-        return awaitsRestartContinuation(run).pipe(Effect.orElseSucceed(() => false));
+      function* (run) {
+        if (yield* awaitsRestartContinuation(run).pipe(Effect.orElseSucceed(() => false))) {
+          return true;
+        }
+        return yield* runAwaitsAntigravityFailover(run.threadId, run).pipe(
+          Effect.orElseSucceed(() => false),
+        );
       },
     ),
-    awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {
-      return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
+    awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function* (run) {
+      yield* effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
+      const waiter = antigravityFailoverWaiters.get(failoverAttemptKey(run));
+      if (waiter !== undefined) {
+        yield* Deferred.await(waiter).pipe(Effect.timeoutOption("10 seconds"), Effect.ignore);
+      }
     }),
     dispatch: dispatchWithReceipt,
     autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
       return threadDispatch.withLock(
         input.threadId,
         Effect.gen(function* () {
-          const thread = yield* projectionStore
-            .getThread(input.threadId)
+          const records = yield* projectionStore
+            .getThreadRecords(input.threadId, ["runs"])
             .pipe(
               Effect.mapError(
                 (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
               ),
             );
+          const thread = records.thread;
+          const targetRun = records.runs.find(
+            (candidate) => candidate.id === input.limitRecovery.runId,
+          );
+          if (
+            targetRun !== undefined &&
+            (targetRun.status !== "failed" ||
+              (yield* runAwaitsAntigravityFailover(input.threadId, targetRun)))
+          ) {
+            return;
+          }
           // Stop or an explicit recovery choice can commit after the sweep reads its candidate.
           if (
             thread.limitRecovery?.runId === input.limitRecovery.runId &&
