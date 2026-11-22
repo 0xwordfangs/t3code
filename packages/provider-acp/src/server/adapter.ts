@@ -10490,17 +10490,24 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         ) {
                           yield* Ref.set(runtimeRestartRequired, true);
                         }
-                        if (shouldCloseRuntimeOnStop && runtimeScope !== undefined) {
+                        if (shouldCloseRuntimeOnStop) {
                           yield* runtimeCallbackPermit.withPermit(
                             Effect.gen(function* () {
-                              yield* awaitAdmittedNativeResponses;
-                              agentRequests.clear();
-                              const stoppedGeneration = yield* Ref.get(runtimeCallbackGeneration);
-                              yield* quarantineNativeTransportAtGeneration(stoppedGeneration);
-                              yield* advanceRuntimeCallbackGeneration;
+                              if (runtimeScope !== undefined) {
+                                yield* awaitAdmittedNativeResponses;
+                                agentRequests.clear();
+                                const stoppedGeneration = yield* Ref.get(runtimeCallbackGeneration);
+                                yield* quarantineNativeTransportAtGeneration(stoppedGeneration);
+                                yield* advanceRuntimeCallbackGeneration;
+                              }
+                              if (!context.finalized) {
+                                yield* finalizeTurn(context, "interrupted");
+                              }
                             }),
                           );
-                          yield* Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore);
+                          if (runtimeScope !== undefined) {
+                            yield* Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore);
+                          }
                         }
                       }
                       const stopped = yield* Deferred.await(context.completed).pipe(

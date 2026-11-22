@@ -26,11 +26,12 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import type * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
-import { AcpProviderCapabilitiesV2, makeAcpAdapterV2 } from "./adapter.ts";
+import { AcpProviderCapabilitiesV2, makeAcpAdapterV2, type AcpAdapterV2Flavor } from "./adapter.ts";
 
 const TEST_DRIVER = ProviderDriverKind.make("acp");
 
@@ -73,6 +74,11 @@ const makeHarness = Effect.fnUntraced(function* (options: {
   readonly approvalPolicy?: "never" | "on-request" | "untrusted";
   readonly enablePostSettleContinuation?: boolean;
   readonly deferFinalizeForBackgroundWork?: boolean;
+  readonly detachOpenBackgroundCommandsOnSettle?: boolean;
+  readonly isBackgroundCommandTool?: AcpAdapterV2Flavor["isBackgroundCommandTool"];
+  readonly cancelEffect?: Effect.Effect<void, EffectAcpErrors.AcpError>;
+  readonly cancelResolvesPrompt?: boolean;
+  readonly loadSession?: boolean;
   readonly onUrlElicitation?: (input: {
     readonly elicitationId: string;
     readonly url: string;
@@ -83,10 +89,13 @@ const makeHarness = Effect.fnUntraced(function* (options: {
   const sessionId = `session-${options.name}`;
   let permissionHandler: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
   let elicitationHandler: Parameters<RuntimeService["handleElicitation"]>[0] | undefined;
+  let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
   let onOutgoingResponse: ((requestId: string) => Effect.Effect<void>) | undefined;
   let promptStarted = yield* Deferred.make<void>();
   let promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
   let cancelCalled = yield* Deferred.make<void>();
+  let runtimeScopeCloseCount = 0;
+  let runtimeCreateCount = 0;
   const continuationOffered =
     yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
 
@@ -94,7 +103,7 @@ const makeHarness = Effect.fnUntraced(function* (options: {
     sessionId,
     initializeResult: {
       protocolVersion: 1,
-      agentCapabilities: {},
+      agentCapabilities: options.loadSession === true ? { loadSession: true } : {},
     },
     sessionSetupResult: {},
     modelConfigId: undefined,
@@ -102,69 +111,88 @@ const makeHarness = Effect.fnUntraced(function* (options: {
 
   const makeMockRuntime = (
     runtimeInput: Parameters<Parameters<typeof makeAcpAdapterV2>[0]["flavor"]["makeRuntime"]>[0],
-  ): Effect.Effect<RuntimeService, EffectAcpErrors.AcpError> => {
+  ) => {
+    runtimeCreateCount += 1;
     onOutgoingResponse = runtimeInput.onOutgoingResponse;
     const unsupported = (method: string) =>
       Effect.fail(EffectAcpErrors.AcpRequestError.methodNotFound(method));
-    return Effect.succeed({
-      handleRequestPermission: (handler) =>
+    return Effect.acquireRelease(
+      Effect.succeed({
+        handleRequestPermission: (handler) =>
+          Effect.sync(() => {
+            permissionHandler = handler;
+          }),
+        handleElicitation: (handler) =>
+          Effect.sync(() => {
+            elicitationHandler = handler;
+          }),
+        handleMcpConnect: () => Effect.void,
+        handleMcpMessage: () => Effect.void,
+        handleMcpDisconnect: () => Effect.void,
+        handleMcpNotification: () => Effect.void,
+        handleReadTextFile: () => Effect.void,
+        handleWriteTextFile: () => Effect.void,
+        handleCreateTerminal: () => Effect.void,
+        handleTerminalOutput: () => Effect.void,
+        handleTerminalWaitForExit: () => Effect.void,
+        handleTerminalKill: () => Effect.void,
+        handleTerminalRelease: () => Effect.void,
+        handleSessionUpdate: (handler) =>
+          Effect.sync(() => {
+            sessionUpdateHandler = handler;
+          }),
+        handleElicitationComplete: () => Effect.void,
+        handleUnknownExtRequest: () => Effect.void,
+        handleUnknownExtNotification: () => Effect.void,
+        handleExtRequest: () => Effect.void,
+        handleExtNotification: () => Effect.void,
+        initialize: () => Effect.succeed(startResult.initializeResult),
+        start: () => Effect.succeed(startResult),
+        getEvents: () => Stream.empty,
+        drainEvents: Effect.void,
+        getModeState: Effect.undefined,
+        getConfigOptions: Effect.succeed([]),
+        configOptionChanges: Stream.empty,
+        loadSession: () => Effect.succeed(startResult),
+        resumeSession: () => Effect.succeed(startResult),
+        forkSession: () => Effect.succeed(startResult),
+        listSessions: () => unsupported("session/list"),
+        closeSession: () => Effect.succeed({}),
+        deleteSession: () => unsupported("session/delete"),
+        listProviders: unsupported("provider/list"),
+        setProvider: () => unsupported("provider/set"),
+        disableProvider: () => unsupported("provider/disable"),
+        logout: unsupported("logout"),
+        prompt: (_payload, promptOptions) =>
+          Effect.gen(function* () {
+            if (promptOptions?.dispatched !== undefined) {
+              yield* Deferred.succeed(promptOptions.dispatched, undefined);
+            }
+            yield* Deferred.succeed(promptStarted, undefined);
+            return yield* Deferred.await(promptGate);
+          }),
+        cancel: Effect.suspend(() =>
+          Deferred.succeed(cancelCalled, undefined).pipe(
+            Effect.andThen(
+              options.cancelResolvesPrompt === true
+                ? Deferred.succeed(promptGate, { stopReason: "cancelled" }).pipe(Effect.asVoid)
+                : Effect.void,
+            ),
+            Effect.andThen(options.cancelEffect ?? Effect.void),
+          ),
+        ),
+        setMode: () => Effect.succeed({}),
+        setSessionModel: () => Effect.succeed({}),
+        setConfigOption: () => Effect.succeed({ configOptions: [] }),
+        setModel: () => Effect.void,
+        request: (method) => unsupported(method),
+        notify: () => Effect.void,
+      } satisfies RuntimeService),
+      () =>
         Effect.sync(() => {
-          permissionHandler = handler;
+          runtimeScopeCloseCount += 1;
         }),
-      handleElicitation: (handler) =>
-        Effect.sync(() => {
-          elicitationHandler = handler;
-        }),
-      handleMcpConnect: () => Effect.void,
-      handleMcpMessage: () => Effect.void,
-      handleMcpDisconnect: () => Effect.void,
-      handleMcpNotification: () => Effect.void,
-      handleReadTextFile: () => Effect.void,
-      handleWriteTextFile: () => Effect.void,
-      handleCreateTerminal: () => Effect.void,
-      handleTerminalOutput: () => Effect.void,
-      handleTerminalWaitForExit: () => Effect.void,
-      handleTerminalKill: () => Effect.void,
-      handleTerminalRelease: () => Effect.void,
-      handleSessionUpdate: () => Effect.void,
-      handleElicitationComplete: () => Effect.void,
-      handleUnknownExtRequest: () => Effect.void,
-      handleUnknownExtNotification: () => Effect.void,
-      handleExtRequest: () => Effect.void,
-      handleExtNotification: () => Effect.void,
-      initialize: () => Effect.succeed(startResult.initializeResult),
-      start: () => Effect.succeed(startResult),
-      getEvents: () => Stream.empty,
-      drainEvents: Effect.void,
-      getModeState: Effect.undefined,
-      getConfigOptions: Effect.succeed([]),
-      configOptionChanges: Stream.empty,
-      loadSession: () => Effect.succeed(startResult),
-      resumeSession: () => Effect.succeed(startResult),
-      forkSession: () => Effect.succeed(startResult),
-      listSessions: () => unsupported("session/list"),
-      closeSession: () => Effect.succeed({}),
-      deleteSession: () => unsupported("session/delete"),
-      listProviders: unsupported("provider/list"),
-      setProvider: () => unsupported("provider/set"),
-      disableProvider: () => unsupported("provider/disable"),
-      logout: unsupported("logout"),
-      prompt: (_payload, promptOptions) =>
-        Effect.gen(function* () {
-          if (promptOptions?.dispatched !== undefined) {
-            yield* Deferred.succeed(promptOptions.dispatched, undefined);
-          }
-          yield* Deferred.succeed(promptStarted, undefined);
-          return yield* Deferred.await(promptGate);
-        }),
-      cancel: Effect.suspend(() => Deferred.succeed(cancelCalled, undefined).pipe(Effect.asVoid)),
-      setMode: () => Effect.succeed({}),
-      setSessionModel: () => Effect.succeed({}),
-      setConfigOption: () => Effect.succeed({ configOptions: [] }),
-      setModel: () => Effect.void,
-      request: (method) => unsupported(method),
-      notify: () => Effect.void,
-    });
+    );
   };
 
   const instanceId = ProviderInstanceId.make(`acp-adapter-${options.name}`);
@@ -180,6 +208,14 @@ const makeHarness = Effect.fnUntraced(function* (options: {
       ...(options.deferFinalizeForBackgroundWork === undefined
         ? {}
         : { deferFinalizeForBackgroundWork: options.deferFinalizeForBackgroundWork }),
+      ...(options.detachOpenBackgroundCommandsOnSettle === undefined
+        ? {}
+        : {
+            detachOpenBackgroundCommandsOnSettle: options.detachOpenBackgroundCommandsOnSettle,
+          }),
+      ...(options.isBackgroundCommandTool === undefined
+        ? {}
+        : { isBackgroundCommandTool: options.isBackgroundCommandTool }),
       ...(options.onUrlElicitation === undefined
         ? {}
         : { onUrlElicitation: options.onUrlElicitation }),
@@ -358,6 +394,8 @@ const makeHarness = Effect.fnUntraced(function* (options: {
     elicitMcpApproval,
     elicitFormQuestion,
     elicitUrl,
+    emitUpdate: (update: EffectAcpSchema.SessionUpdate) =>
+      sessionUpdateHandler!({ sessionId, update }),
     get promptStarted() {
       return promptStarted;
     },
@@ -366,6 +404,12 @@ const makeHarness = Effect.fnUntraced(function* (options: {
     },
     get cancelCalled() {
       return cancelCalled;
+    },
+    get runtimeScopeCloseCount() {
+      return runtimeScopeCloseCount;
+    },
+    get runtimeCreateCount() {
+      return runtimeCreateCount;
     },
     resetPrompt: Effect.gen(function* () {
       promptStarted = yield* Deferred.make<void>();
@@ -668,6 +712,251 @@ describe("AcpAdapterV2 stop and interrupt cancellation (CF-12)", () => {
           remainingEvents.some((event) => event.type === "runtime_request.updated"),
           `${label} must not emit pending runtime request cards`,
         );
+      }).pipe(Effect.provide(layerTest)),
+  );
+});
+
+const awaitRunningProviderTurnId = Effect.fnUntraced(function* (
+  events: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event>,
+) {
+  while (true) {
+    const event = yield* Queue.take(events);
+    if (event.type === "provider_turn.updated" && event.providerTurn.status === "running") {
+      return event.providerTurn.id;
+    }
+  }
+});
+
+describe("AcpAdapterV2 shouldCloseRuntimeOnStop (CF-13)", () => {
+  it.effect(
+    "closes runtimeScope and finalizes an unsettled turn with an open background command when Stop cancel hangs past 1s",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "cf13-open-bg-hang",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+          detachOpenBackgroundCommandsOnSettle: true,
+          isBackgroundCommandTool: (tool) => tool.kind === "execute",
+          cancelEffect: Effect.never,
+          loadSession: true,
+        });
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_cf13_open_bg",
+          title: "sleep 60",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { CommandLine: "sleep 60", WaitMsBeforeAsync: 5000 },
+        });
+        yield* Queue.takeAll(harness.events);
+
+        const interruptFiber = yield* harness.session
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Id,
+            requestRuntimeRestart: true,
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.cancelCalled);
+
+        yield* TestClock.adjust("1 second");
+        assert.isDefined(
+          interruptFiber.pollUnsafe(),
+          "interruptTurn must settle after the 1s cancel timeout without hitting the 10s interrupt timeout",
+        );
+        yield* Fiber.join(interruptFiber);
+
+        assert.equal(harness.runtimeScopeCloseCount, 1);
+        const stopEvents = yield* Queue.takeAll(harness.events);
+        const turn1Terminal = stopEvents.find(
+          (event) => event.type === "turn.terminal" && event.providerTurnId === turn1Id,
+        );
+        assert.equal(turn1Terminal?.type, "turn.terminal");
+        if (turn1Terminal?.type === "turn.terminal") {
+          assert.equal(turn1Terminal.status, "interrupted");
+        }
+        const latestThreadUpdate = stopEvents.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.equal(latestThreadUpdate?.type, "provider_thread.updated");
+        if (latestThreadUpdate?.type === "provider_thread.updated") {
+          assert.deepEqual(latestThreadUpdate.providerThread.pendingBackgroundTasks, []);
+        }
+
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal") {
+            assert.equal(event.status, "completed");
+            break;
+          }
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "closes runtimeScope and finalizes an unsettled turn with a prior detached background command when Stop cancel hangs past 1s",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "cf13-detached-bg-hang",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+          detachOpenBackgroundCommandsOnSettle: true,
+          isBackgroundCommandTool: (tool) => tool.kind === "execute",
+          cancelEffect: Effect.never,
+          loadSession: true,
+        });
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_cf13_detached",
+          title: "sleep 60",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { CommandLine: "sleep 60", WaitMsBeforeAsync: 5000 },
+        });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn2Id = yield* awaitRunningProviderTurnId(harness.events);
+        yield* Queue.takeAll(harness.events);
+
+        const interruptFiber = yield* harness.session
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn2Id,
+            requestRuntimeRestart: true,
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.cancelCalled);
+
+        yield* TestClock.adjust("1 second");
+        assert.isDefined(
+          interruptFiber.pollUnsafe(),
+          "interruptTurn must settle after the 1s cancel timeout when detached background commands exist",
+        );
+        yield* Fiber.join(interruptFiber);
+
+        assert.equal(harness.runtimeScopeCloseCount, 1);
+        const stopEvents = yield* Queue.takeAll(harness.events);
+        const turn2Terminal = stopEvents.find(
+          (event) => event.type === "turn.terminal" && event.providerTurnId === turn2Id,
+        );
+        assert.equal(turn2Terminal?.type, "turn.terminal");
+        if (turn2Terminal?.type === "turn.terminal") {
+          assert.equal(turn2Terminal.status, "interrupted");
+        }
+        const latestThreadUpdate = stopEvents.findLast(
+          (event) => event.type === "provider_thread.updated",
+        );
+        assert.equal(latestThreadUpdate?.type, "provider_thread.updated");
+        if (latestThreadUpdate?.type === "provider_thread.updated") {
+          assert.deepEqual(latestThreadUpdate.providerThread.pendingBackgroundTasks, []);
+        }
+
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(3)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal") {
+            assert.equal(event.status, "completed");
+            break;
+          }
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "emits turn.terminal interrupted exactly once when prompt settles within the 1s cancel window",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "cf13-settles-within-cancel",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+          detachOpenBackgroundCommandsOnSettle: true,
+          isBackgroundCommandTool: (tool) => tool.kind === "execute",
+          cancelResolvesPrompt: true,
+          cancelEffect: Effect.sleep("100 millis"),
+          loadSession: true,
+        });
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_cf13_fast_settle",
+          title: "sleep 60",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { CommandLine: "sleep 60", WaitMsBeforeAsync: 5000 },
+        });
+        yield* Queue.takeAll(harness.events);
+
+        const interruptFiber = yield* harness.session
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Id,
+            requestRuntimeRestart: true,
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.cancelCalled);
+        yield* TestClock.adjust("100 millis");
+        yield* Fiber.join(interruptFiber);
+
+        assert.equal(harness.runtimeScopeCloseCount, 1);
+
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        const trailingEvents: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          trailingEvents.push(event);
+          if (event.type === "turn.terminal" && event.providerTurnId !== turn1Id) {
+            assert.equal(event.status, "completed");
+            break;
+          }
+        }
+
+        const turn1Terminals = trailingEvents.filter(
+          (event) => event.type === "turn.terminal" && event.providerTurnId === turn1Id,
+        );
+        assert.lengthOf(turn1Terminals, 1);
+        if (turn1Terminals[0]?.type === "turn.terminal") {
+          assert.equal(turn1Terminals[0].status, "interrupted");
+        }
       }).pipe(Effect.provide(layerTest)),
   );
 });

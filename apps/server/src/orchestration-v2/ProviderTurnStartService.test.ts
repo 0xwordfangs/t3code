@@ -3285,3 +3285,34 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect(
+  "fails with ProviderTurnStartError before opening a session when run.providerInstanceId differs from bound providerThread.providerInstanceId",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        sessionForTurn: true,
+      });
+      const initial = harness.projection();
+      harness.setProjection({
+        ...initial,
+        providerThreads: initial.providerThreads.map((providerThread) => ({
+          ...providerThread,
+          providerInstanceId: harness.oldInstanceId,
+          driver: ProviderDriverKind.make("antigravity"),
+          nativeThreadRef: {
+            driver: ProviderDriverKind.make("antigravity"),
+            nativeId: "account-a-native-thread",
+            strength: "strong",
+          },
+        })),
+      });
+
+      const error = yield* harness.start.pipe(Effect.flip);
+
+      expect(error._tag).toBe("ProviderTurnStartError");
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+    }),
+);

@@ -128,6 +128,19 @@ export function antigravityClientInfo(version: string | null | undefined) {
     : { name: "zed", version: "0.0.0" };
 }
 
+function antigravityAcpRuntimeProcessOwnership(
+  processGroupPlatform: NodeJS.Platform,
+): Pick<
+  AcpSessionRuntime.AcpSessionRuntimeOptions,
+  "ownDescendantProcessGroups" | "ownDetachedProcessGroup" | "processGroupPlatform"
+> {
+  return {
+    ownDescendantProcessGroups: processGroupPlatform === "linux",
+    ownDetachedProcessGroup: true,
+    processGroupPlatform,
+  };
+}
+
 export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(function* (
   input: AntigravityAcpRuntimeInput,
 ): Effect.fn.Return<
@@ -135,8 +148,10 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
   EffectAcpErrors.AcpError,
   SecureRandom.SecureRandom | Scope.Scope
 > {
+  const processGroupPlatform = yield* HostProcess.Platform;
   const context = yield* Layer.build(
     AcpSessionRuntime.layer({
+      ...antigravityAcpRuntimeProcessOwnership(processGroupPlatform),
       ...input,
       authMethodId: input.authMethod ?? "oauth-personal",
       authenticateEagerly: true,

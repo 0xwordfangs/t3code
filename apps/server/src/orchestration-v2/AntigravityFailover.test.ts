@@ -21,19 +21,27 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
@@ -41,10 +49,13 @@ import type { McpInvocationScope } from "../mcp/McpInvocationContext.ts";
 import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
 import * as AntigravityFailover from "./AntigravityFailover.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as EffectWorker from "./EffectWorker.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { AcpProviderCapabilitiesV2 } from "@t3tools/provider-acp/server/adapter";
 
@@ -591,6 +602,18 @@ interface MockTurnOutcome {
   readonly behavior: "succeed" | "usage_limit" | "validation_required";
   readonly assistantText?: string;
   readonly verificationUrl?: GoogleAccountVerificationUrl;
+  readonly pause?: {
+    readonly onStarted: Deferred.Deferred<void>;
+    readonly release: Deferred.Deferred<void>;
+  };
+}
+
+interface RecordedSessionOp {
+  readonly op: "openSession" | "ensureThread" | "resumeThread";
+  readonly instanceId: ProviderInstanceId;
+  readonly initialNativeThreadId?: string | undefined;
+  readonly nativeThreadId?: string | null | undefined;
+  readonly providerThreadOwnerInstanceId?: ProviderInstanceId | undefined;
 }
 
 function makeFakeAntigravityAdapter(input: {
@@ -603,8 +626,9 @@ function makeFakeAntigravityAdapter(input: {
     readonly text: string;
     readonly model: string;
   }>;
+  readonly recordedSessionOps?: Array<RecordedSessionOp>;
 }): ProviderAdapter.ProviderAdapterV2["Service"] {
-  const { instanceId, cwd, outcomeForTurn, recordedTurns } = input;
+  const { instanceId, cwd, outcomeForTurn, recordedTurns, recordedSessionOps } = input;
   return {
     instanceId,
     driver: ANTIGRAVITY_DRIVER,
@@ -613,7 +637,13 @@ function makeFakeAntigravityAdapter(input: {
     openSession: (openInput) =>
       Effect.gen(function* () {
         const now = yield* DateTime.now;
+        const sessionScope = yield* Effect.scope;
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        recordedSessionOps?.push({
+          op: "openSession",
+          instanceId,
+          initialNativeThreadId: openInput.initialNativeThreadId,
+        });
         return {
           instanceId,
           driver: ANTIGRAVITY_DRIVER,
@@ -632,28 +662,45 @@ function makeFakeAntigravityAdapter(input: {
           },
           events: Stream.fromQueue(events),
           ensureThread: ({ threadId }) =>
-            Effect.succeed({
-              id: ProviderThreadId.make(`provider-thread:${instanceId}:${threadId}`),
-              driver: ANTIGRAVITY_DRIVER,
-              providerInstanceId: instanceId,
-              providerSessionId: openInput.providerSessionId,
-              appThreadId: threadId,
-              ownerNodeId: null,
-              nativeThreadRef: {
+            Effect.sync(() => {
+              const nativeId = `native:${instanceId}:${threadId}`;
+              recordedSessionOps?.push({
+                op: "ensureThread",
+                instanceId,
+                nativeThreadId: nativeId,
+              });
+              return {
+                id: ProviderThreadId.make(`provider-thread:${instanceId}:${threadId}`),
                 driver: ANTIGRAVITY_DRIVER,
-                nativeId: `native:${instanceId}:${threadId}`,
-                strength: "strong",
-              },
-              nativeConversationHeadRef: null,
-              status: "idle",
-              firstRunOrdinal: null,
-              lastRunOrdinal: null,
-              handoffIds: [],
-              forkedFrom: null,
-              createdAt: now,
-              updatedAt: now,
+                providerInstanceId: instanceId,
+                providerSessionId: openInput.providerSessionId,
+                appThreadId: threadId,
+                ownerNodeId: null,
+                nativeThreadRef: {
+                  driver: ANTIGRAVITY_DRIVER,
+                  nativeId,
+                  strength: "strong" as const,
+                },
+                nativeConversationHeadRef: null,
+                status: "idle" as const,
+                firstRunOrdinal: null,
+                lastRunOrdinal: null,
+                handoffIds: [],
+                forkedFrom: null,
+                createdAt: now,
+                updatedAt: now,
+              };
             }),
-          resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+          resumeThread: ({ providerThread }) =>
+            Effect.sync(() => {
+              recordedSessionOps?.push({
+                op: "resumeThread",
+                instanceId,
+                nativeThreadId: providerThread.nativeThreadRef?.nativeId,
+                providerThreadOwnerInstanceId: providerThread.providerInstanceId,
+              });
+              return providerThread;
+            }),
           startTurn: (turn) =>
             Effect.gen(function* () {
               recordedTurns.push({
@@ -681,55 +728,67 @@ function makeFakeAntigravityAdapter(input: {
               const outcome = outcomeForTurn(turn);
               if (outcome.behavior === "succeed") {
                 const reply = outcome.assistantText ?? `Reply from ${instanceId}`;
-                yield* Queue.offer(events, {
-                  type: "turn_item.updated",
-                  driver: ANTIGRAVITY_DRIVER,
-                  turnItem: {
-                    id: `item:assistant:${instanceId}:${turn.attemptId}` as never,
-                    threadId: turn.threadId,
-                    runId: turn.runId,
-                    nodeId: turn.rootNodeId,
+                const emitSuccess = Effect.gen(function* () {
+                  yield* Queue.offer(events, {
+                    type: "turn_item.updated",
+                    driver: ANTIGRAVITY_DRIVER,
+                    turnItem: {
+                      id: `item:assistant:${instanceId}:${turn.attemptId}` as never,
+                      threadId: turn.threadId,
+                      runId: turn.runId,
+                      nodeId: turn.rootNodeId,
+                      providerThreadId: turn.providerThread.id,
+                      providerTurnId: turnId,
+                      nativeItemRef: null,
+                      parentItemId: null,
+                      ordinal: turn.runOrdinal * 100 + 2,
+                      status: "completed",
+                      title: null,
+                      startedAt: now,
+                      completedAt: now,
+                      updatedAt: now,
+                      type: "assistant_message",
+                      messageId: MessageId.make(`assistant:${instanceId}:${turn.attemptId}`),
+                      text: reply,
+                      streaming: false,
+                    },
+                  });
+                  yield* Queue.offer(events, {
+                    type: "provider_turn.updated",
+                    driver: ANTIGRAVITY_DRIVER,
+                    providerTurn: {
+                      id: turnId,
+                      providerThreadId: turn.providerThread.id,
+                      nodeId: turn.rootNodeId,
+                      runAttemptId: turn.attemptId,
+                      nativeTurnRef: null,
+                      ordinal: turn.providerTurnOrdinal,
+                      status: "completed",
+                      startedAt: now,
+                      completedAt: now,
+                    },
+                  });
+                  yield* Queue.offer(events, {
+                    type: "turn.terminal",
+                    driver: ANTIGRAVITY_DRIVER,
                     providerThreadId: turn.providerThread.id,
                     providerTurnId: turnId,
-                    nativeItemRef: null,
-                    parentItemId: null,
-                    ordinal: turn.runOrdinal * 100 + 2,
+                    runOrdinal: turn.runOrdinal,
                     status: "completed",
-                    title: null,
-                    startedAt: now,
-                    completedAt: now,
-                    updatedAt: now,
-                    type: "assistant_message",
-                    messageId: MessageId.make(`assistant:${instanceId}:${turn.attemptId}`),
-                    text: reply,
-                    streaming: false,
-                  },
+                    failure: null,
+                    threadDisposition: "reusable",
+                  });
                 });
-                yield* Queue.offer(events, {
-                  type: "provider_turn.updated",
-                  driver: ANTIGRAVITY_DRIVER,
-                  providerTurn: {
-                    id: turnId,
-                    providerThreadId: turn.providerThread.id,
-                    nodeId: turn.rootNodeId,
-                    runAttemptId: turn.attemptId,
-                    nativeTurnRef: null,
-                    ordinal: turn.providerTurnOrdinal,
-                    status: "completed",
-                    startedAt: now,
-                    completedAt: now,
-                  },
-                });
-                yield* Queue.offer(events, {
-                  type: "turn.terminal",
-                  driver: ANTIGRAVITY_DRIVER,
-                  providerThreadId: turn.providerThread.id,
-                  providerTurnId: turnId,
-                  runOrdinal: turn.runOrdinal,
-                  status: "completed",
-                  failure: null,
-                  threadDisposition: "reusable",
-                });
+                if (outcome.pause !== undefined) {
+                  const { onStarted, release } = outcome.pause;
+                  yield* Deferred.succeed(onStarted, undefined);
+                  yield* Deferred.await(release).pipe(
+                    Effect.andThen(emitSuccess),
+                    Effect.forkIn(sessionScope),
+                  );
+                } else {
+                  yield* emitSuccess;
+                }
                 return;
               }
               if (outcome.behavior === "usage_limit") {
@@ -817,6 +876,7 @@ function makeIntegrationLayer(input: {
   readonly name: string;
   readonly cwd: string;
   readonly providers: ReadonlyArray<ServerProvider>;
+  readonly providersRef?: Ref.Ref<ReadonlyArray<ServerProvider>>;
   readonly settings?: Partial<ServerSettings>;
   readonly outcomeFor: (
     instanceId: ProviderInstanceId,
@@ -828,8 +888,20 @@ function makeIntegrationLayer(input: {
     readonly text: string;
     readonly model: string;
   }>;
+  readonly recordedSessionOps?: Array<RecordedSessionOp>;
+  readonly databaseLayer?: NonNullable<
+    Parameters<typeof ProviderReplayHarness.layerWithRegistry>[2]
+  >["databaseLayer"];
+  readonly wrapFailover?: (
+    inner: AntigravityFailover.AntigravityFailoverShape,
+  ) => AntigravityFailover.AntigravityFailoverShape;
+  readonly wrapProjectionStore?: (
+    store: ProjectionStore.ProjectionStoreV2Shape,
+  ) => ProjectionStore.ProjectionStoreV2Shape;
+  readonly sweeps?: Map<string, Effect.Effect<void>>;
 }) {
-  const providersRef = Ref.makeUnsafe<ReadonlyArray<ServerProvider>>(input.providers);
+  const providersRef =
+    input.providersRef ?? Ref.makeUnsafe<ReadonlyArray<ServerProvider>>(input.providers);
   const adapterMap = new Map(
     input.providers.map((provider) => [
       provider.instanceId,
@@ -838,6 +910,9 @@ function makeIntegrationLayer(input: {
         cwd: input.cwd,
         outcomeForTurn: (turn) => input.outcomeFor(provider.instanceId, turn),
         recordedTurns: input.recordedTurns,
+        ...(input.recordedSessionOps === undefined
+          ? {}
+          : { recordedSessionOps: input.recordedSessionOps }),
       }),
     ]),
   );
@@ -859,23 +934,37 @@ function makeIntegrationLayer(input: {
   const layerSettings = ServerSettingsService.layerTest(
     settingsForProviders(input.providers, input.settings),
   );
-  const layerFailover = AntigravityFailover.layer.pipe(
+  const baseFailover = AntigravityFailover.layer.pipe(
     Layer.provide(Layer.mergeAll(layerProviderRegistry, layerSettings)),
   );
+  const layerFailover =
+    input.wrapFailover === undefined
+      ? baseFailover
+      : Layer.effect(
+          AntigravityFailover.AntigravityFailover,
+          Effect.map(AntigravityFailover.AntigravityFailover, input.wrapFailover),
+        ).pipe(Layer.provide(baseFailover));
+  const layerDatabase = input.databaseLayer ?? SqlitePersistence.layerMemory;
   const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
     { name: input.name },
     layerAdapters,
-    { runEffectWorker: true },
+    {
+      runEffectWorker: true,
+      ...(input.databaseLayer === undefined ? {} : { databaseLayer: input.databaseLayer }),
+      ...(input.wrapProjectionStore === undefined
+        ? {}
+        : { wrapProjectionStore: input.wrapProjectionStore }),
+    },
   ).pipe(Layer.provide(layerFailover));
   const layerThreadMgmt = Layer.merge(
     layerOrchestrator,
     ThreadManagementService.layer.pipe(
       Layer.provide(layerOrchestrator),
       Layer.provide(layerSettings),
-      Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory))),
+      Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
     ),
   );
-  return OrchestratorMcpService.layer.pipe(
+  const layerMcp = OrchestratorMcpService.layer.pipe(
     Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
     Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
     Layer.provideMerge(layerThreadMgmt),
@@ -894,6 +983,24 @@ function makeIntegrationLayer(input: {
       ),
     ),
   );
+  if (input.sweeps === undefined) {
+    return layerMcp;
+  }
+  const sweeps = input.sweeps;
+  const layerScheduler = Layer.succeed(Scheduler.Scheduler, {
+    register: <E, R>(name: string, work: Effect.Effect<void, E, R>) =>
+      Effect.gen(function* () {
+        const context = yield* Effect.context<R>();
+        sweeps.set(name, work.pipe(Effect.provideContext(context), Effect.orDie));
+      }),
+  });
+  const layerRecovery = UsageLimitRecoveryWorker.layer.pipe(
+    Layer.provide(layerScheduler),
+    Layer.provide(ProjectionStore.layer.pipe(Layer.provide(layerDatabase))),
+    Layer.provide(layerSettings),
+    Layer.provide(layerThreadMgmt),
+  );
+  return Layer.merge(layerMcp, layerRecovery);
 }
 
 describe("Antigravity auto-failover integration", () => {
@@ -1691,6 +1798,806 @@ describe("Antigravity auto-failover integration", () => {
           });
           assert.equal(roleDelegation.providerInstanceId, ProviderInstanceId.make("antigravity_2"));
         }).pipe(Effect.provide(layer));
+      }),
+  );
+
+  it.effect(
+    "allocates an isolated providerThread and handoff when startNextQueuedRun pre-flight fails over a queued non-fresh follow-up",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-cf06-queued-preflight");
+        const recordedTurns: Array<{
+          readonly instanceId: ProviderInstanceId;
+          readonly threadId: ThreadId;
+          readonly text: string;
+          readonly model: string;
+        }> = [];
+        const recordedSessionOps: Array<RecordedSessionOp> = [];
+        const initialProviders = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 10 }]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+          }),
+        ];
+        const providersRef = Ref.makeUnsafe<ReadonlyArray<ServerProvider>>(initialProviders);
+        const run1Started = yield* Deferred.make<void>();
+        const releaseRun1 = yield* Deferred.make<void>();
+        const layer = makeIntegrationLayer({
+          name: "antigravity-cf06-queued-preflight",
+          cwd,
+          providers: initialProviders,
+          providersRef,
+          recordedTurns,
+          recordedSessionOps,
+          outcomeFor: (_instanceId, turn) =>
+            turn.runOrdinal === 1
+              ? {
+                  behavior: "succeed",
+                  assistantText: "Run 1 context PHOENIX_QUEUED.",
+                  pause: { onStarted: run1Started, release: releaseRun1 },
+                }
+              : {
+                  behavior: "succeed",
+                  assistantText: "Run 2 completed on AGY-2.",
+                },
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const threadId = ThreadId.make("thread:cf06-queued-preflight");
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-cf06"),
+            threadId,
+            projectId: PROJECT_ID,
+            title: "CF-06 queued preflight",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+
+          const waitRun1Running = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === threadId &&
+                event.payload.ordinal === 1 &&
+                event.payload.status === "running",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("msg-cf06-1"),
+            threadId,
+            messageId: MessageId.make("message:cf06-1"),
+            text: "Remember PHOENIX_QUEUED.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(run1Started);
+          yield* Fiber.join(waitRun1Running);
+
+          // Queue Run 2 as a normal non-fresh follow-up while Run 1 is active on Account A.
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("msg-cf06-2"),
+            threadId,
+            messageId: MessageId.make("message:cf06-2"),
+            text: "Follow up on the queued turn.",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+
+          // Exhaust Account A before Run 1 completes so startNextQueuedRun pre-flight fails over Run 2.
+          yield* Ref.set(providersRef, [
+            makeAntigravityProvider("antigravity", {
+              displayName: "AGY-1",
+              usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+            }),
+            makeAntigravityProvider("antigravity_2", {
+              displayName: "AGY-2",
+              usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+            }),
+          ]);
+
+          const waitRun2Completed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === threadId &&
+                event.payload.ordinal === 2 &&
+                event.payload.status === "completed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* Deferred.succeed(releaseRun1, undefined);
+          yield* Fiber.join(waitRun2Completed);
+
+          const agy2 = ProviderInstanceId.make("antigravity_2");
+          const agy1 = ProviderInstanceId.make("antigravity");
+          const agy2Ops = recordedSessionOps.filter((op) => op.instanceId === agy2);
+          assert.isTrue(agy2Ops.some((op) => op.op === "ensureThread"));
+          assert.isFalse(agy2Ops.some((op) => op.op === "resumeThread"));
+          const agy2OpenOps = agy2Ops.filter((op) => op.op === "openSession");
+          assert.isNotEmpty(agy2OpenOps);
+          for (const op of agy2OpenOps) {
+            assert.isUndefined(op.initialNativeThreadId);
+          }
+
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          const run1 = projection.runs.find((run) => run.ordinal === 1)!;
+          const run2 = projection.runs.find((run) => run.ordinal === 2)!;
+          assert.equal(run2.providerInstanceId, agy2);
+          assert.notEqual(run2.providerThreadId, run1.providerThreadId);
+
+          const pt1 = projection.providerThreads.find((pt) => pt.id === run1.providerThreadId);
+          const pt2 = projection.providerThreads.find((pt) => pt.id === run2.providerThreadId);
+          assert.equal(pt1?.providerInstanceId, agy1);
+          assert.equal(pt2?.providerInstanceId, agy2);
+
+          const handoffForRun2 = projection.contextHandoffs.find(
+            (handoff) => handoff.targetRunId === run2.id,
+          );
+          assert.isDefined(handoffForRun2);
+          assert.include(handoffForRun2!.fromProviderThreadIds, run1.providerThreadId!);
+          assert.equal(handoffForRun2?.toProviderThreadId, run2.providerThreadId);
+          assert.isAtMost(handoffForRun2!.coveredRunOrdinals.from, 1);
+          assert.isAtLeast(handoffForRun2!.coveredRunOrdinals.to, 1);
+          const handoffTurnItem = projection.turnItems.find(
+            (item) => item.type === "handoff" && item.contextHandoffId === handoffForRun2?.id,
+          );
+          assert.isDefined(handoffTurnItem);
+          if (handoffTurnItem?.type === "handoff") {
+            assert.deepEqual(handoffTurnItem.fromProviderInstanceIds, [agy1]);
+            assert.equal(handoffTurnItem.toProviderInstanceId, agy2);
+          }
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(releaseRun1, undefined).pipe(Effect.ignore)),
+          Effect.provide(layer),
+        );
+      }),
+  );
+
+  it.effect(
+    "does not keep declined Antigravity failover pending across server restarts and lets UsageLimitRecoveryWorker and waitForThread settle",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-cf07-restart-",
+        });
+        const dbPath = path.join(tempDir, "state.sqlite");
+        const cwd = yield* checkpointWorkspace("antigravity-cf07-restart");
+        const threadId = ThreadId.make("thread:cf07-restart");
+
+        // Instance 1: Run 1 fails with usage_limit on AGY-1 while AGY-2 is exhausted (100%).
+        const instance1Providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+          }),
+        ];
+        const failoverDeclined = yield* Deferred.make<void>();
+        const dbLayer1 = SqlitePersistence.layerFromPath(dbPath).pipe(
+          Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        );
+        const layer1 = makeIntegrationLayer({
+          name: "antigravity-cf07-instance1",
+          cwd,
+          providers: instance1Providers,
+          recordedTurns: [],
+          outcomeFor: () => ({ behavior: "usage_limit" }),
+          databaseLayer: dbLayer1,
+          wrapFailover: (inner) => ({
+            ...inner,
+            nextFailoverSelection: (input) =>
+              inner
+                .nextFailoverSelection(input)
+                .pipe(
+                  Effect.tap((decision) =>
+                    decision === null
+                      ? Deferred.succeed(failoverDeclined, undefined).pipe(Effect.asVoid)
+                      : Effect.void,
+                  ),
+                ),
+          }),
+        });
+
+        const failedRun = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-cf07-restart"),
+            threadId,
+            projectId: PROJECT_ID,
+            title: "CF-07 restart test",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const waitFailed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === threadId &&
+                event.payload.status === "failed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("msg-cf07-restart"),
+            threadId,
+            messageId: MessageId.make("message:cf07-restart"),
+            text: "Hit quota when backup is exhausted.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Fiber.join(waitFailed);
+          yield* Deferred.await(failoverDeclined);
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          const run = projection.runs[0]!;
+          assert.equal(run.status, "failed");
+          assert.isFalse(yield* orchestrator.restartContinuationPending(run));
+          return run;
+        }).pipe(Effect.provide(layer1));
+
+        // Instance 2: Reboot against the same SQLite DB with AGY-2 now healthy (0%).
+        const instance2Providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+          }),
+        ];
+        const sweeps = new Map<string, Effect.Effect<void>>();
+        let nextFailoverSelectionCalls = 0;
+        const dbLayer2 = SqlitePersistence.layerFromPath(dbPath).pipe(
+          Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        );
+        const layer2 = makeIntegrationLayer({
+          name: "antigravity-cf07-instance2",
+          cwd,
+          providers: instance2Providers,
+          settings: { autoResumeLimitedThreads: true },
+          recordedTurns: [],
+          outcomeFor: () => ({ behavior: "succeed" }),
+          databaseLayer: dbLayer2,
+          sweeps,
+          wrapFailover: (inner) => ({
+            ...inner,
+            nextFailoverSelection: (input) =>
+              Effect.sync(() => {
+                nextFailoverSelectionCalls += 1;
+              }).pipe(Effect.andThen(inner.nextFailoverSelection(input))),
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sweep = Effect.andThen(
+            Effect.suspend(() => sweeps.get("usage-limit-recovery")!),
+            worker.drain(),
+          );
+
+          assert.isFalse(yield* orchestrator.restartContinuationPending(failedRun));
+
+          yield* sweep;
+          yield* sweep;
+          yield* sweep;
+
+          const afterSweeps = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(afterSweeps.thread.limitRecovery?.runId, failedRun.id);
+          assert.equal(nextFailoverSelectionCalls, 0);
+
+          const waitFiber = yield* threadManagement
+            .waitForThread({
+              projectId: PROJECT_ID,
+              threadId,
+              runId: failedRun.id,
+              timeoutMs: 5_000,
+            })
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* TestClock.adjust("5 seconds");
+          const waited = yield* Fiber.join(waitFiber);
+          assert.isFalse(waited.timedOut);
+          assert.equal(waited.run?.id, failedRun.id);
+        }).pipe(Effect.provide(layer2));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "clears stale Attempt-1 failover state once Attempt 2 completes and handles interrupting a blocked awaitRestartContinuation fiber",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-cf07-stale-waiter");
+        const providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+          }),
+          makeAntigravityProvider("antigravity_3", {
+            displayName: "AGY-3",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 0 }]),
+          }),
+        ];
+        const gateEntered = yield* Deferred.make<void>();
+        const releaseGate = yield* Deferred.make<void>();
+        let gatedOnce = false;
+        const layer = makeIntegrationLayer({
+          name: "antigravity-cf07-stale-waiter",
+          cwd,
+          providers,
+          recordedTurns: [],
+          outcomeFor: (instanceId) =>
+            instanceId === ProviderInstanceId.make("antigravity")
+              ? { behavior: "usage_limit" }
+              : { behavior: "succeed", assistantText: "Completed on AGY-2." },
+          wrapFailover: (inner) => ({
+            ...inner,
+            recordQuotaExhausted: (input) =>
+              Effect.gen(function* () {
+                if (!gatedOnce) {
+                  gatedOnce = true;
+                  yield* Deferred.succeed(gateEntered, undefined);
+                  yield* Deferred.await(releaseGate);
+                }
+                yield* inner.recordQuotaExhausted(input);
+              }),
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const threadId = ThreadId.make("thread:cf07-stale-waiter");
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-cf07-stale"),
+            threadId,
+            projectId: PROJECT_ID,
+            title: "CF-07 stale waiter",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+
+          const waitCompleted = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === threadId &&
+                event.payload.status === "completed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("msg-cf07-stale"),
+            threadId,
+            messageId: MessageId.make("message:cf07-stale"),
+            text: "Fail over cleanly.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+
+          yield* Deferred.await(gateEntered);
+          const projectionWhileGated = yield* orchestrator.getThreadProjection(threadId);
+          const staleAttempt1Run = projectionWhileGated.runs[0]!;
+          assert.equal(staleAttempt1Run.status, "failed");
+          assert.equal(staleAttempt1Run.providerInstanceId, ProviderInstanceId.make("antigravity"));
+
+          assert.isTrue(yield* orchestrator.restartContinuationPending(staleAttempt1Run));
+          const blockedFiber = yield* orchestrator
+            .awaitRestartContinuation(staleAttempt1Run)
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* TestClock.adjust("1 second");
+          assert.isTrue(Option.isNone(Option.fromUndefinedOr(blockedFiber.pollUnsafe())));
+          yield* Fiber.interrupt(blockedFiber);
+          const interruptExit = yield* Fiber.await(blockedFiber);
+          assert.isTrue(Exit.isFailure(interruptExit));
+          if (Exit.isFailure(interruptExit)) {
+            assert.isTrue(Cause.hasInterruptsOnly(interruptExit.cause));
+          }
+
+          yield* Deferred.succeed(releaseGate, undefined);
+          yield* Fiber.join(waitCompleted);
+
+          const finished = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(finished.runs[0]?.status, "completed");
+          assert.deepEqual(
+            finished.attempts.map((attempt) => attempt.providerInstanceId),
+            [ProviderInstanceId.make("antigravity"), ProviderInstanceId.make("antigravity_2")],
+          );
+
+          assert.isFalse(yield* orchestrator.restartContinuationPending(staleAttempt1Run));
+          const staleAwaitFiber = yield* orchestrator
+            .awaitRestartContinuation(staleAttempt1Run)
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* TestClock.adjust("1 second");
+          const stalePolled = Option.fromUndefinedOr(staleAwaitFiber.pollUnsafe());
+          assert.isTrue(Option.isSome(stalePolled));
+          if (Option.isSome(stalePolled)) {
+            assert.isTrue(Exit.isSuccess(stalePolled.value));
+          }
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(releaseGate, undefined).pipe(Effect.ignore)),
+          Effect.provide(layer),
+        );
+      }),
+  );
+
+  it.effect(
+    "does not prematurely fail a delegated subagent via recoverDelegatedTask while Antigravity failover is gated",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-cf08-recover-race");
+        const providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 10 }]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 20 }]),
+          }),
+        ];
+        const parentThreadId = ThreadId.make("thread:parent-cf08-recover");
+        const gateEntered = yield* Deferred.make<void>();
+        const releaseGate = yield* Deferred.make<void>();
+        let gatedOnce = false;
+        const layer = makeIntegrationLayer({
+          name: "antigravity-cf08-recover-race",
+          cwd,
+          providers,
+          recordedTurns: [],
+          outcomeFor: (instanceId, turn) => {
+            if (turn.threadId === parentThreadId) {
+              return { behavior: "succeed", assistantText: "Parent running." };
+            }
+            return instanceId === ProviderInstanceId.make("antigravity")
+              ? { behavior: "usage_limit" }
+              : { behavior: "succeed", assistantText: "AUTHORITATIVE_RESULT_FROM_AGY2" };
+          },
+          wrapFailover: (inner) => ({
+            ...inner,
+            recordQuotaExhausted: (input) =>
+              Effect.gen(function* () {
+                if (!gatedOnce && input.instanceId === ProviderInstanceId.make("antigravity")) {
+                  gatedOnce = true;
+                  yield* Deferred.succeed(gateEntered, undefined);
+                  yield* Deferred.await(releaseGate);
+                }
+                yield* inner.recordQuotaExhausted(input);
+              }),
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-parent-cf08-recover"),
+            threadId: parentThreadId,
+            projectId: PROJECT_ID,
+            title: "Parent CF-08 recover",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-parent-cf08-recover"),
+            threadId: parentThreadId,
+            messageId: MessageId.make("message:parent-cf08-recover"),
+            text: "Delegate task",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const scope: McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:antigravity-cf08-recover"),
+            requestNamespace: "provider-session:antigravity-cf08-recover",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "provider-session:antigravity-cf08-recover",
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+
+          const delegated = yield* mcp.delegateTask(scope, {
+            task: "Complete on backup after quota failure.",
+            mode: "async",
+            clientRequestId: "req-cf08-recover",
+          });
+          const childThreadId = delegated.childThreadId!;
+
+          yield* Deferred.await(gateEntered);
+          // Same parent-locked finalizeAppOwnedSubagent path as settlesChildWork.
+          const recoverFiber = yield* orchestrator
+            .recoverDelegatedTask(childThreadId)
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* TestClock.adjust("1 second");
+
+          const gatedParent = yield* orchestrator.getThreadProjection(parentThreadId);
+          const gatedTask = gatedParent.subagents.find((task) => task.id === delegated.taskId);
+          assert.isDefined(gatedTask);
+          assert.notEqual(gatedTask?.status, "failed");
+          assert.isNull(gatedTask?.result ?? null);
+          assert.isDefined(recoverFiber.pollUnsafe());
+          yield* Fiber.join(recoverFiber);
+
+          const waitSubagentDone = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "subagent.updated" &&
+                event.threadId === parentThreadId &&
+                event.payload.id === delegated.taskId &&
+                (event.payload.status === "completed" || event.payload.status === "failed"),
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* Deferred.succeed(releaseGate, undefined);
+          yield* Fiber.join(waitSubagentDone);
+
+          const parentProjection = yield* orchestrator.getThreadProjection(parentThreadId);
+          const subagent = parentProjection.subagents.find((task) => task.id === delegated.taskId);
+          assert.equal(subagent?.status, "completed");
+          assert.include(subagent?.result ?? "", "AUTHORITATIVE_RESULT_FROM_AGY2");
+
+          const status = yield* mcp.taskStatus(scope, delegated.taskId);
+          assert.equal(status.status, "completed");
+          assert.include(status.summary ?? "", "AUTHORITATIVE_RESULT_FROM_AGY2");
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(releaseGate, undefined).pipe(Effect.ignore)),
+          Effect.provide(layer),
+        );
+      }),
+  );
+
+  it.effect(
+    "aborts pending child Antigravity failover when cancelDelegatedTask is invoked while failover is gated",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-cf08-cancel-race");
+        const recordedTurns: Array<{
+          readonly instanceId: ProviderInstanceId;
+          readonly threadId: ThreadId;
+          readonly text: string;
+          readonly model: string;
+        }> = [];
+        const providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 10 }]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 20 }]),
+          }),
+        ];
+        const parentThreadId = ThreadId.make("thread:parent-cf08-cancel");
+        const gateEntered = yield* Deferred.make<void>();
+        const releaseGate = yield* Deferred.make<void>();
+        const cancelEntered = yield* Deferred.make<void>();
+        let gatedOnce = false;
+        let cancelGateArmed = false;
+        const layer = makeIntegrationLayer({
+          name: "antigravity-cf08-cancel-race",
+          cwd,
+          providers,
+          recordedTurns,
+          outcomeFor: (instanceId, turn) => {
+            if (turn.threadId === parentThreadId) {
+              return { behavior: "succeed", assistantText: "Parent running." };
+            }
+            return instanceId === ProviderInstanceId.make("antigravity")
+              ? { behavior: "usage_limit" }
+              : { behavior: "succeed", assistantText: "Should never start on AGY-2." };
+          },
+          wrapFailover: (inner) => ({
+            ...inner,
+            recordQuotaExhausted: (input) =>
+              Effect.gen(function* () {
+                if (!gatedOnce && input.instanceId === ProviderInstanceId.make("antigravity")) {
+                  gatedOnce = true;
+                  yield* Deferred.succeed(gateEntered, undefined);
+                  yield* Deferred.await(releaseGate);
+                }
+                yield* inner.recordQuotaExhausted(input);
+              }),
+          }),
+          wrapProjectionStore: (store) => ({
+            ...store,
+            getThreadRecords: ((
+              threadId: ThreadId,
+              fields: ReadonlyArray<string>,
+              filter?: unknown,
+            ) =>
+              store
+                .getThreadRecords(threadId, fields as never, filter as never)
+                .pipe(
+                  Effect.tap(() =>
+                    cancelGateArmed && threadId === parentThreadId && fields.includes("subagents")
+                      ? Deferred.succeed(cancelEntered, undefined).pipe(Effect.asVoid)
+                      : Effect.void,
+                  ),
+                )) as typeof store.getThreadRecords,
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-parent-cf08-cancel"),
+            threadId: parentThreadId,
+            projectId: PROJECT_ID,
+            title: "Parent CF-08 cancel",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-parent-cf08-cancel"),
+            threadId: parentThreadId,
+            messageId: MessageId.make("message:parent-cf08-cancel"),
+            text: "Delegate and cancel",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const scope: McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:antigravity-cf08-cancel"),
+            requestNamespace: "provider-session:antigravity-cf08-cancel",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "provider-session:antigravity-cf08-cancel",
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+
+          const delegated = yield* mcp.delegateTask(scope, {
+            task: "Cancel while failover is gated.",
+            mode: "async",
+            clientRequestId: "req-cf08-cancel",
+          });
+          const childThreadId = delegated.childThreadId!;
+
+          yield* Deferred.await(gateEntered);
+          cancelGateArmed = true;
+          const cancelFiber = yield* orchestrator
+            .cancelDelegatedTask({
+              parentThreadId,
+              taskId: delegated.taskId,
+              command: {
+                type: "thread.stop",
+                commandId: CommandId.make("stop-cf08-cancel"),
+                threadId: childThreadId,
+                stopDelegatedTasks: false,
+                reason: "Cancelled while failover was pending.",
+              },
+              stopDescendants: () => Effect.void,
+            })
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.await(cancelEntered);
+          yield* Deferred.succeed(releaseGate, undefined);
+          yield* Fiber.join(cancelFiber);
+          yield* worker.drain();
+
+          const childTurns = recordedTurns.filter((turn) => turn.threadId === childThreadId);
+          assert.deepEqual(
+            childTurns.map((turn) => turn.instanceId),
+            [ProviderInstanceId.make("antigravity")],
+          );
+          const childProjection = yield* orchestrator.getThreadProjection(childThreadId);
+          assert.equal(childProjection.attempts.length, 1);
+          assert.equal(
+            childProjection.attempts[0]?.providerInstanceId,
+            ProviderInstanceId.make("antigravity"),
+          );
+
+          const parentProjection = yield* orchestrator.getThreadProjection(parentThreadId);
+          const subagent = parentProjection.subagents.find((task) => task.id === delegated.taskId);
+          assert.isDefined(subagent);
+          assert.equal(subagent?.status, "interrupted");
+          assert.equal(subagent?.completionDelivery?.state, "disposed");
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(releaseGate, undefined).pipe(Effect.ignore)),
+          Effect.provide(layer),
+        );
       }),
   );
 });

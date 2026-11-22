@@ -2639,10 +2639,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const freshContext = queuedRun.freshContext === true;
       const activeProviderThread = dispatchProviderThread(projection, queuedMessage, freshContext);
       const contextBoundary = freshContext ? ordinal : contextBoundaryOrdinal(projection);
+      const providerInstanceChanged =
+        storedProviderThread.providerInstanceId !== queuedRun.providerInstanceId;
       // A run queued before a fresh run started is bound to the conversation that run left behind.
       const followsLatestContext =
         !freshContext &&
-        (followsCurrent || providerThreadPredatesBoundary(storedProviderThread, contextBoundary));
+        (followsCurrent ||
+          providerInstanceChanged ||
+          providerThreadPredatesBoundary(storedProviderThread, contextBoundary));
       const targetProviderThread = followsLatestContext
         ? activeProviderThread?.providerInstanceId === queuedRun.providerInstanceId &&
           !providerThreadPredatesBoundary(activeProviderThread, contextBoundary)
@@ -2661,7 +2665,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           // The queue reserved `pending:<run>` for this run; another run may have taken it.
           nativeThreadId: freshContext
             ? `pending:${queuedRun.id}:fresh`
-            : `pending:${queuedRun.id}`,
+            : providerInstanceChanged
+              ? `pending:${queuedRun.id}:${queuedRun.providerInstanceId}`
+              : `pending:${queuedRun.id}`,
         }),
         driver: targetAdapter.driver,
         providerInstanceId: queuedRun.providerInstanceId,
@@ -2682,9 +2688,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         projection.thread.modelSelection,
         queuedRun.modelSelection,
       );
-      // The picker may already have moved ahead of the native conversation.
+      // The picker may already have moved ahead of the native conversation, or pre-flight
+      // failover may have moved this queued run onto another provider instance.
       const switchFromActiveProvider =
-        followsCurrent &&
+        (followsCurrent || (!freshContext && !isBufferedProviderNotification(queuedMessage))) &&
         activeProviderThread !== undefined &&
         activeProviderThread.providerInstanceId !== queuedRun.providerInstanceId;
       const switchPlan =
@@ -12936,9 +12943,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // A resumed queue can have a lower ordinal than a pending continuation source.
       // Stop must reach those sources even when interrupting the resumed run succeeds.
       if (
-        (run.status === "cancelled" ||
+        ((run.status === "cancelled" ||
           (run.status === "failed" && run.restartContinuationOfRunId !== undefined)) &&
-        (yield* awaitsRestartContinuation(run).pipe(mapDispatchError(input.command)))
+          (yield* awaitsRestartContinuation(run).pipe(mapDispatchError(input.command)))) ||
+        (run.status === "failed" &&
+          (yield* runAwaitsAntigravityFailover(thread.id, run, { ignorePendingStop: true })))
       ) {
         yield* markStoppedRun({ ...input, thread, run });
       }
@@ -14515,8 +14524,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           );
           // Unawaited background tasks still allow a result but die with the process; the idle
           // timer keeps their process pinned.
+          const progress = delegatedTaskProgress(child);
           if (
-            delegatedTaskProgress(child).state !== "result_available" ||
+            progress.state !== "result_available" ||
+            (progress.resultRun !== undefined &&
+              (yield* runAwaitsAntigravityFailover(childThreadId, progress.resultRun))) ||
             child.providerThreads.some((thread) => (thread.pendingBackgroundTasks ?? []).length > 0)
           )
             return;
@@ -14657,6 +14669,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ) {
         return;
       }
+      if (
+        options.task.cancelledRunId !== childRun.id &&
+        (yield* runAwaitsAntigravityFailover(childThreadId, childRun))
+      ) {
+        return;
+      }
 
       // A run queued behind the report can end the task without saying anything.
       const reportRuns = delegatedTaskReportRuns(childControls, { ...childRun, status: outcome });
@@ -14698,9 +14716,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (task === undefined) {
         return;
       }
-      // A cancelled task's completed run ends it interrupted.
+      // A cancelled task's completed or failed run ends it interrupted.
       const cancelled = task.cancelledRunId === childRun.id;
-      if (cancelled && terminalStatus === "completed") outcome = terminalStatus = "interrupted";
+      if (cancelled && (terminalStatus === "completed" || terminalStatus === "failed")) {
+        outcome = terminalStatus = "interrupted";
+      }
       // Every result the child sent is among its own transfers, far fewer than the parent's.
       const childTransfers = yield* projectionStore.getThreadRecords(childThreadId, [
         "contextTransfers",
@@ -14927,6 +14947,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       )
     )
       return;
+    if (!taskCancelled && (yield* runAwaitsAntigravityFailover(childThreadId, resultRun))) return;
     // Callers hold the parent lock; dismiss takes the child lock, as follow-up intake does.
     const { runtimeRequests } = yield* projectionStore.getThreadRecords(childThreadId, [
       "runtimeRequests",
@@ -15917,12 +15938,60 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
     );
 
+  // Ref-counted threads with a Stop/cancel waiting on or holding the thread lock, so in-flight
+  // Antigravity failover aborts before committing a new attempt.
+  const pendingStopThreads = new Map<
+    ThreadId,
+    { count: number; holdQueueCount: number; readonly abortedFailoverRunIds: Set<RunId> }
+  >();
+  const withPendingStop = <A, E, R>(
+    threadId: ThreadId,
+    effect: Effect.Effect<A, E, R>,
+    options?: { readonly holdQueue?: boolean },
+  ) => {
+    const holdQueue = options?.holdQueue === true;
+    return Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const existing = pendingStopThreads.get(threadId);
+        if (existing !== undefined) {
+          existing.count += 1;
+          if (holdQueue) existing.holdQueueCount += 1;
+        } else {
+          pendingStopThreads.set(threadId, {
+            count: 1,
+            holdQueueCount: holdQueue ? 1 : 0,
+            abortedFailoverRunIds: new Set(),
+          });
+        }
+      }),
+      () => effect,
+      () =>
+        Effect.sync(() => {
+          const existing = pendingStopThreads.get(threadId);
+          if (existing === undefined) return;
+          existing.count -= 1;
+          if (holdQueue) existing.holdQueueCount = Math.max(0, existing.holdQueueCount - 1);
+          if (existing.count <= 0) {
+            pendingStopThreads.delete(threadId);
+          }
+        }),
+    );
+  };
+
   // dispatchWithReceiptEffect owns the dispatch span; this wrapper selects the thread locks.
   const dispatchWithReceipt = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),
       dispatchWithReceiptEffect(command),
     );
+    if (command.type === "thread.stop") {
+      return yield* withPendingStop(command.threadId, dispatch, { holdQueue: true });
+    }
+    if (command.type === "run.interrupt") {
+      return yield* withPendingStop(command.threadId, dispatch, {
+        holdQueue: command.holdQueue === true,
+      });
+    }
     // A fork holds its source's lock, so a source deletion and its fork never interleave. A
     // parent's lock comes before its side chats' locks. A side chat fork from a side chat or a
     // fork onto an existing thread would invert that order; dispatch rejects both, so they skip it.
@@ -15968,24 +16037,69 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       : dispatch;
   });
 
-  const activeAntigravityFailoverRuns = new Set<RunId>();
-  const settledAntigravityFailoverAttempts = new Set<string>();
-  const antigravityFailoverWaiters = new Map<string, Deferred.Deferred<void>>();
+  const activeAntigravityFailoverAttempts = new Set<string>();
+  const committingAntigravityFailoverAttempts = new Set<string>();
+  const pendingAntigravityFailoverAttempts = new Map<string, number>();
+  const antigravityFailoverWaiters = new Map<string, Set<Deferred.Deferred<void>>>();
+  let lastConsumedRunUpdateSequence = 0;
   const failoverAttemptKey = (run: Pick<OrchestrationV2Run, "id" | "activeAttemptId">) =>
     `${run.id}:${run.activeAttemptId ?? ""}`;
+  const wakeAntigravityFailoverWaiters = Effect.fn("Orchestrator.wakeAntigravityFailoverWaiters")(
+    function* (key: string) {
+      const waiters = antigravityFailoverWaiters.get(key);
+      if (waiters === undefined) return;
+      antigravityFailoverWaiters.delete(key);
+      for (const waiter of waiters) {
+        yield* Deferred.succeed(waiter, undefined).pipe(Effect.ignore);
+      }
+    },
+  );
+  const releasePendingAntigravityFailoverAttempt = Effect.fn(
+    "Orchestrator.releasePendingAntigravityFailoverAttempt",
+  )(function* (key: string) {
+    const remaining = (pendingAntigravityFailoverAttempts.get(key) ?? 0) - 1;
+    if (remaining > 0) {
+      pendingAntigravityFailoverAttempts.set(key, remaining);
+      return;
+    }
+    pendingAntigravityFailoverAttempts.delete(key);
+    yield* wakeAntigravityFailoverWaiters(key);
+  });
+  const hasUnconsumedFailedRunUpdate = (
+    threadId: ThreadId,
+    run: Pick<OrchestrationV2Run, "id" | "activeAttemptId">,
+  ) =>
+    eventSink
+      .read({
+        threadId,
+        afterSequence: lastConsumedRunUpdateSequence,
+        eventType: "run.updated",
+      })
+      .pipe(
+        Stream.filter(
+          (stored) =>
+            stored.event.type === "run.updated" &&
+            !String(stored.commandId).startsWith("command:runtime-reconcile:") &&
+            stored.event.payload.id === run.id &&
+            stored.event.payload.status === "failed" &&
+            stored.event.payload.activeAttemptId === run.activeAttemptId,
+        ),
+        Stream.take(1),
+        Stream.runHead,
+        Effect.map(Option.isSome),
+        Effect.orElseSucceed(() => false),
+      );
 
   const runAwaitsAntigravityFailover = Effect.fn("Orchestrator.runAwaitsAntigravityFailover")(
-    function* (threadId: ThreadId, run: OrchestrationV2Run) {
+    function* (
+      threadId: ThreadId,
+      run: OrchestrationV2Run,
+      options?: { readonly ignorePendingStop?: boolean },
+    ) {
       if (run.status !== "failed") return false;
-      const key = failoverAttemptKey(run);
-      if (settledAntigravityFailoverAttempts.has(key)) return false;
-      if (activeAntigravityFailoverRuns.has(run.id)) {
-        if (!antigravityFailoverWaiters.has(key)) {
-          antigravityFailoverWaiters.set(key, yield* Deferred.make<void>());
-        }
-        return true;
-      }
-      if (!(yield* antigravityFailover.isAntigravityInstance(run.providerInstanceId))) {
+      const requestedKey = failoverAttemptKey(run);
+      const committing = committingAntigravityFailoverAttempts.has(requestedKey);
+      if (!committing && options?.ignorePendingStop !== true && pendingStopThreads.has(threadId)) {
         return false;
       }
       const projection = yield* projectionStore
@@ -16005,8 +16119,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         )
         .pipe(Effect.orElseSucceed(() => null));
+      if (projection === null) return false;
+      const liveRun = projection.runs.find((candidate) => candidate.id === run.id);
       if (
-        projection === null ||
+        liveRun === undefined ||
+        liveRun.status !== "failed" ||
+        liveRun.activeAttemptId !== run.activeAttemptId ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
         projection.thread.settledOverride === "settled" ||
@@ -16016,11 +16134,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return false;
       }
       if (projection.turnItems.some((item) => item.type === "run_interrupt_request")) return false;
-      const failure = latestRootProviderFailure(run, projection.turnItems);
+      const key = failoverAttemptKey(liveRun);
+      if (committingAntigravityFailoverAttempts.has(key)) {
+        return true;
+      }
+      if (
+        options?.ignorePendingStop === true &&
+        pendingStopThreads.get(threadId)?.abortedFailoverRunIds.has(liveRun.id)
+      ) {
+        return true;
+      }
+      const inFlight =
+        activeAntigravityFailoverAttempts.has(key) ||
+        (pendingAntigravityFailoverAttempts.get(key) ?? 0) > 0;
+      if (!inFlight && !(yield* hasUnconsumedFailedRunUpdate(threadId, liveRun))) {
+        return false;
+      }
+      if (!(yield* antigravityFailover.isAntigravityInstance(liveRun.providerInstanceId))) {
+        return false;
+      }
+      const failure = latestRootProviderFailure(liveRun, projection.turnItems);
       if (failure?.class !== "usage_limit") return false;
       const currentSessions = projection.providerSessions.filter(
         (session) =>
-          session.providerInstanceId === run.providerInstanceId &&
+          session.providerInstanceId === liveRun.providerInstanceId &&
           session.status !== "stopped" &&
           session.status !== "error",
       );
@@ -16031,14 +16168,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       const excluded = new Set<ProviderInstanceId>([
         ...projection.attempts
-          .filter((attempt) => attempt.runId === run.id)
+          .filter((attempt) => attempt.runId === liveRun.id)
           .map((attempt) => attempt.providerInstanceId),
-        run.providerInstanceId,
+        liveRun.providerInstanceId,
       ]);
       while (true) {
         const candidate = yield* antigravityFailover.nextFailoverSelection({
           projectId: projection.thread.projectId,
-          selection: run.modelSelection,
+          selection: liveRun.modelSelection,
           triedInstanceIds: excluded,
         });
         if (candidate === null) return false;
@@ -16046,9 +16183,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           providerAdapters.get(candidate.modelSelection.instanceId),
         );
         if (Exit.isSuccess(adapterExit)) {
-          if (!antigravityFailoverWaiters.has(key)) {
-            antigravityFailoverWaiters.set(key, yield* Deferred.make<void>());
-          }
           return true;
         }
         excluded.add(candidate.modelSelection.instanceId);
@@ -16057,10 +16191,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   );
 
   const attemptAntigravityQuotaFailover = Effect.fn("Orchestrator.attemptAntigravityQuotaFailover")(
-    function* (threadId: ThreadId, failedRunId: RunId) {
-      activeAntigravityFailoverRuns.add(failedRunId);
-      let attemptKey: string | undefined;
-      let didFailover = false;
+    function* (threadId: ThreadId, failedRunId: RunId, failedAttemptKey: string) {
+      let attemptKey: string = failedAttemptKey;
+      const abortForPendingStop = () => {
+        const pendingStop = pendingStopThreads.get(threadId);
+        if (pendingStop === undefined) return false;
+        pendingStop.abortedFailoverRunIds.add(failedRunId);
+        return true;
+      };
       return yield* Effect.gen(function* () {
         const projection = yield* readCommandProjection(threadId).pipe(
           Effect.orElseSucceed(() => null),
@@ -16105,11 +16243,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         if (failure?.class !== "usage_limit") {
           return false;
         }
+        if (abortForPendingStop()) {
+          return false;
+        }
+        activeAntigravityFailoverAttempts.add(attemptKey);
         yield* antigravityFailover.recordQuotaExhausted({
           instanceId: run.providerInstanceId,
           model: run.modelSelection.model,
           resetAt: failure.resetAt ?? null,
         });
+        if (abortForPendingStop()) {
+          return false;
+        }
 
         const currentSessions = projection.providerSessions.filter(
           (session) =>
@@ -16149,6 +16294,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             break;
           }
           excluded.add(candidate.modelSelection.instanceId);
+        }
+        if (abortForPendingStop()) {
+          return false;
         }
 
         const now = yield* DateTime.now;
@@ -16750,34 +16898,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         });
 
+        if (abortForPendingStop()) {
+          return false;
+        }
+        committingAntigravityFailoverAttempts.add(attemptKey);
         yield* writeSystemEvents(failoverEvents, failoverEffects);
-        didFailover = true;
         return true;
       }).pipe(
         Effect.ensuring(
-          Effect.gen(function* () {
-            activeAntigravityFailoverRuns.delete(failedRunId);
-            if (attemptKey !== undefined) {
-              if (!didFailover) {
-                if (settledAntigravityFailoverAttempts.size >= 1000) {
-                  const oldest = settledAntigravityFailoverAttempts.values().next().value;
-                  if (oldest !== undefined) settledAntigravityFailoverAttempts.delete(oldest);
-                }
-                settledAntigravityFailoverAttempts.add(attemptKey);
-              }
-              const waiter = antigravityFailoverWaiters.get(attemptKey);
-              if (waiter !== undefined) {
-                antigravityFailoverWaiters.delete(attemptKey);
-                yield* Deferred.succeed(waiter, undefined).pipe(Effect.ignore);
-              }
-            } else {
-              const prefix = `${failedRunId}:`;
-              for (const [key, waiter] of antigravityFailoverWaiters) {
-                if (key.startsWith(prefix)) {
-                  antigravityFailoverWaiters.delete(key);
-                  yield* Deferred.succeed(waiter, undefined).pipe(Effect.ignore);
-                }
-              }
+          Effect.sync(() => {
+            activeAntigravityFailoverAttempts.delete(failedAttemptKey);
+            committingAntigravityFailoverAttempts.delete(failedAttemptKey);
+            if (attemptKey !== failedAttemptKey) {
+              activeAntigravityFailoverAttempts.delete(attemptKey);
+              committingAntigravityFailoverAttempts.delete(attemptKey);
             }
           }),
         ),
@@ -16786,74 +16920,85 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   );
 
   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
-    function* (stored: OrchestrationV2StoredEvent) {
-      if (stored.event.type !== "run.updated") return;
-      const threadId = stored.event.threadId;
-      const run = stored.event.payload;
-      // Take parent and child locks sequentially, never nested: delegation holds the parent
-      // while writing child events, so nesting parent inside child would invert the order.
-      // The keyed semaphores are neither reentrant nor deadlock-aware.
-      if (delegatedTaskTerminalStatus(run.status) !== null) {
-        if (run.status === "failed") {
-          const failedOver = yield* threadDispatch
-            .withLock(threadId, attemptAntigravityQuotaFailover(threadId, run.id))
-            .pipe(
+    function* (stored: OrchestrationV2StoredEvent, pendingFailoverAttemptKey?: string) {
+      let releasedPending = false;
+      const releasePendingOnce = Effect.suspend(() => {
+        if (releasedPending || pendingFailoverAttemptKey === undefined) return Effect.void;
+        releasedPending = true;
+        return releasePendingAntigravityFailoverAttempt(pendingFailoverAttemptKey);
+      });
+      yield* Effect.gen(function* () {
+        if (stored.event.type !== "run.updated") return;
+        const threadId = stored.event.threadId;
+        const run = stored.event.payload;
+        // Take parent and child locks sequentially, never nested: delegation holds the parent
+        // while writing child events, so nesting parent inside child would invert the order.
+        // The keyed semaphores are neither reentrant nor deadlock-aware.
+        if (delegatedTaskTerminalStatus(run.status) !== null) {
+          if (run.status === "failed") {
+            const attemptKey = pendingFailoverAttemptKey ?? failoverAttemptKey(run);
+            const failedOver = yield* threadDispatch
+              .withLock(threadId, attemptAntigravityQuotaFailover(threadId, run.id, attemptKey))
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to attempt Antigravity quota failover", {
+                    threadId,
+                    runId: run.id,
+                    cause,
+                  }).pipe(Effect.as(false)),
+                ),
+                Effect.ensuring(releasePendingOnce),
+              );
+            if (failedOver) return;
+          }
+          // Before the parent hears of the failure: a pending continuation keeps the task open.
+          if (run.status === "failed" && run.restartContinuationOfRunId !== undefined) {
+            yield* threadDispatch.withLock(threadId, retryContinuationStart(threadId, run.id)).pipe(
               Effect.catchCause((cause) =>
-                Effect.logWarning("Failed to attempt Antigravity quota failover", {
+                Effect.logWarning("Failed to schedule a restart continuation retry", {
                   threadId,
                   runId: run.id,
                   cause,
-                }).pipe(Effect.as(false)),
-              ),
-            );
-          if (failedOver) return;
-        }
-        // Before the parent hears of the failure: a pending continuation keeps the task open.
-        if (run.status === "failed" && run.restartContinuationOfRunId !== undefined) {
-          yield* threadDispatch.withLock(threadId, retryContinuationStart(threadId, run.id)).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Failed to schedule a restart continuation retry", {
-                threadId,
-                runId: run.id,
-                cause,
-              }),
-            ),
-          );
-        }
-        yield* threadDispatch.withLock(
-          threadId,
-          finalizeDelegatedCompletionDelivery(threadId, run.id),
-        );
-        yield* threadDispatch
-          .withLock(
-            threadId,
-            (run.status === "completed"
-              ? releaseUnattendedHolds(threadId, run.id)
-              : Effect.void
-            ).pipe(
-              Effect.andThen(
-                startNextQueuedRun(threadId, {
-                  endedRunId: run.id,
-                  ...(run.status === "failed" ? { failedRunId: run.id } : {}),
                 }),
               ),
-            ),
-          )
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause }),
-            ),
+            );
+          }
+          yield* threadDispatch.withLock(
+            threadId,
+            finalizeDelegatedCompletionDelivery(threadId, run.id),
           );
-      }
-      const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
-      if (parentThreadId !== undefined) {
-        yield* threadDispatch.withLock(
-          parentThreadId,
-          finalizeAppOwnedSubagent(threadId, { syncRunId: run.id }),
-        );
-      }
+          if ((pendingStopThreads.get(threadId)?.holdQueueCount ?? 0) === 0) {
+            yield* threadDispatch
+              .withLock(
+                threadId,
+                Effect.gen(function* () {
+                  if ((pendingStopThreads.get(threadId)?.holdQueueCount ?? 0) > 0) return;
+                  if (run.status === "completed") {
+                    yield* releaseUnattendedHolds(threadId, run.id);
+                  }
+                  yield* startNextQueuedRun(threadId, {
+                    endedRunId: run.id,
+                    ...(run.status === "failed" ? { failedRunId: run.id } : {}),
+                  });
+                }),
+              )
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause }),
+                ),
+              );
+          }
+        }
+        const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
+        if (parentThreadId !== undefined) {
+          yield* threadDispatch.withLock(
+            parentThreadId,
+            finalizeAppOwnedSubagent(threadId, { syncRunId: run.id }),
+          );
+        }
+      }).pipe(Effect.ensuring(releasePendingOnce));
     },
-    (effect, stored) =>
+    (effect, stored, _pendingFailoverAttemptKey?) =>
       effect.pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("Failed to react to V2 run update", {
@@ -16871,29 +17016,51 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   // Projections already contain historical terminals; replaying them delays startup queue promotion with database size.
   const terminalEventsAfterSequence = yield* eventSink.latestSequence().pipe(Effect.orDie);
+  lastConsumedRunUpdateSequence = terminalEventsAfterSequence;
+  const shouldReactToRunUpdate = (stored: OrchestrationV2StoredEvent) =>
+    stored.event.type === "run.updated" &&
+    (!String(stored.commandId).startsWith("command:runtime-reconcile:") ||
+      (stored.event.payload.delegatedTaskId !== undefined &&
+        stored.event.payload.status === "queued" &&
+        stored.event.payload.queueHeld === true)) &&
+    ((stored.event.payload.delegatedTaskId !== undefined &&
+      (stored.event.payload.status === "queued" ||
+        stored.event.payload.status === "starting" ||
+        stored.event.payload.status === "waiting")) ||
+      stored.event.payload.status === "completed" ||
+      stored.event.payload.status === "interrupted" ||
+      stored.event.payload.status === "failed" ||
+      stored.event.payload.status === "cancelled" ||
+      stored.event.payload.status === "rolled_back");
   // Filter run updates before buffering so blocked queue promotion does not retain unrelated tool bodies.
   yield* eventSink
     .stream({ afterSequence: terminalEventsAfterSequence, eventType: "run.updated" })
     .pipe(
-      Stream.filter(
-        (stored) =>
-          stored.event.type === "run.updated" &&
-          (!String(stored.commandId).startsWith("command:runtime-reconcile:") ||
-            (stored.event.payload.delegatedTaskId !== undefined &&
-              stored.event.payload.status === "queued" &&
-              stored.event.payload.queueHeld === true)) &&
-          ((stored.event.payload.delegatedTaskId !== undefined &&
-            (stored.event.payload.status === "queued" ||
-              stored.event.payload.status === "starting" ||
-              stored.event.payload.status === "waiting")) ||
-            stored.event.payload.status === "completed" ||
-            stored.event.payload.status === "interrupted" ||
-            stored.event.payload.status === "failed" ||
-            stored.event.payload.status === "cancelled" ||
-            stored.event.payload.status === "rolled_back"),
-      ),
       Stream.runForEach((stored) =>
-        threadReactions.run(stored.event.threadId, handleRunUpdate(stored)),
+        Effect.gen(function* () {
+          if (!shouldReactToRunUpdate(stored)) {
+            lastConsumedRunUpdateSequence = Math.max(
+              lastConsumedRunUpdateSequence,
+              stored.sequence,
+            );
+            return;
+          }
+          const pendingFailoverAttemptKey =
+            stored.event.type === "run.updated" && stored.event.payload.status === "failed"
+              ? failoverAttemptKey(stored.event.payload)
+              : undefined;
+          if (pendingFailoverAttemptKey !== undefined) {
+            pendingAntigravityFailoverAttempts.set(
+              pendingFailoverAttemptKey,
+              (pendingAntigravityFailoverAttempts.get(pendingFailoverAttemptKey) ?? 0) + 1,
+            );
+          }
+          lastConsumedRunUpdateSequence = Math.max(lastConsumedRunUpdateSequence, stored.sequence);
+          yield* threadReactions.run(
+            stored.event.threadId,
+            handleRunUpdate(stored, pendingFailoverAttemptKey),
+          );
+        }),
       ),
       Effect.forkScoped,
     );
@@ -17201,73 +17368,111 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const { command } = input;
     return yield* threadDispatch.withLock(
       input.parentThreadId,
-      Effect.gen(function* () {
-        const { subagents } = yield* projectionStore
-          .getThreadRecords(input.parentThreadId, ["subagents"], { subagentIds: [input.taskId] })
-          .pipe(mapDispatchError(command));
-        const task = subagents.find(
-          (candidate) =>
-            candidate.id === input.taskId &&
-            candidate.origin === "app_owned" &&
-            candidate.childThreadId === command.threadId &&
-            isOrchestrationV2WorkActive(candidate.status),
-        );
-        const child = yield* projectionStore
-          .getThreadRecords(
+      withPendingStop(
+        command.threadId,
+        Effect.gen(function* () {
+          const { subagents } = yield* projectionStore
+            .getThreadRecords(input.parentThreadId, ["subagents"], { subagentIds: [input.taskId] })
+            .pipe(mapDispatchError(command));
+          const task = subagents.find(
+            (candidate) =>
+              candidate.id === input.taskId &&
+              candidate.origin === "app_owned" &&
+              candidate.childThreadId === command.threadId &&
+              isOrchestrationV2WorkActive(candidate.status),
+          );
+          const runAwaitsFailoverOrContinuation = Effect.fn(
+            "Orchestrator.runAwaitsFailoverOrContinuation",
+          )(function* (runs: ReadonlyArray<OrchestrationV2Run>, targetRun: OrchestrationV2Run) {
+            if (
+              yield* childAwaitsRestartContinuation(runs, targetRun).pipe(mapDispatchError(command))
+            ) {
+              return true;
+            }
+            return yield* runAwaitsAntigravityFailover(command.threadId, targetRun, {
+              ignorePendingStop: true,
+            });
+          });
+          yield* threadDispatch.withLock(
             command.threadId,
-            ["runs", "messages", "subagents", "providerThreads"],
-            { messageRoles: ["user"] },
-          )
-          .pipe(mapDispatchError(command));
-        const followUpRun = child.runs
-          .filter((run) => run.delegatedTaskId === input.taskId)
-          .toSorted((a, b) => b.ordinal - a.ordinal)[0];
-        const unsettled =
-          followUpRun === undefined
-            ? child.thread.forkedFrom?.type === "node" &&
-              child.thread.forkedFrom.nodeId === input.taskId &&
-              progressAfterTurn(child).state !== "result_available"
-            : delegatedTaskTerminalStatus(runOutcome(followUpRun)) === null ||
-              delegatedTaskAwaitsWork(delegatedTaskRuns(child, input.taskId), child);
-        yield* threadDispatch.withLock(
-          command.threadId,
-          Effect.gen(function* () {
-            // Hold intake closed until descendants stop and this thread's Stop commits.
-            yield* input.stopDescendants((command) =>
-              commandThreadId(command) === input.command.threadId
-                ? dispatchWithReceiptEffect(command)
-                : dispatchWithReceipt(command),
-            );
-            const child = yield* projectionStore
-              .getThreadRecords(
-                command.threadId,
-                ["runs", "messages", "subagents", "providerThreads"],
-                { messageRoles: ["user"] },
-              )
-              .pipe(mapDispatchError(command));
-            const followUpRun = child.runs
-              .filter((run) => run.delegatedTaskId === input.taskId)
-              .toSorted((a, b) => b.ordinal - a.ordinal)[0];
-            const monitorRunIds = new Set(
-              child.messages
-                .filter((message) => message.notification?.source.kind === "monitor")
-                .map((message) => message.runId),
-            );
-            const activeRun = child.runs
-              .filter((run) => isLiveRun(run) && !monitorRunIds.has(run.id))
-              .toSorted((a, b) => b.ordinal - a.ordinal)[0];
-            const cancelledRun = followUpRun ?? activeRun ?? progressAfterTurn(child).resultRun;
-            const now = yield* DateTime.now;
-            const cancelledTask =
-              task !== undefined && unsettled && cancelledRun !== undefined
-                ? { ...task, cancelledRunId: cancelledRun.id, updatedAt: now }
-                : undefined;
-            // The marker, Stop receipt and interrupt outbox commit together under both locks.
-            yield* dispatchWithReceiptEffect(command, [], cancelledTask);
-          }),
-        );
-        yield* finalizeAppOwnedSubagent(command.threadId).pipe(mapDispatchError(command));
-      }),
+            Effect.gen(function* () {
+              const childBeforeStop = yield* projectionStore
+                .getThreadRecords(
+                  command.threadId,
+                  ["runs", "messages", "subagents", "providerThreads"],
+                  { messageRoles: ["user"] },
+                )
+                .pipe(mapDispatchError(command));
+              const followUpRunBeforeStop = childBeforeStop.runs
+                .filter((run) => run.delegatedTaskId === input.taskId)
+                .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+              const progressBeforeStop =
+                followUpRunBeforeStop === undefined
+                  ? progressAfterTurn(childBeforeStop)
+                  : undefined;
+              const followUpTaskRunsBeforeStop =
+                followUpRunBeforeStop === undefined
+                  ? undefined
+                  : delegatedTaskRuns(childBeforeStop, input.taskId);
+              const followUpResultRunBeforeStop =
+                followUpTaskRunsBeforeStop === undefined
+                  ? undefined
+                  : (delegatedTaskResultRun(followUpTaskRunsBeforeStop) ?? followUpRunBeforeStop);
+              const unsettled =
+                followUpRunBeforeStop === undefined
+                  ? childBeforeStop.thread.forkedFrom?.type === "node" &&
+                    childBeforeStop.thread.forkedFrom.nodeId === input.taskId &&
+                    (progressBeforeStop!.state !== "result_available" ||
+                      (progressBeforeStop!.resultRun !== undefined &&
+                        (yield* runAwaitsFailoverOrContinuation(
+                          childBeforeStop.runs,
+                          progressBeforeStop!.resultRun,
+                        ))))
+                  : delegatedTaskTerminalStatus(runOutcome(followUpRunBeforeStop)) === null ||
+                    delegatedTaskAwaitsWork(followUpTaskRunsBeforeStop!, childBeforeStop) ||
+                    (followUpResultRunBeforeStop !== undefined &&
+                      (yield* runAwaitsFailoverOrContinuation(
+                        followUpTaskRunsBeforeStop!,
+                        followUpResultRunBeforeStop,
+                      )));
+              // Hold intake closed until descendants stop and this thread's Stop commits.
+              yield* input.stopDescendants((command) =>
+                commandThreadId(command) === input.command.threadId
+                  ? dispatchWithReceiptEffect(command)
+                  : dispatchWithReceipt(command),
+              );
+              const child = yield* projectionStore
+                .getThreadRecords(
+                  command.threadId,
+                  ["runs", "messages", "subagents", "providerThreads"],
+                  { messageRoles: ["user"] },
+                )
+                .pipe(mapDispatchError(command));
+              const followUpRun = child.runs
+                .filter((run) => run.delegatedTaskId === input.taskId)
+                .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+              const monitorRunIds = new Set(
+                child.messages
+                  .filter((message) => message.notification?.source.kind === "monitor")
+                  .map((message) => message.runId),
+              );
+              const activeRun = child.runs
+                .filter((run) => isLiveRun(run) && !monitorRunIds.has(run.id))
+                .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+              const cancelledRun = followUpRun ?? activeRun ?? progressAfterTurn(child).resultRun;
+              const now = yield* DateTime.now;
+              const cancelledTask =
+                task !== undefined && unsettled && cancelledRun !== undefined
+                  ? { ...task, cancelledRunId: cancelledRun.id, updatedAt: now }
+                  : undefined;
+              // The marker, Stop receipt and interrupt outbox commit together under both locks.
+              yield* dispatchWithReceiptEffect(command, [], cancelledTask);
+            }),
+          );
+          yield* finalizeAppOwnedSubagent(command.threadId).pipe(mapDispatchError(command));
+        }),
+        { holdQueue: true },
+      ),
     );
   });
 
@@ -17292,16 +17497,54 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ),
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function* (run) {
       yield* effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
-      const waiter = antigravityFailoverWaiters.get(failoverAttemptKey(run));
-      if (waiter !== undefined) {
-        yield* Deferred.await(waiter).pipe(Effect.timeoutOption("10 seconds"), Effect.ignore);
+      const awaitsFailover = yield* runAwaitsAntigravityFailover(run.threadId, run).pipe(
+        Effect.orElseSucceed(() => false),
+      );
+      if (!awaitsFailover) {
+        return;
       }
+      const key = failoverAttemptKey(run);
+      const waiter = yield* Deferred.make<void>();
+      yield* Effect.acquireUseRelease(
+        Effect.sync(() => {
+          let waiters = antigravityFailoverWaiters.get(key);
+          if (waiters === undefined) {
+            waiters = new Set();
+            antigravityFailoverWaiters.set(key, waiters);
+          }
+          waiters.add(waiter);
+        }),
+        () =>
+          Effect.gen(function* () {
+            // Re-check after registration so a failover settling concurrently cannot be missed.
+            const stillAwaitsFailover = yield* runAwaitsAntigravityFailover(run.threadId, run).pipe(
+              Effect.orElseSucceed(() => false),
+            );
+            if (!stillAwaitsFailover) {
+              return;
+            }
+            yield* Deferred.await(waiter).pipe(Effect.timeoutOption("10 seconds"));
+          }),
+        () =>
+          Effect.sync(() => {
+            const currentWaiters = antigravityFailoverWaiters.get(key);
+            if (currentWaiters !== undefined) {
+              currentWaiters.delete(waiter);
+              if (currentWaiters.size === 0) {
+                antigravityFailoverWaiters.delete(key);
+              }
+            }
+          }),
+      );
     }),
     dispatch: dispatchWithReceipt,
     autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
       return threadDispatch.withLock(
         input.threadId,
         Effect.gen(function* () {
+          if (pendingStopThreads.has(input.threadId)) {
+            return;
+          }
           const records = yield* projectionStore
             .getThreadRecords(input.threadId, ["runs"])
             .pipe(

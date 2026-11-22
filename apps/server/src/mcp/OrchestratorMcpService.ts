@@ -1854,8 +1854,9 @@ const make = Effect.gen(function* () {
               : childRun,
           )
         : workState === "result_available"
-          ? // A cancelled task's finished turn settles it as interrupted.
-            task.cancelledRunId !== undefined && runStatus === "completed"
+          ? // A cancelled task's finished or failed turn settles it as interrupted.
+            task.cancelledRunId !== undefined &&
+            (runStatus === "completed" || runStatus === "failed")
             ? "interrupted"
             : runStatus
           : runStatus === "queued" || runStatus === "starting"

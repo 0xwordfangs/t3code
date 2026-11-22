@@ -566,6 +566,12 @@ export const layer: Layer.Layer<
           cause: `Run ${runId} is missing its execution projection state.`,
         });
       }
+      if (providerThread.providerInstanceId !== run.providerInstanceId) {
+        return yield* new ProviderTurnStartError({
+          runId,
+          cause: `Run ${runId} targets provider instance ${run.providerInstanceId}, but bound provider thread ${providerThread.id} belongs to ${providerThread.providerInstanceId}.`,
+        });
+      }
       const manualResume =
         run.manualContinuationOfRunId !== undefined && attempt.reason !== "steering_restart";
       const resumeSource = manualResume

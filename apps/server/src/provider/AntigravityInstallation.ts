@@ -495,11 +495,19 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
               ? ChildProcessSpawner.make(
                   Effect.fnUntraced(function* (command) {
                     const child = yield* spawner.spawn(command);
-                    // Stop PyInstaller's tree before ACP closes pipes; after launcher exit, taskkill cannot reach children holding DLLs open.
-                    yield* Scope.addFinalizer(
-                      validationScope,
-                      child.kill({ forceKillAfter: "1 second" }).pipe(Effect.orDie),
-                    );
+                    // Do not kill `taskkill` spawned by AcpSessionRuntime's own closing finalizer.
+                    if (
+                      !(
+                        ChildProcess.isStandardCommand(command) &&
+                        command.command.toLowerCase() === "taskkill"
+                      )
+                    ) {
+                      // Stop PyInstaller's tree before ACP closes pipes; after launcher exit, taskkill cannot reach children holding DLLs open.
+                      yield* Scope.addFinalizer(
+                        validationScope,
+                        child.kill({ forceKillAfter: "1 second" }).pipe(Effect.orDie),
+                      );
+                    }
                     return child;
                   }),
                 )

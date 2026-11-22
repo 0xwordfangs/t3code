@@ -672,9 +672,18 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
       Effect.gen(function* () {
         const realSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
         // Google's linux-arm64 build aborts like this on Asahi and Raspberry Pi 5 kernels.
+        const unwrapCgroupCommand = (command: ChildProcess.Command): string | undefined => {
+          if (!ChildProcess.isStandardCommand(command)) return undefined;
+          const args = command.args.map(String);
+          return command.command === "/bin/sh" &&
+            args[0] === "-c" &&
+            args[2] === "t3-acp-cgroup-wrapper" &&
+            args[5] !== undefined
+            ? args[5]
+            : String(command.command);
+        };
         const spawner = ChildProcessSpawner.make((command) =>
-          ChildProcess.isStandardCommand(command) &&
-          String(command.command).endsWith(executableName)
+          unwrapCgroupCommand(command)?.endsWith(executableName)
             ? realSpawner.spawn(
                 ChildProcess.make(
                   "sh",

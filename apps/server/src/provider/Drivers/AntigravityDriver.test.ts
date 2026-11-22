@@ -196,9 +196,17 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
         const value = environment[name];
         return Redacted.isRedacted(value) ? Redacted.value(value) : value;
       };
+      const rawArgs = command.args.map(String);
+      const unwrapped =
+        command.command === "/bin/sh" &&
+        rawArgs[0] === "-c" &&
+        rawArgs[2] === "t3-acp-cgroup-wrapper" &&
+        rawArgs[5] !== undefined
+          ? { command: rawArgs[5], args: rawArgs.slice(6) }
+          : { command: command.command, args: rawArgs };
       launches.push({
-        command: command.command,
-        args: command.args.map(String),
+        command: unwrapped.command,
+        args: unwrapped.args,
         cwd: command.options.cwd,
         extendEnv: command.options.extendEnv,
         environment: Object.fromEntries(Object.keys(environment).map((name) => [name, env(name)])),
