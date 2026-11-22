@@ -24,6 +24,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -957,6 +958,202 @@ describe("AcpAdapterV2 shouldCloseRuntimeOnStop (CF-13)", () => {
         if (turn1Terminals[0]?.type === "turn.terminal") {
           assert.equal(turn1Terminals[0].status, "interrupted");
         }
+      }).pipe(Effect.provide(layerTest)),
+  );
+});
+
+describe("AcpAdapterV2 bounded wakeBuffer (CF-16)", () => {
+  const drainTurnEvents = Effect.fnUntraced(function* (
+    events: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event>,
+  ) {
+    const collected: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+    while (true) {
+      const event = yield* Queue.take(events);
+      collected.push(event);
+      if (event.type === "turn.terminal") {
+        return collected;
+      }
+    }
+  });
+
+  it.effect(
+    "bounds 2,000 post-settle thought chunks, keeps hasPendingBackgroundWork false without offers, and replays coalesced reasoning with a later offering message",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "cf16-thought-flood",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+        });
+        yield* harness.settleTurn1;
+        assert.isDefined(harness.session.hasPendingBackgroundWork);
+
+        for (let index = 0; index < 2_000; index += 1) {
+          const text = `${String(index).padStart(4, "0")}:${"t".repeat(1_019)}`;
+          yield* harness.emitUpdate({
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text },
+          });
+        }
+
+        assert.isTrue(Option.isNone(yield* Queue.poll(harness.continuationOffered)));
+        assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "FINAL_OFFER_AFTER_FLOOD" },
+        });
+
+        assert.isTrue(yield* harness.session.hasPendingBackgroundWork!);
+        const offered = yield* Queue.take(harness.continuationOffered);
+        yield* offered.dispatchIfCurrent!(Effect.void);
+        yield* harness.session.startTurn(harness.makeTurn(2, { continuation: true }));
+        yield* TestClock.adjust("3 seconds");
+
+        const turn2Events = yield* drainTurnEvents(harness.events);
+        const reasoningUpdates = turn2Events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "reasoning"
+            ? [event.turnItem]
+            : [],
+        );
+        const assistantUpdates = turn2Events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+            ? [event.turnItem]
+            : [],
+        );
+
+        assert.isAbove(reasoningUpdates.length, 0);
+        const firstReasoning = reasoningUpdates[0]!;
+        const finalReasoning = reasoningUpdates[reasoningUpdates.length - 1]!;
+        assert.isAbove(firstReasoning.text.length, 1_024);
+        assert.isAtMost(firstReasoning.text.length, 65_536);
+        assert.isBelow(finalReasoning.text.length, 1_048_576);
+        assert.isFalse(finalReasoning.text.includes("0000:"));
+        assert.isTrue(finalReasoning.text.includes("1999:"));
+
+        const finalAssistant = assistantUpdates[assistantUpdates.length - 1];
+        assert.equal(finalAssistant?.text, "FINAL_OFFER_AFTER_FLOOD");
+        assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "preserves offering tool calls and assistant messages under non-offering thought floods and enforces the 256-entry cap",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "cf16-offering-preserved",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+        });
+        yield* harness.settleTurn1;
+        assert.isDefined(harness.session.hasPendingBackgroundWork);
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_cf16_offer_tool",
+          title: "Completed background check",
+          kind: "read",
+          status: "completed",
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "OFFER_MUST_SURVIVE" },
+        });
+        const offered = yield* Queue.take(harness.continuationOffered);
+
+        // Distinct messageIds prevent coalescing so the 256-entry bound is also exercised.
+        for (let index = 0; index < 300; index += 1) {
+          yield* harness.emitUpdate({
+            sessionUpdate: "agent_thought_chunk",
+            messageId: `thought-${index}`,
+            content: { type: "text", text: `entry-${index}:${"z".repeat(4_000)}` },
+          });
+        }
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_thought_chunk",
+          messageId: "thought-oversized",
+          content: { type: "text", text: "X".repeat(1_200_000) },
+        });
+
+        assert.isTrue(yield* harness.session.hasPendingBackgroundWork!);
+        yield* offered.dispatchIfCurrent!(Effect.void);
+        yield* harness.session.startTurn(harness.makeTurn(2, { continuation: true }));
+        yield* TestClock.adjust("3 seconds");
+
+        const turn2Events = yield* drainTurnEvents(harness.events);
+        const completedToolItems = turn2Events.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.nativeItemRef?.nativeId === "call_cf16_offer_tool" &&
+          event.turnItem.status === "completed"
+            ? [event.turnItem]
+            : [],
+        );
+        const assistantUpdates = turn2Events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+            ? [event.turnItem]
+            : [],
+        );
+        const completedReasoningItems = turn2Events.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "reasoning" &&
+          event.turnItem.status === "completed"
+            ? [event.turnItem]
+            : [],
+        );
+
+        assert.isAbove(completedToolItems.length, 0);
+        assert.equal(assistantUpdates[assistantUpdates.length - 1]?.text, "OFFER_MUST_SURVIVE");
+        assert.isAtMost(completedReasoningItems.length, 254);
+        assert.isFalse(completedReasoningItems.some((item) => item.text.includes("entry-0:")));
+        assert.isTrue(completedReasoningItems.some((item) => item.text.includes("entry-299:")));
+        assert.isFalse(completedReasoningItems.some((item) => item.text.includes("XXXX")));
+        assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "splits coalesced text chunks at 65,536 chars so continuation replay never truncates",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "cf16-coalesce-cap",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+        });
+        yield* harness.settleTurn1;
+
+        for (let index = 0; index < 100; index += 1) {
+          const prefix = index === 0 ? "START_00" : index === 99 ? "END_99" : "";
+          const text = `${prefix}${"a".repeat(1_000 - prefix.length)}`;
+          yield* harness.emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            messageId: "msg-coalesce",
+            content: { type: "text", text },
+          });
+        }
+
+        const offered = yield* Queue.take(harness.continuationOffered);
+        yield* offered.dispatchIfCurrent!(Effect.void);
+        yield* harness.session.startTurn(harness.makeTurn(2, { continuation: true }));
+        yield* TestClock.adjust("3 seconds");
+
+        const turn2Events = yield* drainTurnEvents(harness.events);
+        const assistantUpdates = turn2Events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+            ? [event.turnItem]
+            : [],
+        );
+
+        assert.isAbove(assistantUpdates.length, 0);
+        assert.equal(assistantUpdates[0]!.text.length, 65_000);
+        const finalAssistant = assistantUpdates[assistantUpdates.length - 1]!;
+        assert.equal(finalAssistant.text.length, 100_000);
+        assert.isTrue(finalAssistant.text.startsWith("START_00"));
+        assert.isTrue(finalAssistant.text.includes("END_99"));
       }).pipe(Effect.provide(layerTest)),
   );
 });

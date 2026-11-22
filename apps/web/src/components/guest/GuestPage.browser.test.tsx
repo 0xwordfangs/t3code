@@ -2,6 +2,7 @@ import {
   EventId,
   GUEST_COMMAND_OUTPUT_ROUTE,
   GUEST_RENDER_ROUTE,
+  GoogleAccountVerificationUrl,
   GuestMessageId,
   GuestShareId,
   GuestStreamEvent,
@@ -103,7 +104,21 @@ const items: ReadonlyArray<OrchestrationV2TurnItem> = [
     input: null,
     output: { htmlRender: { attachmentId: "thread-a-1", title: "Chart", height: 200 } },
   },
-  reply("reply", 3, "All checks pass."),
+  {
+    ...itemBase("verification-error", 3),
+    type: "error",
+    status: "failed",
+    failure: {
+      class: "provider_error",
+      message: "Verify your Google account to continue.",
+      code: "VALIDATION_REQUIRED",
+      retryable: false,
+      verificationUrl: GoogleAccountVerificationUrl.make(
+        "https://accounts.google.com/v3/signin/continue?plt=guest-secret",
+      ),
+    },
+  },
+  reply("reply", 4, "All checks pass."),
 ];
 
 const view: GuestShareView = {
@@ -244,6 +259,11 @@ describe("GuestPage", () => {
       );
     // Guests cannot act on the thread, so no control offers to.
     expect(screen.container.querySelector('[aria-label="Fork from this response"]')).toBeNull();
+    await expect.element(screen.getByText("Verify your Google account to continue.")).toBeVisible();
+    await expect
+      .element(screen.getByRole("link", { name: "Verify account" }))
+      .not.toBeInTheDocument();
+    expect(screen.container.textContent).not.toContain("accounts.google.com");
     expect(socket).not.toHaveBeenCalled();
     // The composer names the thread's model, as the owner's does, with nothing to pick.
     await expect.element(screen.getByLabelText("Model: GPT-5.4")).toBeVisible();

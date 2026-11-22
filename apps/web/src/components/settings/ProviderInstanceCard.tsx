@@ -90,6 +90,15 @@ import {
 
 const ENVIRONMENT_VARIABLE_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
+export function formatVerificationUrlDisplay(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+}
+
 function ProviderStatusDiagnostic({
   detail,
   children,
@@ -861,6 +870,7 @@ export function ProviderInstanceCard({
       : onRunUpdate;
   const urlAuthAction = liveProvider?.auth.action;
   const verificationUrl =
+    !readOnly &&
     enabled &&
     liveProvider?.installed &&
     liveProvider.auth.status !== "unauthenticated" &&
@@ -1316,27 +1326,32 @@ export function ProviderInstanceCard({
         </p>
       ) : null}
       {verificationUrl ? (
-        <div className="flex flex-wrap items-center gap-2 pt-1">
-          <Button
-            render={<a href={verificationUrl} target="_blank" rel="noopener noreferrer" />}
-            size="xs"
-            variant="outline"
-          >
-            <ExternalLinkIcon aria-hidden />
-            <T>Verify account</T>
-          </Button>
-          {onRefreshProviders ? (
+        <div className="grid max-w-xl gap-1.5 pt-1">
+          <code className="break-all text-2xs text-muted-foreground">
+            {formatVerificationUrlDisplay(verificationUrl)}
+          </code>
+          <div className="flex flex-wrap items-center gap-2">
             <Button
-              type="button"
+              render={<a href={verificationUrl} target="_blank" rel="noopener noreferrer" />}
               size="xs"
-              variant="ghost"
-              disabled={isRefreshingProviders}
-              onClick={onRefreshProviders}
+              variant="outline"
             >
-              <RefreshCwIcon aria-hidden />
-              <T>Refresh</T>
+              <ExternalLinkIcon aria-hidden />
+              <T>Verify account</T>
             </Button>
-          ) : null}
+            {onRefreshProviders ? (
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                disabled={isRefreshingProviders}
+                onClick={onRefreshProviders}
+              >
+                <RefreshCwIcon aria-hidden />
+                <T>Refresh</T>
+              </Button>
+            ) : null}
+          </div>
         </div>
       ) : null}
       {urlAuthAction && onAcceptUrlAuth ? (

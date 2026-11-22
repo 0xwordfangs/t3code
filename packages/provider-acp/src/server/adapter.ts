@@ -1741,6 +1741,374 @@ export function acpCompletedTurnShouldTerminalizeTool(
   return flavor.extractSubagentUpdate?.(tool) === undefined;
 }
 
+const MAX_WAKE_BUFFER_ENTRIES = 256;
+const MAX_WAKE_BUFFER_BYTES = 1_048_576;
+// Matches MAX_ACP_CONTENT_TEXT_LENGTH in runtimeModel.ts so replayed coalesced chunks never truncate.
+const MAX_WAKE_BUFFER_COALESCED_TEXT_LENGTH = 65_536;
+
+interface AcpWakeBufferNode {
+  notification: EffectAcpSchema.SessionNotification;
+  bytes: number;
+  readonly offering: boolean;
+  prev: AcpWakeBufferNode | null;
+  next: AcpWakeBufferNode | null;
+  nonOfferingPrev: AcpWakeBufferNode | null;
+  nonOfferingNext: AcpWakeBufferNode | null;
+}
+
+function estimateWakeNotificationBytes(
+  value: unknown,
+  limit: number = MAX_WAKE_BUFFER_BYTES + 1,
+): number {
+  let total = 0;
+  const seen = new WeakSet<object>();
+  const stack: Array<unknown> = [value];
+  while (stack.length > 0 && total < limit) {
+    const current = stack.pop();
+    if (current === null || current === undefined) {
+      total += 4;
+      continue;
+    }
+    switch (typeof current) {
+      case "string": {
+        const remaining = limit - total;
+        total += current.length >= remaining ? remaining : Buffer.byteLength(current, "utf8") + 2;
+        break;
+      }
+      case "number":
+      case "boolean":
+        total += 8;
+        break;
+      case "bigint":
+        total += 16;
+        break;
+      case "object": {
+        if (seen.has(current)) {
+          total += 8;
+          break;
+        }
+        seen.add(current);
+        if (ArrayBuffer.isView(current)) {
+          total += current.byteLength;
+          break;
+        }
+        if (Array.isArray(current)) {
+          total += 16;
+          if (current.length * 4 >= limit - total) {
+            total = limit;
+            break;
+          }
+          for (let index = current.length - 1; index >= 0; index -= 1) {
+            stack.push(current[index]);
+          }
+          break;
+        }
+        total += 16;
+        const record = current as Record<string, unknown>;
+        for (const key in record) {
+          if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+          const remaining = limit - total;
+          if (remaining <= 0) break;
+          total += key.length >= remaining ? remaining : Buffer.byteLength(key, "utf8") + 4;
+          stack.push(record[key]);
+        }
+        break;
+      }
+      default:
+        total += 8;
+        break;
+    }
+  }
+  return total > limit ? limit : total;
+}
+
+function coalesceWakeTextChunks(
+  last: EffectAcpSchema.SessionNotification,
+  incoming: EffectAcpSchema.SessionNotification,
+): {
+  readonly notification: EffectAcpSchema.SessionNotification;
+  readonly addedText: string;
+} | null {
+  if (last.sessionId !== incoming.sessionId) return null;
+  const lastUpdate = last.update;
+  const incomingUpdate = incoming.update;
+  if (
+    (lastUpdate.sessionUpdate !== "agent_message_chunk" &&
+      lastUpdate.sessionUpdate !== "agent_thought_chunk") ||
+    incomingUpdate.sessionUpdate !== lastUpdate.sessionUpdate ||
+    lastUpdate.content.type !== "text" ||
+    incomingUpdate.content.type !== "text" ||
+    (lastUpdate.messageId ?? null) !== (incomingUpdate.messageId ?? null)
+  ) {
+    return null;
+  }
+  if (
+    lastUpdate.content.text.length + incomingUpdate.content.text.length >
+    MAX_WAKE_BUFFER_COALESCED_TEXT_LENGTH
+  ) {
+    return null;
+  }
+  const mergedContent = {
+    ...lastUpdate.content,
+    text: lastUpdate.content.text + incomingUpdate.content.text,
+  };
+  return {
+    addedText: incomingUpdate.content.text,
+    notification: {
+      ...last,
+      update:
+        lastUpdate.sessionUpdate === "agent_message_chunk"
+          ? { ...lastUpdate, content: mergedContent }
+          : { ...lastUpdate, content: mergedContent },
+    },
+  };
+}
+
+interface AcpWakeBuffer {
+  readonly length: number;
+  hasOffering: () => boolean;
+  append: (notification: EffectAcpSchema.SessionNotification, offering?: boolean) => boolean;
+  clear: () => void;
+  notifications: () => Array<EffectAcpSchema.SessionNotification>;
+  take: (sessionId: string) => Array<EffectAcpSchema.SessionNotification>;
+}
+
+function makeAcpWakeBuffer(
+  flavor: Pick<
+    AcpAdapterV2Flavor,
+    | "extractBackgroundToolMutation"
+    | "normalizeToolCall"
+    | "offerPostSettleContinuationOnActiveTool"
+  >,
+): AcpWakeBuffer {
+  let head: AcpWakeBufferNode | null = null;
+  let tail: AcpWakeBufferNode | null = null;
+  let nonOfferingHead: AcpWakeBufferNode | null = null;
+  let nonOfferingTail: AcpWakeBufferNode | null = null;
+  let count = 0;
+  let totalBytes = 0;
+  let offeringCount = 0;
+  let offeringBytes = 0;
+
+  const pushNode = (node: AcpWakeBufferNode) => {
+    node.prev = tail;
+    node.next = null;
+    if (tail !== null) {
+      tail.next = node;
+    } else {
+      head = node;
+    }
+    tail = node;
+    if (!node.offering) {
+      node.nonOfferingPrev = nonOfferingTail;
+      node.nonOfferingNext = null;
+      if (nonOfferingTail !== null) {
+        nonOfferingTail.nonOfferingNext = node;
+      } else {
+        nonOfferingHead = node;
+      }
+      nonOfferingTail = node;
+    } else {
+      offeringCount += 1;
+      offeringBytes += node.bytes;
+    }
+    count += 1;
+    totalBytes += node.bytes;
+  };
+
+  const removeNode = (node: AcpWakeBufferNode) => {
+    if (node.prev !== null) {
+      node.prev.next = node.next;
+    } else {
+      head = node.next;
+    }
+    if (node.next !== null) {
+      node.next.prev = node.prev;
+    } else {
+      tail = node.prev;
+    }
+    node.prev = null;
+    node.next = null;
+    if (!node.offering) {
+      if (node.nonOfferingPrev !== null) {
+        node.nonOfferingPrev.nonOfferingNext = node.nonOfferingNext;
+      } else {
+        nonOfferingHead = node.nonOfferingNext;
+      }
+      if (node.nonOfferingNext !== null) {
+        node.nonOfferingNext.nonOfferingPrev = node.nonOfferingPrev;
+      } else {
+        nonOfferingTail = node.nonOfferingPrev;
+      }
+      node.nonOfferingPrev = null;
+      node.nonOfferingNext = null;
+    } else {
+      offeringCount -= 1;
+      offeringBytes -= node.bytes;
+    }
+    count -= 1;
+    totalBytes -= node.bytes;
+  };
+
+  const clear = () => {
+    head = null;
+    tail = null;
+    nonOfferingHead = null;
+    nonOfferingTail = null;
+    count = 0;
+    totalBytes = 0;
+    offeringCount = 0;
+    offeringBytes = 0;
+  };
+
+  const append = (
+    notification: EffectAcpSchema.SessionNotification,
+    precomputedOffering?: boolean,
+  ): boolean => {
+    const offering =
+      precomputedOffering ?? acpPostSettleContinuationOfferEvidence(notification, flavor);
+
+    if (tail !== null && tail.offering === offering) {
+      const coalesced = coalesceWakeTextChunks(tail.notification, notification);
+      if (coalesced !== null) {
+        const extraBytes = Buffer.byteLength(coalesced.addedText, "utf8");
+        const canFitCoalesced = offering
+          ? tail.bytes + extraBytes <= MAX_WAKE_BUFFER_BYTES
+          : offeringBytes + tail.bytes + extraBytes <= MAX_WAKE_BUFFER_BYTES;
+        if (canFitCoalesced) {
+          for (;;) {
+            if (
+              totalBytes + extraBytes <= MAX_WAKE_BUFFER_BYTES ||
+              nonOfferingHead === null ||
+              nonOfferingHead === tail
+            ) {
+              break;
+            }
+            removeNode(nonOfferingHead);
+          }
+          if (offering) {
+            for (;;) {
+              if (
+                totalBytes + extraBytes <= MAX_WAKE_BUFFER_BYTES ||
+                head === null ||
+                head === tail
+              ) {
+                break;
+              }
+              removeNode(head);
+            }
+          }
+          tail.notification = coalesced.notification;
+          tail.bytes += extraBytes;
+          totalBytes += extraBytes;
+          if (tail.offering) {
+            offeringBytes += extraBytes;
+          }
+          return true;
+        }
+      }
+    }
+
+    const bytes = estimateWakeNotificationBytes(notification);
+    if (!offering) {
+      if (
+        offeringCount >= MAX_WAKE_BUFFER_ENTRIES ||
+        offeringBytes + bytes > MAX_WAKE_BUFFER_BYTES
+      ) {
+        return false;
+      }
+      for (;;) {
+        if (
+          (count < MAX_WAKE_BUFFER_ENTRIES && totalBytes + bytes <= MAX_WAKE_BUFFER_BYTES) ||
+          nonOfferingHead === null
+        ) {
+          break;
+        }
+        removeNode(nonOfferingHead);
+      }
+      pushNode({
+        notification,
+        bytes,
+        offering: false,
+        prev: null,
+        next: null,
+        nonOfferingPrev: null,
+        nonOfferingNext: null,
+      });
+      return true;
+    }
+
+    if (bytes > MAX_WAKE_BUFFER_BYTES) {
+      clear();
+      pushNode({
+        notification,
+        bytes,
+        offering: true,
+        prev: null,
+        next: null,
+        nonOfferingPrev: null,
+        nonOfferingNext: null,
+      });
+      return true;
+    }
+
+    for (;;) {
+      if (
+        (count < MAX_WAKE_BUFFER_ENTRIES && totalBytes + bytes <= MAX_WAKE_BUFFER_BYTES) ||
+        nonOfferingHead === null
+      ) {
+        break;
+      }
+      removeNode(nonOfferingHead);
+    }
+    for (;;) {
+      if (
+        (count < MAX_WAKE_BUFFER_ENTRIES && totalBytes + bytes <= MAX_WAKE_BUFFER_BYTES) ||
+        head === null
+      ) {
+        break;
+      }
+      removeNode(head);
+    }
+    pushNode({
+      notification,
+      bytes,
+      offering: true,
+      prev: null,
+      next: null,
+      nonOfferingPrev: null,
+      nonOfferingNext: null,
+    });
+    return true;
+  };
+
+  return {
+    get length() {
+      return count;
+    },
+    hasOffering: () => offeringCount > 0,
+    append,
+    clear,
+    notifications: () => {
+      const result: Array<EffectAcpSchema.SessionNotification> = [];
+      for (let node = head; node !== null; node = node.next) {
+        result.push(node.notification);
+      }
+      return result;
+    },
+    take: (sessionId) => {
+      const drained: Array<EffectAcpSchema.SessionNotification> = [];
+      for (let node = head; node !== null; node = node.next) {
+        if (node.notification.sessionId === sessionId) {
+          drained.push(node.notification);
+        }
+      }
+      clear();
+      return drained;
+    },
+  };
+}
+
 interface ActiveAcpSubagent {
   task: OrchestrationV2Subagent;
   readonly childThreadId: ThreadId;
@@ -2422,7 +2790,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           readonly threadId: ThreadId;
           readonly providerThreadId: ProviderThreadId;
         } | null>(null);
-        const wakeBuffer = yield* Ref.make<Array<EffectAcpSchema.SessionNotification>>([]);
+        const wakeBuffer = makeAcpWakeBuffer(flavor);
         const noWakeReports = {
           reports: new Map<string, BackgroundWorkReport>(),
           offered: new Set<string>(),
@@ -2604,7 +2972,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 yield* continuationPermit.withPermit(
                   Effect.gen(function* () {
                     yield* Ref.update(continuationGeneration, (value) => value + 1);
-                    yield* Ref.set(wakeBuffer, []);
+                    wakeBuffer.clear();
                     yield* Ref.set(wakeReports, noWakeReports);
                     yield* Ref.set(continuationRequested, false);
                   }),
@@ -2643,7 +3011,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 yield* publishNativeChildStatus(child, "failed");
               }
               agentRequests.clear();
-              yield* Ref.set(wakeBuffer, []);
+              wakeBuffer.clear();
               yield* Ref.set(continuationRequested, false);
               yield* cancelPendingRuntimeRequests();
               const context = yield* Ref.get(activeTurn);
@@ -5253,9 +5621,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             (yield* Ref.get(activeSessionId)) === sessionId &&
             (flavor.allowPostSettleWakeWhileBackgroundWorkRuns === true ||
               (yield* Ref.get(runningBackgroundTaskIds)).size === 0) &&
-            (yield* Ref.get(wakeBuffer)).some((notification) =>
-              acpPostSettleContinuationOfferEvidence(notification, flavor),
-            )
+            wakeBuffer.hasOffering()
           ) {
             yield* offerContinuationRun(sessionId);
           }
@@ -5412,16 +5778,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             (update.sessionUpdate === "agent_message_chunk" ||
               update.sessionUpdate === "agent_thought_chunk");
           // Grok re-prompts for each post-settle monitor event; retaining them would replay the whole burst.
+          const isOffering = acpPostSettleContinuationOfferEvidence(notification, flavor);
           let buffered = false;
           if (
             !alreadyHandledToolUpdate &&
             !isInTurnHandledAgentChatter &&
             acpPostSettleWakeShouldBuffer(notification, backgroundWorkBlocksWake)
           ) {
-            yield* Ref.update(wakeBuffer, (current) => [...current, notification]);
-            buffered = true;
+            buffered = wakeBuffer.append(notification, isOffering);
           }
-          if (!acpPostSettleContinuationOfferEvidence(notification, flavor)) {
+          if (!isOffering) {
             return {
               buffered,
               offerContinuation: false,
@@ -5437,7 +5803,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }
           if (alreadyHandledToolUpdate) {
             if (!(yield* Ref.get(continuationRequested))) {
-              yield* Ref.set(wakeBuffer, []);
+              wakeBuffer.clear();
             }
             return {
               buffered,
@@ -5776,7 +6142,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 update.sessionUpdate === "user_message_chunk" ||
                 (update.sessionUpdate === "state_update" && update.state === "running"))
             ) {
-              yield* Ref.update(wakeBuffer, (current) => [...current, notification]);
+              wakeBuffer.append(notification);
               yield* offerContinuationRun(notification.sessionId);
               return;
             }
@@ -5893,7 +6259,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               if (
                 acpCarryoverTerminalShouldClearContinuation({
                   continuationOffered: wakeOutcome.continuationOffered,
-                  wakeBufferLength: (yield* Ref.get(wakeBuffer)).length,
+                  wakeBufferLength: wakeBuffer.length,
                 })
               ) {
                 yield* Ref.set(continuationRequested, false);
@@ -6063,7 +6429,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             flavor.isProviderWakeNotification?.(notification) === true
           ) {
             if (hasDeferredBackgroundWork(context)) {
-              yield* Ref.update(wakeBuffer, (current) => [...current, notification]);
+              wakeBuffer.append(notification);
               return;
             }
             yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
@@ -7389,7 +7755,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         ? rawContext !== null
                           ? rawContext.tools.get(nativeParams.toolCall.toolCallId)
                           : postSettleContinuationEnabled
-                            ? bufferedToolFor(yield* Ref.get(wakeBuffer))
+                            ? bufferedToolFor(wakeBuffer.notifications())
                             : undefined
                         : undefined;
                     const effectiveParams =
@@ -8088,7 +8454,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               Effect.gen(function* () {
                 yield* Ref.update(continuationGeneration, (value) => value + 1);
                 yield* Ref.set(stoppedRunQuarantine, false);
-                yield* Ref.set(wakeBuffer, []);
+                wakeBuffer.clear();
                 yield* Ref.set(wakeReports, noWakeReports);
                 yield* Ref.set(continuationRequested, false);
                 yield* Ref.set(runningBackgroundTaskIds, new Set());
@@ -8602,7 +8968,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             Effect.gen(function* () {
               yield* Ref.update(continuationGeneration, (value) => value + 1);
               yield* Ref.set(stoppedRunQuarantine, true);
-              yield* Ref.set(wakeBuffer, []);
+              wakeBuffer.clear();
               yield* Ref.set(wakeReports, noWakeReports);
               yield* Ref.set(continuationRequested, false);
               yield* Ref.set(runningBackgroundTaskIds, new Set());
@@ -8831,9 +9197,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             !stopQuarantinedNow &&
             (flavor.allowPostSettleWakeWhileBackgroundWorkRuns === true ||
               (yield* Ref.get(runningBackgroundTaskIds)).size === 0) &&
-            (yield* Ref.get(wakeBuffer)).some((notification) =>
-              acpPostSettleContinuationOfferEvidence(notification, flavor),
-            )
+            wakeBuffer.hasOffering()
           ) {
             const sessionId = yield* Ref.get(activeSessionId);
             if (sessionId !== null) {
@@ -8927,7 +9291,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               yield* continuationPermit.withPermit(
                 Effect.gen(function* () {
                   yield* Ref.update(continuationGeneration, (value) => value + 1);
-                  yield* Ref.set(wakeBuffer, []);
+                  wakeBuffer.clear();
                   yield* Ref.set(wakeReports, noWakeReports);
                   yield* Ref.set(continuationRequested, false);
                 }),
@@ -9245,10 +9609,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 const preserveBufferedContinuation = acpTurnStartShouldPreserveContinuation({
                   continuationRequested: wasRequested,
                   isContinuationTurn,
-                  wakeBufferLength: (yield* Ref.get(wakeBuffer)).length,
+                  wakeBufferLength: wakeBuffer.length,
                 });
                 if (!isContinuationTurn && !isAppOwnedWakeTurn && !preserveBufferedContinuation) {
-                  yield* Ref.set(wakeBuffer, []);
+                  wakeBuffer.clear();
                   yield* Ref.set(wakeReports, noWakeReports);
                 }
                 if (preserveBufferedContinuation) return wasRequested;
@@ -9428,13 +9792,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 reports: new Map([...reports].filter(([key]) => !offered.has(key))),
                 offered: noWakeReports.offered,
               }));
-              const takeWakeBuffer = Ref.modify(wakeBuffer, (current) => {
-                const next: Array<EffectAcpSchema.SessionNotification> = [];
-                return [
-                  current.filter((notification) => notification.sessionId === requestedSessionId),
-                  next,
-                ] as const;
-              });
+              const takeWakeBuffer = Effect.sync(() => wakeBuffer.take(requestedSessionId));
               if (followsAgentWorkState) {
                 yield* runtimeCallbackPermit.withPermit(
                   Effect.gen(function* () {
@@ -9822,7 +10180,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     (agentWork?.state === "running" || agentWork?.state === "requires_action")
                   )
                     return true;
-                  if ((yield* Ref.get(wakeBuffer)).length > 0) return true;
+                  if ((followsAgentWorkState && wakeBuffer.length > 0) || wakeBuffer.hasOffering())
+                    return true;
                   if ((yield* Ref.get(midTurnUnreportedCompletedTaskIds)).size > 0) return true;
                   if (yield* Ref.get(continuationRequested)) return true;
                   if ((yield* Ref.get(runningBackgroundTaskIds)).size > 0) return true;

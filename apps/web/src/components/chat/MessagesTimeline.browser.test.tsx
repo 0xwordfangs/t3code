@@ -4,8 +4,10 @@ import { flushSync } from "react-dom";
 import { AudioPreview } from "../files/AudioPreview";
 import { cdp, page, userEvent } from "vite-plus/test/browser";
 import {
+  AuthProvidersManageScope,
   ComposerContextId,
   EnvironmentId,
+  GoogleAccountVerificationUrl,
   MessageId,
   NodeId,
   ProviderDriverKind,
@@ -92,6 +94,20 @@ vi.mock(import("~/assets/assetUrls"), async (original) => {
       stubbedAsset.url
         ? args[1].map(() => stubbedAsset.url)
         : actual.useAssetUrls(...args)) as typeof actual.useAssetUrls,
+  };
+});
+
+const sessionScopeState = vi.hoisted(() => ({
+  grantedScopes: null as ReadonlySet<string> | null,
+}));
+vi.mock(import("~/state/session"), async (original) => {
+  const actual = await original();
+  return {
+    ...actual,
+    useEnvironmentScope: (environmentId, scope) =>
+      sessionScopeState.grantedScopes === null
+        ? actual.useEnvironmentScope(environmentId, scope)
+        : environmentId !== null && sessionScopeState.grantedScopes.has(scope),
   };
 });
 
@@ -225,6 +241,7 @@ async function click(element: HTMLElement) {
 function setup({ scheduledTasks = [] as ReadonlyArray<{ id: string; title: string }> } = {}) {
   environmentQuery.error = "Pull request not found";
   environmentQuery.data = { tasks: scheduledTasks };
+  sessionScopeState.grantedScopes = null;
 }
 
 const TASK_ID = ScheduledTaskId.make("task-1");
@@ -1216,6 +1233,84 @@ describe("MessagesTimeline usage limit notice", () => {
     } finally {
       await session.send("Emulation.setTimezoneOverride", { timezoneId: "" });
     }
+  });
+});
+
+function verificationFailureEntries(verificationUrl: GoogleAccountVerificationUrl) {
+  const threadId = ThreadId.make("verification-thread");
+  const at = DateTime.makeUnsafe(CREATED_AT);
+  return deriveTimelineEntriesFromVisibleTurnItems({
+    visibleTurnItems: [
+      {
+        position: 0,
+        visibility: "local",
+        sourceThreadId: threadId,
+        sourceItemId: TurnItemId.make("verification-error"),
+        item: {
+          id: TurnItemId.make("verification-error"),
+          threadId,
+          runId: RunId.make("verification-run"),
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          title: null,
+          startedAt: at,
+          completedAt: at,
+          updatedAt: at,
+          type: "error",
+          status: "failed",
+          failure: {
+            class: "provider_error",
+            message: "Verify your Google account to continue.",
+            code: "VALIDATION_REQUIRED",
+            retryable: false,
+            verificationUrl,
+          },
+        },
+      },
+    ],
+    optimisticMessages: [],
+  });
+}
+
+describe("MessagesTimeline verification action", () => {
+  const verificationUrl = GoogleAccountVerificationUrl.make(
+    "https://accounts.google.com/v3/signin/continue?plt=chat-secret",
+  );
+
+  it("shows the compact URL destination only when providers:manage is granted", async () => {
+    setup();
+    using _resetScopes = {
+      [Symbol.dispose]: () => {
+        sessionScopeState.grantedScopes = null;
+      },
+    };
+    const entries = verificationFailureEntries(verificationUrl);
+
+    sessionScopeState.grantedScopes = new Set();
+    {
+      await using denied = await renderTimeline(entries);
+      await expect
+        .element(denied.getByText("Verify your Google account to continue."))
+        .toBeVisible();
+      await expect
+        .element(denied.getByRole("link", { name: "Verify account" }))
+        .not.toBeInTheDocument();
+      expect(denied.text()).not.toContain("accounts.google.com");
+    }
+
+    sessionScopeState.grantedScopes = new Set([AuthProvidersManageScope]);
+    await using allowed = await renderTimeline(entries);
+    await expect
+      .element(allowed.getByText("https://accounts.google.com/v3/signin/continue"))
+      .toBeVisible();
+    expect(allowed.text()).not.toContain("plt=chat-secret");
+    await expect
+      .element(allowed.getByRole("link", { name: "Verify account" }))
+      .toHaveAttribute("href", verificationUrl);
   });
 });
 

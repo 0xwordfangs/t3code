@@ -53,6 +53,9 @@ import { buildBoundedThreadStreamSnapshot } from "../orchestration-v2/ThreadStre
 import {
   projectTurnItemForDetail,
   projectTurnItemForWire,
+  stripThreadHistoryPageVerificationUrls,
+  stripThreadStreamItemVerificationUrl,
+  stripTurnItemVerificationUrl,
   threadStreamEventItem,
 } from "../orchestration-v2/WireProjection.ts";
 import * as DocumentText from "../provider/DocumentText.ts";
@@ -562,6 +565,7 @@ const make = Effect.gen(function* () {
         // Ending the source here flushes what the coalescer holds, so `ended` is not held back.
         Stream.takeUntil((item) => endsShare(item.event)),
         coalesceThreadLiveStream,
+        Stream.map(stripThreadStreamItemVerificationUrl),
         Stream.map((item): ReadonlyArray<GuestStreamEvent> => {
           if (item.kind !== "event") return [];
           if (endsShare(item.event)) return [ended];
@@ -583,10 +587,12 @@ const make = Effect.gen(function* () {
     const untilExpiry = Effect.sleep(
       Math.max(0, Date.parse(share.expiresAt) - DateTime.toEpochMillis(yield* DateTime.now)),
     );
-    const openingSnapshot = buildBoundedThreadStreamSnapshot({
-      snapshotSequence: snapshot.snapshotSequence,
-      projection: snapshot.projection,
-    });
+    const openingSnapshot = stripThreadStreamItemVerificationUrl(
+      buildBoundedThreadStreamSnapshot({
+        snapshotSequence: snapshot.snapshotSequence,
+        projection: snapshot.projection,
+      }),
+    );
     const opening: ReadonlyArray<GuestStreamEvent> = [
       { type: "view", view: initialView },
       { type: "thread", item: openingSnapshot },
@@ -670,8 +676,9 @@ const make = Effect.gen(function* () {
   const item = Effect.fn("GuestShareService.item")(function* (session: string, itemId: string) {
     const { item } = yield* threadItem(session, itemId);
     return {
-      item:
+      item: stripTurnItemVerificationUrl(
         item.type === "file_change" ? projectTurnItemForWire(item) : projectTurnItemForDetail(item),
+      ),
     };
   });
 
@@ -687,7 +694,7 @@ const make = Effect.gen(function* () {
       share.id,
       page.items.map((row) => row.item),
     );
-    return page;
+    return stripThreadHistoryPageVerificationUrls(page);
   });
 
   const commandOutput = Effect.fn("GuestShareService.commandOutput")(function* (

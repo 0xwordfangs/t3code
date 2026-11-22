@@ -5,11 +5,16 @@ import type {
   OrchestrationV2Checkpoint,
   OrchestrationV2DomainEvent,
   OrchestrationV2ContextHandoff,
+  OrchestrationV2ProjectedTurnItem,
+  OrchestrationV2ProviderFailure,
   OrchestrationV2StoredEvent,
   OrchestrationV2Subagent,
+  OrchestrationV2ThreadHistoryPage,
   OrchestrationV2ThreadProjection,
   OrchestrationV2ThreadStreamItem,
+  OrchestrationV2ThreadTranscript,
   OrchestrationV2TurnItem,
+  OrchestrationV2TurnItemJson,
 } from "@t3tools/contracts";
 import {
   dedupeSubagentBodies,
@@ -430,4 +435,122 @@ export function makeLiveBodyDeduper(): (
         return item;
     }
   };
+}
+
+type ThreadStreamSnapshot = Extract<OrchestrationV2ThreadStreamItem, { readonly kind: "snapshot" }>;
+type VerificationUrlTurnItem = OrchestrationV2TurnItem | OrchestrationV2TurnItemJson;
+type ProjectedVerificationUrlTurnItem =
+  | OrchestrationV2ProjectedTurnItem
+  | { readonly item: OrchestrationV2TurnItemJson };
+
+function stripProviderFailureVerificationUrl(
+  failure: OrchestrationV2ProviderFailure,
+): OrchestrationV2ProviderFailure {
+  if (failure.verificationUrl === undefined) return failure;
+  const { verificationUrl: _verificationUrl, ...rest } = failure;
+  return rest;
+}
+
+function stripSingleTurnItemVerificationUrl<T extends VerificationUrlTurnItem>(item: T): T {
+  if (item.type !== "error" || item.failure.verificationUrl === undefined) return item;
+  return { ...item, failure: stripProviderFailureVerificationUrl(item.failure) };
+}
+
+export function stripTurnItemVerificationUrl<T extends VerificationUrlTurnItem>(item: T): T;
+export function stripTurnItemVerificationUrl<T extends ProjectedVerificationUrlTurnItem>(row: T): T;
+export function stripTurnItemVerificationUrl(
+  entry: VerificationUrlTurnItem | ProjectedVerificationUrlTurnItem,
+): VerificationUrlTurnItem | ProjectedVerificationUrlTurnItem {
+  if ("item" in entry) {
+    const item = stripSingleTurnItemVerificationUrl(entry.item);
+    return item === entry.item ? entry : { ...entry, item };
+  }
+  return stripSingleTurnItemVerificationUrl(entry);
+}
+
+export function stripThreadProjectionVerificationUrls(
+  projection: OrchestrationV2ThreadProjection,
+): OrchestrationV2ThreadProjection {
+  let strippedByItem: Map<OrchestrationV2TurnItem, OrchestrationV2TurnItem> | undefined;
+  const stripItem = (item: OrchestrationV2TurnItem): OrchestrationV2TurnItem => {
+    if (item.type !== "error" || item.failure.verificationUrl === undefined) return item;
+    const existing = strippedByItem?.get(item);
+    if (existing !== undefined) return existing;
+    const stripped = stripSingleTurnItemVerificationUrl(item);
+    strippedByItem ??= new Map();
+    strippedByItem.set(item, stripped);
+    return stripped;
+  };
+  let turnItemsChanged = false;
+  const turnItems = projection.turnItems.map((item) => {
+    const stripped = stripItem(item);
+    if (stripped !== item) turnItemsChanged = true;
+    return stripped;
+  });
+  let visibleChanged = false;
+  const visibleTurnItems = projection.visibleTurnItems.map((row) => {
+    const item = stripItem(row.item);
+    if (item === row.item) return row;
+    visibleChanged = true;
+    return { ...row, item };
+  });
+  if (!turnItemsChanged && !visibleChanged) return projection;
+  return {
+    ...projection,
+    ...(turnItemsChanged ? { turnItems } : {}),
+    ...(visibleChanged ? { visibleTurnItems } : {}),
+  };
+}
+
+function stripDomainEventVerificationUrl(
+  event: OrchestrationV2DomainEvent,
+): OrchestrationV2DomainEvent {
+  if (event.type !== "turn-item.updated") return event;
+  const payload = stripSingleTurnItemVerificationUrl(event.payload);
+  return payload === event.payload ? event : { ...event, payload };
+}
+
+export function stripThreadStreamItemVerificationUrl(
+  item: ThreadStreamSnapshot,
+): ThreadStreamSnapshot;
+export function stripThreadStreamItemVerificationUrl(item: ThreadStreamEvent): ThreadStreamEvent;
+export function stripThreadStreamItemVerificationUrl(
+  item: OrchestrationV2ThreadStreamItem,
+): OrchestrationV2ThreadStreamItem;
+export function stripThreadStreamItemVerificationUrl(
+  item: OrchestrationV2ThreadStreamItem,
+): OrchestrationV2ThreadStreamItem {
+  if (item.kind === "snapshot") {
+    const projection = stripThreadProjectionVerificationUrls(item.projection);
+    return projection === item.projection ? item : { ...item, projection };
+  }
+  if (item.kind === "event") {
+    const event = stripDomainEventVerificationUrl(item.event);
+    return event === item.event ? item : { ...item, event };
+  }
+  return item;
+}
+
+export function stripThreadHistoryPageVerificationUrls(
+  page: OrchestrationV2ThreadHistoryPage,
+): OrchestrationV2ThreadHistoryPage {
+  let changed = false;
+  const items = page.items.map((row) => {
+    const next = stripTurnItemVerificationUrl(row);
+    if (next !== row) changed = true;
+    return next;
+  });
+  return changed ? { ...page, items } : page;
+}
+
+export function stripThreadTranscriptVerificationUrls(
+  transcript: OrchestrationV2ThreadTranscript,
+): OrchestrationV2ThreadTranscript {
+  let changed = false;
+  const items = transcript.items.map((row) => {
+    const next = stripTurnItemVerificationUrl(row);
+    if (next !== row) changed = true;
+    return next;
+  });
+  return changed ? { ...transcript, items } : transcript;
 }

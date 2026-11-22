@@ -45,6 +45,7 @@ import {
 } from "react-native";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
 import {
+  AuthProvidersManageScope,
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type EnvironmentId,
   type RunId,
@@ -53,6 +54,7 @@ import {
 } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { useEnvironmentScope } from "../../state/session";
 import { environmentThreadDetails, threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { toolActivityFaviconUrl } from "@t3tools/shared/favicon";
@@ -770,6 +772,15 @@ function workLogRowKey(row: ThreadFeedActivity): string {
   return row.id;
 }
 
+function formatVerificationUrlDisplay(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+}
+
 function WorkspacePreparationRetryButton(props: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
@@ -896,6 +907,14 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
       : null,
   );
   const failureItem = row.projectedItem.item;
+  const verificationUrl =
+    failureItem.type === "error" && failureItem.status === "failed"
+      ? failureItem.failure.verificationUrl
+      : undefined;
+  const canManageProviders = useEnvironmentScope(
+    verificationUrl ? props.environmentId : null,
+    AuthProvidersManageScope,
+  );
   if (failureItem.type === "error" && failureItem.status === "failed") {
     const warning = failureItem.failure.class === "usage_limit";
     const timestamp = new Date(row.createdAt);
@@ -967,8 +986,11 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
               {failureItem.failure.message}
             </Text>
           ) : null}
-          {failureItem.failure.verificationUrl ? (
-            <View className="ml-7 mt-2">
+          {canManageProviders && verificationUrl ? (
+            <View className="ml-7 mt-2 gap-1.5">
+              <Text selectable className="font-mono text-2xs leading-normal text-foreground-muted">
+                {formatVerificationUrlDisplay(verificationUrl)}
+              </Text>
               <Button
                 label={gt("Verify account")}
                 tone="secondary"
@@ -976,7 +998,7 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
                 icon="arrow.up.right"
                 onPress={() => {
                   void Haptics.selectionAsync();
-                  void Linking.openURL(failureItem.failure.verificationUrl!).catch(() => undefined);
+                  void Linking.openURL(verificationUrl).catch(() => undefined);
                 }}
               />
             </View>

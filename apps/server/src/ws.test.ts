@@ -10,10 +10,14 @@ import {
   AuthAccessReadScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  AuthProvidersManageScope,
   AuthSessionId,
   AuthSourceControlWriteScope,
+  CommandId,
+  GoogleAccountVerificationUrl,
   ORCHESTRATION_PROTOCOL_VERSION,
   ORCHESTRATION_PROTOCOL_QUERY_PARAM,
+  ORCHESTRATION_V2_WS_METHODS,
   EnvironmentId,
   EventId,
   GitManagerError,
@@ -31,11 +35,15 @@ import {
   WsRpcGroup,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
+  type AuthEnvironmentScope,
   type AuthAccessStreamEvent,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
+  type OrchestrationV2ThreadStreamItem,
+  type OrchestrationV2TurnItem,
   type OrchestrationProjectShell,
   type ServerConfig,
   type ServerConfigStreamEvent,
@@ -2624,4 +2632,511 @@ it.effect("ACP session RPCs list a thread missing its history and repair it on i
       ),
     ),
   ),
+);
+
+it.effect(
+  "filters provider auth verificationUrl on WS config and refresh RPCs by providers:manage",
+  () =>
+    Effect.gen(function* () {
+      const instanceId = ProviderInstanceId.make("antigravity");
+      const verificationUrl = GoogleAccountVerificationUrl.make(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-ws-provider",
+      );
+      const updatedVerificationUrl = GoogleAccountVerificationUrl.make(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-ws-provider-updated",
+      );
+      const provider: ServerProvider = {
+        instanceId,
+        driver: ProviderDriverKind.make("antigravity"),
+        enabled: true,
+        installed: true,
+        version: "1.0.0",
+        status: "warning",
+        auth: {
+          status: "authenticated",
+          verificationRequired: true,
+          verificationUrl,
+        },
+        checkedAt: "2026-11-22T00:00:00.000Z",
+        models: [],
+        slashCommands: [],
+        skills: [],
+      };
+      const verifyForScopes = Effect.fn(function* (
+        scopes: ReadonlyArray<AuthEnvironmentScope>,
+        expectUrl: boolean,
+      ) {
+        const providerChanges = yield* Queue.unbounded<ReadonlyArray<ServerProvider>>();
+        const pulled = yield* Queue.unbounded<void>();
+        const responses = yield* Queue.unbounded<unknown>();
+        const services = Layer.mergeAll(
+          layerUnusedConfigRpcServices,
+          Layer.mock(ExternalLauncher.ExternalLauncher)({
+            resolveAvailableEditors: () => Effect.succeed([]),
+            resolveFileManagerRevealKind: () => Effect.undefined,
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([provider]),
+            streamChanges: Stream.fromQueue(providerChanges).pipe(
+              Stream.tap(() => Queue.offer(pulled, undefined)),
+            ),
+            refresh: () => Effect.succeed([provider]),
+            refreshInstance: () => Effect.succeed([provider]),
+            refreshWorkspaceSnapshot: () => Effect.succeed([provider]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({
+            workspaceScanDirectory: (cwd) => Effect.succeed(cwd),
+          }),
+          Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+            listInstances: Effect.succeed([]),
+            getInstance: () => Effect.undefined,
+          }),
+          Layer.mock(UsageLimitSources.UsageLimitSources)({
+            current: Effect.succeed([]),
+            streamChanges: Stream.make([]),
+            refresh: Effect.void,
+          }),
+          Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({
+            resolveTargets: () => Effect.succeed([]),
+          }),
+          Layer.mock(DirectEndpoints.DirectEndpoints)({
+            resolve: () => Effect.succeed([]),
+            resolveAvailable: () => Effect.succeed([]),
+          }),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            scratchRoot: Effect.succeedNone,
+            namedProjectsRoot: process.cwd(),
+          }),
+          Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+          Layer.mock(ServerEnvironment.ServerEnvironment)({
+            getDescriptor: Effect.succeed({
+              environmentId: EnvironmentId.make("provider-filter-test"),
+              label: "Provider filter test",
+              platform: { os: "linux", arch: "x64" },
+              serverVersion: "0.0.0",
+              capabilities: { repositoryIdentity: false },
+            }),
+          }),
+          Layer.mock(EnvironmentAuth.EnvironmentAuth)({
+            getDescriptor: () =>
+              Effect.succeed({
+                policy: "loopback-browser",
+                bootstrapMethods: [],
+                sessionMethods: ["browser-session-cookie"],
+                sessionCookieName: "provider-filter-session",
+              }),
+          }),
+        );
+        const server = yield* RpcServer.makeNoSerialization(WsRpcGroup, {
+          ...WS_RPC_SERVER_OPTIONS,
+          onFromServer: (response) =>
+            response._tag === "Chunk"
+              ? Effect.forEach(response.values, (value) => Queue.offer(responses, value), {
+                  discard: true,
+                })
+              : response._tag === "Exit" && response.exit._tag === "Success"
+                ? Queue.offer(responses, response.exit.value)
+                : Effect.void,
+        }).pipe(
+          Effect.provide(
+            layerWsRpc(
+              {
+                sessionId: AuthSessionId.make(`provider-filter:${expectUrl}`),
+                subject: "provider-filter",
+                method: "browser-session-cookie",
+                scopes,
+              },
+              {},
+              yield* ServerBrowser.ServerBrowser,
+              () => Effect.void,
+              { secretReferences: true },
+            ).pipe(Layer.provide(services), Layer.merge(RpcAuthorization.layer(scopes))),
+          ),
+        );
+
+        const assertProviderAuth = (
+          auth: ServerProvider["auth"] | undefined,
+          expectedUrl: GoogleAccountVerificationUrl | undefined,
+        ) => {
+          assert.isDefined(auth);
+          assert.equal(auth?.verificationRequired, true);
+          assert.equal(auth?.verificationUrl, expectedUrl);
+          assert.equal("verificationUrl" in (auth ?? {}), expectedUrl !== undefined);
+        };
+
+        const expectedInitialUrl = expectUrl ? verificationUrl : undefined;
+        const expectedUpdatedUrl = expectUrl ? updatedVerificationUrl : undefined;
+
+        yield* server.write(0, {
+          _tag: "Request",
+          id: RpcMessage.RequestId("get-config"),
+          tag: WS_METHODS.serverGetConfig,
+          payload: {},
+          headers: Headers.empty,
+        });
+        const gotConfig = (yield* Queue.take(responses)) as ServerConfig;
+        assertProviderAuth(gotConfig.providers[0]?.auth, expectedInitialUrl);
+
+        for (const [id, payload] of [
+          ["refresh-full", {}],
+          ["refresh-on-demand", { workspaceSnapshotsOnDemand: true }],
+        ] as const) {
+          yield* server.write(0, {
+            _tag: "Request",
+            id: RpcMessage.RequestId(id),
+            tag: WS_METHODS.serverRefreshProviders,
+            payload,
+            headers: Headers.empty,
+          });
+          const refreshed = (yield* Queue.take(responses)) as {
+            readonly providers: ReadonlyArray<ServerProvider>;
+          };
+          assertProviderAuth(refreshed.providers[0]?.auth, expectedInitialUrl);
+        }
+
+        for (const useDeltas of [false, true] as const) {
+          const requestId = RpcMessage.RequestId(useDeltas ? "sub-deltas" : "sub-statuses");
+          yield* server.write(0, {
+            _tag: "Request",
+            id: requestId,
+            tag: WS_METHODS.subscribeServerConfig,
+            payload: useDeltas ? { providerStatusDeltas: true } : {},
+            headers: Headers.empty,
+          });
+          const snapshot = (yield* Queue.take(responses)) as ServerConfigStreamEvent;
+          if (snapshot.type !== "snapshot") return yield* Effect.die("Missing config snapshot");
+          assertProviderAuth(snapshot.config.providers[0]?.auth, expectedInitialUrl);
+          yield* server.write(0, { _tag: "Ack", requestId });
+
+          yield* Queue.offer(providerChanges, [
+            {
+              ...provider,
+              checkedAt: useDeltas ? "2026-11-22T00:02:00.000Z" : "2026-11-22T00:01:00.000Z",
+              auth: { ...provider.auth, verificationUrl: updatedVerificationUrl },
+            },
+          ]);
+          yield* Queue.take(pulled);
+          yield* TestClock.adjust("1 second");
+          const update = (yield* Queue.take(responses)) as ServerConfigStreamEvent;
+          if (useDeltas) {
+            if (update.type !== "providerStatusDeltas") {
+              return yield* Effect.die("Expected providerStatusDeltas");
+            }
+            assertProviderAuth(update.payload.providers[0]?.auth, expectedUpdatedUrl);
+          } else {
+            if (update.type !== "providerStatuses") {
+              return yield* Effect.die("Expected providerStatuses");
+            }
+            assertProviderAuth(update.payload.providers[0]?.auth, expectedUpdatedUrl);
+          }
+          yield* server.write(0, { _tag: "Interrupt", requestId, interruptors: [] });
+        }
+      });
+
+      yield* verifyForScopes([AuthOrchestrationReadScope, AuthOrchestrationOperateScope], false);
+      yield* verifyForScopes([AuthOrchestrationReadScope, AuthProvidersManageScope], true);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+        ),
+      ),
+    ),
+);
+
+it.effect(
+  "filters turn-item failure verificationUrl on WS thread RPCs by providers:manage without mutating shared events",
+  () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread:verification-filter");
+      const projectId = ProjectId.make("project:verification-filter");
+      const instanceId = ProviderInstanceId.make("antigravity");
+      const at = DateTime.makeUnsafe("2026-11-22T00:00:00.000Z");
+      const verificationUrl = GoogleAccountVerificationUrl.make(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-ws-thread",
+      );
+      const freeze = <A>(value: A): A => {
+        if (typeof value === "object" && value !== null && !DateTime.isDateTime(value)) {
+          for (const child of Object.values(value)) freeze(child);
+          Object.freeze(value);
+        }
+        return value;
+      };
+      const errorItem: OrchestrationV2TurnItem = freeze({
+        id: TurnItemId.make("item:verification-error"),
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        type: "error",
+        status: "failed",
+        title: null,
+        startedAt: at,
+        completedAt: at,
+        updatedAt: at,
+        failure: {
+          class: "permission_error",
+          message: "Verify your Google account to continue.",
+          code: "VALIDATION_REQUIRED",
+          retryable: false,
+          verificationUrl,
+        },
+      });
+      const thread: OrchestrationV2AppThread = {
+        createdBy: "user",
+        creationSource: "web",
+        id: threadId,
+        projectId,
+        title: "Verification test",
+        providerInstanceId: instanceId,
+        modelSelection: { instanceId, model: "default" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: null,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        forkedFrom: null,
+        createdAt: at,
+        updatedAt: at,
+        archivedAt: null,
+        deletedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        lastVisitedAt: null,
+      };
+      const projection: OrchestrationV2ThreadProjection = {
+        thread,
+        runs: [],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        providerSessions: [],
+        providerThreads: [],
+        providerTurns: [],
+        runtimeRequests: [],
+        messages: [],
+        plans: [],
+        turnItems: [errorItem],
+        checkpointScopes: [],
+        checkpoints: [],
+        contextHandoffs: [],
+        contextTransfers: [],
+        visibleTurnItems: [
+          {
+            position: 0,
+            visibility: "local",
+            sourceThreadId: threadId,
+            sourceItemId: errorItem.id,
+            item: errorItem,
+          },
+        ],
+        updatedAt: at,
+      };
+      const liveStoredEvent: OrchestrationV2StoredEvent = freeze({
+        sequence: 2,
+        commandId: null,
+        event: {
+          id: EventId.make("event:verification-live"),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: at,
+          payload: errorItem,
+        },
+      });
+      const services = Layer.mergeAll(
+        layerUnusedConfigRpcServices,
+        Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+        Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+        Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),
+        Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+        Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+        Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
+          enqueueCommand: (effect) => effect,
+        }),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+          checkWorktreeBase: () => Effect.void,
+          launch: () =>
+            Effect.succeed({
+              threadId,
+              sequence: 1,
+              resumed: true,
+              projection,
+              workspace: {
+                branch: null,
+                worktreePath: null,
+                workspaceRoot: "/unused",
+              },
+            } as never),
+        }),
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          ensureLegacyTranscript: () => Effect.void,
+          getThreadSnapshot: () =>
+            Effect.succeed({ schemaVersion: 1, snapshotSequence: 1, projection }),
+          getThreadSnapshotWindow: () =>
+            Effect.succeed({ schemaVersion: 1, snapshotSequence: 1, projection }),
+          getTurnItem: () => Effect.succeed({ item: errorItem }),
+          streamStoredEventsFrom: () => Stream.make(liveStoredEvent),
+        }),
+        Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
+          latestAgentSequence: () => Effect.succeed(2),
+          prunedThroughSequence: Effect.succeed(0),
+          getAgentReplayStats: () =>
+            Effect.succeed({ eventCount: 1, rawPayloadBytes: 256, hasCreateEvent: false }),
+          readAgentEvents: () => Stream.make(liveStoredEvent),
+        }),
+      );
+
+      const assertErrorItem = (
+        item: OrchestrationV2TurnItem | null | undefined,
+        expectedUrl: GoogleAccountVerificationUrl | undefined,
+      ) => {
+        assert.equal(item?.type, "error");
+        if (item?.type !== "error") return assert.fail("Expected error turn item.");
+        assert.equal(item.failure.verificationUrl, expectedUrl);
+        assert.equal("verificationUrl" in item.failure, expectedUrl !== undefined);
+        assert.equal(item.failure.code, "VALIDATION_REQUIRED");
+        assert.equal(item.failure.message, "Verify your Google account to continue.");
+      };
+
+      const verifyForScopes = Effect.fn(function* (
+        scopes: ReadonlyArray<AuthEnvironmentScope>,
+        expectedUrl: GoogleAccountVerificationUrl | undefined,
+      ) {
+        const responses = yield* Queue.unbounded<unknown>();
+        const server = yield* RpcServer.makeNoSerialization(WsRpcGroup, {
+          ...WS_RPC_SERVER_OPTIONS,
+          onFromServer: (response) =>
+            response._tag === "Chunk"
+              ? Effect.forEach(response.values, (value) => Queue.offer(responses, value), {
+                  discard: true,
+                })
+              : response._tag === "Exit" && response.exit._tag === "Success"
+                ? Queue.offer(responses, response.exit.value)
+                : Effect.void,
+        }).pipe(
+          Effect.provide(
+            layerWsRpc(
+              {
+                sessionId: AuthSessionId.make(`thread-filter:${expectedUrl !== undefined}`),
+                subject: "thread-filter",
+                method: "browser-session-cookie",
+                scopes,
+              },
+              {},
+              yield* ServerBrowser.ServerBrowser,
+              () => Effect.void,
+              { secretReferences: true },
+            ).pipe(Layer.provide(services), Layer.merge(RpcAuthorization.layer(scopes))),
+          ),
+        );
+
+        yield* server.write(0, {
+          _tag: "Request",
+          id: RpcMessage.RequestId("get-turn-item"),
+          tag: ORCHESTRATION_V2_WS_METHODS.getTurnItem,
+          payload: { threadId, itemId: errorItem.id },
+          headers: Headers.empty,
+        });
+        const turnItemRes = (yield* Queue.take(responses)) as {
+          readonly item: OrchestrationV2TurnItem | null;
+        };
+        assertErrorItem(turnItemRes.item, expectedUrl);
+
+        yield* server.write(0, {
+          _tag: "Request",
+          id: RpcMessage.RequestId("get-projection"),
+          tag: ORCHESTRATION_V2_WS_METHODS.getThreadProjection,
+          payload: { threadId },
+          headers: Headers.empty,
+        });
+        const gotProjection = (yield* Queue.take(responses)) as OrchestrationV2ThreadProjection;
+        assertErrorItem(gotProjection.turnItems[0], expectedUrl);
+        assertErrorItem(gotProjection.visibleTurnItems[0]?.item, expectedUrl);
+
+        yield* server.write(0, {
+          _tag: "Request",
+          id: RpcMessage.RequestId("launch-thread"),
+          tag: ORCHESTRATION_V2_WS_METHODS.launchThread,
+          payload: {
+            commandId: CommandId.make("cmd:launch-filter"),
+            projectId,
+            title: "Verification test",
+            modelSelection: { instanceId, model: "default" },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            workspaceStrategy: { type: "root" },
+          },
+          headers: Headers.empty,
+        });
+        const launched = (yield* Queue.take(responses)) as {
+          readonly projection: OrchestrationV2ThreadProjection;
+        };
+        assertErrorItem(launched.projection.turnItems[0], expectedUrl);
+        assertErrorItem(launched.projection.visibleTurnItems[0]?.item, expectedUrl);
+
+        const subId = RpcMessage.RequestId("sub-thread");
+        yield* server.write(0, {
+          _tag: "Request",
+          id: subId,
+          tag: ORCHESTRATION_V2_WS_METHODS.subscribeThread,
+          payload: { threadId },
+          headers: Headers.empty,
+        });
+        const snap = (yield* Queue.take(responses)) as OrchestrationV2ThreadStreamItem;
+        if (snap.kind !== "snapshot") return yield* Effect.die("Expected snapshot stream item");
+        assertErrorItem(snap.projection.turnItems[0], expectedUrl);
+        assertErrorItem(snap.projection.visibleTurnItems[0]?.item, expectedUrl);
+        yield* server.write(0, { _tag: "Ack", requestId: subId });
+        const live = (yield* Queue.take(responses)) as OrchestrationV2ThreadStreamItem;
+        if (live.kind !== "event" || live.event.type !== "turn-item.updated") {
+          return yield* Effect.die("Expected live turn-item.updated event");
+        }
+        assertErrorItem(live.event.payload, expectedUrl);
+        yield* server.write(0, { _tag: "Interrupt", requestId: subId, interruptors: [] });
+
+        const replayId = RpcMessage.RequestId("sub-replay");
+        yield* server.write(0, {
+          _tag: "Request",
+          id: replayId,
+          tag: ORCHESTRATION_V2_WS_METHODS.subscribeThread,
+          payload: { threadId, afterSequence: 1 },
+          headers: Headers.empty,
+        });
+        const replayed = (yield* Queue.take(responses)) as OrchestrationV2ThreadStreamItem;
+        if (replayed.kind !== "event" || replayed.event.type !== "turn-item.updated") {
+          return yield* Effect.die("Expected replayed turn-item.updated event");
+        }
+        assertErrorItem(replayed.event.payload, expectedUrl);
+        yield* server.write(0, { _tag: "Interrupt", requestId: replayId, interruptors: [] });
+      });
+
+      // Run non-manager first to verify stripping never mutates cached shared events for managers.
+      yield* verifyForScopes(
+        [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+        undefined,
+      );
+      yield* verifyForScopes(
+        [AuthOrchestrationReadScope, AuthOrchestrationOperateScope, AuthProvidersManageScope],
+        verificationUrl,
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+        ),
+      ),
+    ),
 );

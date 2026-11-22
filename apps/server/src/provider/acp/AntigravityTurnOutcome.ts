@@ -17,6 +17,7 @@ import {
   ANTIGRAVITY_VERIFICATION_REQUIRED_CODE,
   extractAntigravityVerificationFromText,
   extractAntigravityVerificationRequired,
+  hasConflictingNon403ApiError,
   type AntigravityVerificationRequired,
 } from "../antigravityVerification.ts";
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
@@ -59,6 +60,7 @@ const GO_DURATION_UNIT_MS: Record<string, number> = {
   m: 60_000,
   h: 3_600_000,
 };
+const MAX_RESET_DELAY_MS = 365 * 24 * 60 * 60 * 1_000;
 const NATIVE_SESSION_ID = /^[\w-]+$/;
 
 interface LastStep {
@@ -122,8 +124,11 @@ function resetAtFrom(text: string, now: DateTime.Utc): string | undefined {
   let delayMs = 0;
   for (const [, amount, unit] of delay.matchAll(GO_DURATION_PART)) {
     delayMs += Number(amount) * (GO_DURATION_UNIT_MS[unit!] ?? 0);
+    if (!Number.isFinite(delayMs) || delayMs > MAX_RESET_DELAY_MS) return undefined;
   }
-  return delayMs > 0 ? DateTime.formatIso(DateTime.add(now, { milliseconds: delayMs })) : undefined;
+  if (!Number.isFinite(delayMs) || delayMs <= 0 || delayMs > MAX_RESET_DELAY_MS) return undefined;
+  const target = DateTime.make(DateTime.toEpochMillis(now) + delayMs);
+  return Option.isSome(target) ? DateTime.formatIso(target.value) : undefined;
 }
 
 function turnFailure(
@@ -316,6 +321,9 @@ function extractVerificationFromAcpError(
   boundedErrorMessage: string,
   readSerializedData: () => string,
 ): AntigravityVerificationRequired | undefined {
+  if (cause.code === -32602 || hasConflictingNon403ApiError(boundedErrorMessage)) {
+    return undefined;
+  }
   const fromData = extractAntigravityVerificationRequired(cause.data);
   if (fromData?.verificationUrl !== undefined) return fromData;
   let fallback = fromData;

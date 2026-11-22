@@ -12,7 +12,10 @@ import {
   type OrchestrationV2ProviderFailure,
 } from "@t3tools/contracts";
 
-import { extractAntigravityVerificationFromText } from "../antigravityVerification.ts";
+import {
+  extractAntigravityVerificationFromText,
+  extractAntigravityVerificationRequired,
+} from "../antigravityVerification.ts";
 import {
   classifyAntigravityPromptFailure,
   watchAntigravityPromptOutcome,
@@ -370,6 +373,49 @@ describe("watchAntigravityPromptOutcome", () => {
         assert.equal(nonGoogleOutcome?.failure.code, "VALIDATION_REQUIRED");
         assert.equal(nonGoogleOutcome?.failure.retryable, false);
         assert.isUndefined(nonGoogleOutcome?.failure.verificationUrl);
+
+        // Oversized durations must not throw and must drop resetAt.
+        for (const oversized of [
+          errorPayload(
+            "Error 429, Message: Rate limited., Status: RESOURCE_EXHAUSTED, Details: [map[@type:type.googleapis.com/google.rpc.RetryInfo retryDelay:99999999999999999h ]]",
+          ),
+          errorPayload(
+            "Error 429, Message: Quota exhausted., Status: RESOURCE_EXHAUSTED, Details: [map[@type:type.googleapis.com/google.rpc.ErrorInfo metadata:map[quotaResetDelay:99999999999999999h ] reason:QUOTA_EXHAUSTED]]",
+          ),
+        ]) {
+          const outcome = yield* turn([
+            [USER_INPUT, Buffer.from("design")],
+            [ERROR_MESSAGE, oversized],
+          ]);
+          assert.equal(outcome?.failure.class, "usage_limit");
+          assert.isUndefined(outcome?.failure.resetAt);
+        }
+
+        // HTTP 400 INVALID_ARGUMENT with embedded VALIDATION_REQUIRED JSON and bare text never promote to permission_error.
+        const spoofed400WithType = errorPayload(
+          `Error 400, Message: ${prettyValidationJson}, Status: INVALID_ARGUMENT, Details: []`,
+        );
+        const spoofed400WithoutType = errorPayload(
+          `Error 400, Message: ${JSON.stringify({
+            error: {
+              code: 403,
+              status: "PERMISSION_DENIED",
+              details: [{ reason: "VALIDATION_REQUIRED", metadata: { validation_url: validUrl } }],
+            },
+          })}, Status: INVALID_ARGUMENT, Details: []`,
+        );
+        for (const nonVerification of [
+          spoofed400WithType,
+          spoofed400WithoutType,
+          errorPayload("VALIDATION_REQUIRED"),
+        ]) {
+          const outcome = yield* turn([
+            [USER_INPUT, Buffer.from("design")],
+            [ERROR_MESSAGE, nonVerification],
+          ]);
+          assert.notEqual(outcome?.failure.class, "permission_error");
+          assert.isUndefined(outcome?.failure.verificationUrl);
+        }
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
@@ -462,10 +508,140 @@ describe("classifyAntigravityPromptFailure", () => {
     );
     assert.equal(http429.class, "usage_limit");
     assert.equal(http429.retryable, true);
+
+    for (const oversizedMessage of [
+      "HTTP 429 retryDelay:99999999999999999h ",
+      "HTTP 429 quotaResetDelay:99999999999999999h ",
+    ]) {
+      const oversized = classifyAntigravityPromptFailure(
+        new EffectAcpErrors.AcpRequestError({
+          code: -32603,
+          errorMessage: oversizedMessage,
+        }),
+      );
+      assert.equal(oversized.class, "usage_limit");
+      assert.isUndefined(oversized.resetAt);
+    }
+
+    const spoofedPayload = {
+      error: {
+        code: 403,
+        status: "PERMISSION_DENIED",
+        details: [
+          {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            reason: "VALIDATION_REQUIRED",
+            metadata: { validation_url: rpcValidationUrl },
+          },
+        ],
+      },
+    };
+    const missingTypePayload = {
+      error: {
+        code: 403,
+        status: "PERMISSION_DENIED",
+        details: [
+          { reason: "VALIDATION_REQUIRED", metadata: { validation_url: rpcValidationUrl } },
+        ],
+      },
+    };
+    const missingFramingPayload = {
+      error: {
+        details: [
+          {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            reason: "VALIDATION_REQUIRED",
+            metadata: { validation_url: rpcValidationUrl },
+          },
+        ],
+      },
+    };
+    assert.isUndefined(extractAntigravityVerificationRequired(missingTypePayload));
+    assert.isUndefined(extractAntigravityVerificationRequired(missingFramingPayload));
+    assert.isUndefined(extractAntigravityVerificationFromText(JSON.stringify(missingTypePayload)));
+    assert.isUndefined(
+      extractAntigravityVerificationFromText(JSON.stringify(missingFramingPayload)),
+    );
+    assert.isUndefined(extractAntigravityVerificationFromText("VALIDATION_REQUIRED"));
+    assert.isUndefined(
+      extractAntigravityVerificationFromText(
+        `VALIDATION_REQUIRED ${JSON.stringify(missingTypePayload)}`,
+      ),
+    );
+    assert.isUndefined(
+      extractAntigravityVerificationFromText(
+        '{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"VALIDATION_REQUIRED"}]},}',
+      ),
+    );
+    assert.isUndefined(
+      extractAntigravityVerificationFromText(
+        '{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"VALIDATION_REQUIRED"',
+      ),
+    );
+
+    const longValid403 = extractAntigravityVerificationFromText(
+      `Error 403, Message: ${"x".repeat(5_000)} ${JSON.stringify(spoofedPayload)}, Status: PERMISSION_DENIED`,
+    );
+    assert.equal(longValid403?.verificationUrl, rpcValidationUrl);
+
+    for (const nonVerificationError of [
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `Error 400, Message: ${JSON.stringify(spoofedPayload)}, Status: INVALID_ARGUMENT`,
+        data: spoofedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `Error 400, Message: bad arg, Status: PERMISSION_DENIED ${JSON.stringify(spoofedPayload)}, Status: INVALID_ARGUMENT, Details: []`,
+        data: spoofedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `Error 400, Message: ${"a".repeat(5_000)} ${JSON.stringify(spoofedPayload)}, Status: INVALID_ARGUMENT`,
+        data: spoofedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `HTTP 400 Bad Request: ${JSON.stringify(spoofedPayload)}`,
+        data: spoofedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `Error 500: ${JSON.stringify(spoofedPayload)}`,
+        data: spoofedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `Error 400, Message: ${JSON.stringify(missingTypePayload)}, Status: INVALID_ARGUMENT`,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32602,
+        errorMessage: "Invalid params",
+        data: spoofedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Request failed",
+        data: missingTypePayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Request failed",
+        data: missingFramingPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "VALIDATION_REQUIRED",
+      }),
+    ]) {
+      const classified = classifyAntigravityPromptFailure(nonVerificationError);
+      assert.notEqual(classified.class, "permission_error");
+      assert.isUndefined(classified.verificationUrl);
+    }
   });
 
   it("bounds verification scanning while extracting valid JSON nested inside unclosed wrappers", () => {
-    const adversarial = `VALIDATION_REQUIRED ${'{"error":'.repeat(8_000)}`;
+    const adversarial = `Error 403: VALIDATION_REQUIRED ${'{"error":'.repeat(8_000)}`;
     const fallback = extractAntigravityVerificationFromText(adversarial);
     assert.deepEqual(fallback, {
       message: "Verify your Google account to continue using Antigravity.",
@@ -512,6 +688,7 @@ describe("classifyAntigravityPromptFailure", () => {
             code: 403,
             details: [
               {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
                 reason: "VALIDATION_REQUIRED",
                 metadata: { validation_url: validUrl },
               },

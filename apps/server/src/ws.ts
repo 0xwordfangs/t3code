@@ -31,6 +31,7 @@ import {
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
   AuthOrchestrationOperateScope,
+  AuthProvidersManageScope,
   type AuthEnvironmentScope,
   type ScheduledTaskListResult,
   AuthSessionId,
@@ -167,6 +168,9 @@ import {
   makeLiveBodyDeduper,
   projectDomainEventForWire,
   projectThreadProjectionForWire,
+  stripThreadProjectionVerificationUrls,
+  stripThreadStreamItemVerificationUrl,
+  stripTurnItemVerificationUrl,
   threadStreamEventItem,
 } from "./orchestration-v2/WireProjection.ts";
 import { AGENT_ROLE_INSTRUCTION_DEFAULTS } from "@t3tools/shared/agentRoleInstructions";
@@ -914,12 +918,18 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
     readonly acceptCompactTurnItems?: boolean;
     readonly acceptDedupedBodies?: boolean;
     readonly acceptCompactIds?: boolean;
+    readonly includeVerificationUrls?: boolean;
   }) {
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
     const dedupeBodies = input.acceptDedupedBodies === true;
+    const includeVerificationUrls = input.includeVerificationUrls !== false;
     // Replay, snapshot, and live tail share one deduper: it must see every delivered record.
     const withLiveDedupe = <E, R>(stream: Stream.Stream<OrchestrationV2ThreadStreamItem, E, R>) =>
       dedupeBodies ? Stream.suspend(() => Stream.map(stream, makeLiveBodyDeduper())) : stream;
+    const withVisibleVerificationUrls = <E, R>(
+      stream: Stream.Stream<OrchestrationV2ThreadStreamItem, E, R>,
+    ) =>
+      includeVerificationUrls ? stream : Stream.map(stream, stripThreadStreamItemVerificationUrl);
     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
 
     yield* Effect.annotateCurrentSpan({
@@ -1028,6 +1038,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         Stream.concat(completionMarker),
         Stream.concat(eventStreamFrom(snapshotSequence)),
         withLiveDedupe,
+        withVisibleVerificationUrls,
       );
     });
 
@@ -1130,6 +1141,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         Stream.concat(completionMarker),
         Stream.concat(eventStreamFrom(highWater)),
         withLiveDedupe,
+        withVisibleVerificationUrls,
       );
     }
 
@@ -1603,6 +1615,20 @@ export const layerWsRpc = (
               ...result,
               tasks: result.tasks.map(({ webhook: _webhook, ...task }) => task),
             };
+      const canManageProviders = currentSession.scopes.includes(AuthProvidersManageScope);
+      const withVisibleProviderVerificationUrls = (
+        providers: ReadonlyArray<ServerProvider>,
+      ): ReadonlyArray<ServerProvider> => {
+        if (canManageProviders) return providers;
+        let changed = false;
+        const filtered = providers.map((provider) => {
+          if (provider.auth.verificationUrl === undefined) return provider;
+          changed = true;
+          const { verificationUrl: _verificationUrl, ...auth } = provider.auth;
+          return { ...provider, auth };
+        });
+        return changed ? filtered : providers;
+      };
       const authorizeEffect = <A, E, R>(
         requiredScope: AuthEnvironmentScope,
         effect: Effect.Effect<A, E, R>,
@@ -1823,7 +1849,9 @@ export const layerWsRpc = (
         readonly catalogDigests?: boolean;
       }) {
         const keybindingsConfig = yield* keybindings.loadConfigState;
-        const currentProviders = yield* providerRegistry.getProviders;
+        const currentProviders = withVisibleProviderVerificationUrls(
+          yield* providerRegistry.getProviders,
+        );
         const commandProviders = options.usageLimitsCommand
           ? withUsageLimitsCommands(currentProviders, yield* usageLimitSources.current)
           : currentProviders;
@@ -2048,6 +2076,11 @@ export const layerWsRpc = (
           nativeChildWork.getNativeChildWork(input),
         [ORCHESTRATION_V2_WS_METHODS.getTurnItem]: (input) =>
           threadManagement.getTurnItem(input).pipe(
+            Effect.map((result) =>
+              canManageProviders || result.item === null
+                ? result
+                : { item: stripTurnItemVerificationUrl(result.item) },
+            ),
             Effect.mapError(
               (cause) =>
                 new OrchestrationV2GetThreadProjectionError({
@@ -2157,13 +2190,15 @@ export const layerWsRpc = (
                   rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
                 })
                 .pipe(
-                  Effect.map(
-                    (snapshot) =>
-                      buildBoundedThreadProjection({
-                        projection: projectThreadProjectionForWire(snapshot.projection),
-                        snapshotSequence: snapshot.snapshotSequence,
-                      }).projection,
-                  ),
+                  Effect.map((snapshot) => {
+                    const projection = buildBoundedThreadProjection({
+                      projection: projectThreadProjectionForWire(snapshot.projection),
+                      snapshotSequence: snapshot.snapshotSequence,
+                    }).projection;
+                    return canManageProviders
+                      ? projection
+                      : stripThreadProjectionVerificationUrls(projection);
+                  }),
                   Effect.mapError(
                     (cause) =>
                       new OrchestrationV2GetThreadProjectionError({
@@ -2246,10 +2281,15 @@ export const layerWsRpc = (
                             Effect.ignore,
                           ),
                   ),
-                  Effect.map((result) => ({
-                    ...result,
-                    projection: projectThreadProjectionForWire(result.projection),
-                  })),
+                  Effect.map((result) => {
+                    const projection = projectThreadProjectionForWire(result.projection);
+                    return {
+                      ...result,
+                      projection: canManageProviders
+                        ? projection
+                        : stripThreadProjectionVerificationUrls(projection),
+                    };
+                  }),
                   Effect.catchTags({
                     AttachmentClaimError: (cause) =>
                       new OrchestrationV2ThreadLaunchError({
@@ -2316,7 +2356,12 @@ export const layerWsRpc = (
         [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-              Effect.andThen(subscribeOrchestrationV2Thread(input)),
+              Effect.andThen(
+                subscribeOrchestrationV2Thread({
+                  ...input,
+                  includeVerificationUrls: canManageProviders,
+                }),
+              ),
             ),
           ),
         [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: (input) =>
@@ -2534,11 +2579,12 @@ export const layerWsRpc = (
             if (input.omitProviders === true && (instanceId === undefined || cwd === undefined)) {
               return { providers: [] };
             }
-            if (input.workspaceSnapshotsOnDemand !== true) return { providers };
+            const visibleProviders = withVisibleProviderVerificationUrls(providers);
+            if (input.workspaceSnapshotsOnDemand !== true) return { providers: visibleProviders };
             const commandProviders =
               input.usageLimitsCommand === true
-                ? withUsageLimitsCommands(providers, yield* usageLimitSources.current)
-                : providers;
+                ? withUsageLimitsCommands(visibleProviders, yield* usageLimitSources.current)
+                : visibleProviders;
             if (instanceId === undefined || cwd === undefined) {
               return { providers: withoutWorkspaceSnapshots(commandProviders) };
             }
@@ -2620,7 +2666,12 @@ export const layerWsRpc = (
               ),
           ),
         [WS_METHODS.serverUpdateProvider]: (input) =>
-          providerMaintenanceRunner.updateProvider(input),
+          providerMaintenanceRunner.updateProvider(input).pipe(
+            Effect.map((result) => ({
+              ...result,
+              providers: withVisibleProviderVerificationUrls(result.providers),
+            })),
+          ),
         [WS_METHODS.providerConsumeResetCredit]:
           /* Request instrumentation already owns the span; keep this helper in that context. */
           Effect.fnUntraced(function* (input) {
@@ -3400,7 +3451,9 @@ export const layerWsRpc = (
                   ),
                 ),
                 (providers, sources) =>
-                  usageLimitsCommand ? withUsageLimitsCommands(providers, sources) : providers,
+                  withVisibleProviderVerificationUrls(
+                    usageLimitsCommand ? withUsageLimitsCommands(providers, sources) : providers,
+                  ),
               ).pipe(
                 // Stripped before the de-dupe below, so snapshot-only changes send nothing.
                 Stream.mapEffect((commandProviders) =>

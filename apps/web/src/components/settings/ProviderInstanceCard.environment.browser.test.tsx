@@ -1,8 +1,15 @@
+import {
+  GoogleAccountVerificationUrl,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ProviderInstanceConfig,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { userEvent } from "vite-plus/test/browser";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { render } from "../../../test/render";
-import { ProviderEnvironmentSection } from "./ProviderInstanceCard";
+import { ProviderEnvironmentSection, ProviderInstanceCard } from "./ProviderInstanceCard";
 
 const savedSecret = {
   name: "FAKE_API_KEY",
@@ -172,5 +179,79 @@ describe("ProviderEnvironmentSection external settings writes", () => {
     // Another client deletes the variable. The row must not come back.
     await screen.rerender(<ProviderEnvironmentSection environment={[]} onChange={onChange} />);
     await expect.element(acknowledged).not.toBeInTheDocument();
+  });
+});
+
+describe("ProviderInstanceCard verification action", () => {
+  const verificationUrl = GoogleAccountVerificationUrl.make(
+    "https://accounts.google.com/v3/signin/continue?plt=secret-token",
+  );
+  const instanceId = ProviderInstanceId.make("antigravity");
+  const driver = ProviderDriverKind.make("antigravity");
+  const instance: ProviderInstanceConfig = {
+    driver,
+    enabled: true,
+    config: {},
+  };
+  const liveProvider: ServerProvider = {
+    instanceId,
+    driver,
+    enabled: true,
+    installed: true,
+    version: "1.0.0",
+    status: "warning",
+    auth: {
+      status: "unknown",
+      type: "oauth-personal",
+      verificationRequired: true,
+      verificationUrl,
+    },
+    message: "Verify your Google account to use Antigravity.",
+    checkedAt: "2026-10-21T00:00:00.000Z",
+    models: [],
+    slashCommands: [],
+    skills: [],
+  };
+
+  const renderCard = (readOnly: boolean) => (
+    <ProviderInstanceCard
+      instanceId={instanceId}
+      instance={instance}
+      driverOption={undefined}
+      liveProvider={liveProvider}
+      mode="editor"
+      readOnly={readOnly}
+      onUpdate={async () => true}
+      hiddenModels={[]}
+      favoriteModels={[]}
+      modelOrder={[]}
+      onHiddenModelsChange={() => {}}
+      onFavoriteModelsChange={() => {}}
+      onToggleFavorite={() => {}}
+      onModelOrderChange={() => {}}
+    />
+  );
+
+  it("shows the compact verification destination when editable and hides the action when read-only", async () => {
+    await using screen = await render(renderCard(false));
+
+    await expect.element(screen.getByText("Verification required")).toBeVisible();
+    await expect
+      .element(screen.getByText("https://accounts.google.com/v3/signin/continue"))
+      .toBeVisible();
+    expect(screen.container.textContent).not.toContain("plt=secret-token");
+    await expect
+      .element(screen.getByRole("link", { name: "Verify account" }))
+      .toHaveAttribute("href", verificationUrl);
+
+    await screen.rerender(renderCard(true));
+
+    await expect.element(screen.getByText("Verification required")).toBeVisible();
+    await expect
+      .element(screen.getByRole("link", { name: "Verify account" }))
+      .not.toBeInTheDocument();
+    await expect
+      .element(screen.getByText("https://accounts.google.com/v3/signin/continue"))
+      .not.toBeInTheDocument();
   });
 });

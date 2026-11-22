@@ -7,6 +7,7 @@ import {
   hasQuestionAnswer,
 } from "@t3tools/client-runtime/work-log/user-input";
 import {
+  AuthProvidersManageScope,
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type EnvironmentId,
   ThreadId,
@@ -46,7 +47,9 @@ import {
 } from "lucide-react";
 import { Button, InlineButton } from "../ui/button";
 import { useAssetUrls } from "../../assets/assetUrls";
+import { isGuestPage } from "~/guestPage";
 import { useThreadShell } from "../../state/entities";
+import { useEnvironmentScope } from "~/state/session";
 import {
   threadReadTargetId,
   threadReadTargetTitle,
@@ -197,6 +200,15 @@ const toolCallExpandedBodyClassName =
 
 const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation();
 
+function formatVerificationUrlDisplay(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+}
+
 export function ReasoningTraceContent({ entries }: { entries: ReadonlyArray<TimelineWorkEntry> }) {
   const ctx = use(TimelineRowCtx);
   const { isWorking, latestRunId } = use(TimelineRowActivityCtx);
@@ -320,6 +332,15 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
     setExpanded(next);
   };
   const failureItem = workEntry.projectedItem?.item;
+  const verificationUrl =
+    failureItem?.type === "error" && failureItem.status === "failed"
+      ? failureItem.failure.verificationUrl
+      : undefined;
+  const guestPage = isGuestPage();
+  const canManageProviders = useEnvironmentScope(
+    verificationUrl && !guestPage ? ctx.activeThreadEnvironmentId : null,
+    AuthProvidersManageScope,
+  );
   const pendingApproval =
     failureItem?.type === "approval_request"
       ? ctx.pendingApprovals.get(failureItem.requestId)
@@ -375,16 +396,13 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
             {failureItem.failure.message}
           </p>
         ) : null}
-        {failureItem.failure.verificationUrl ? (
-          <div className="ms-7 pb-1">
+        {!guestPage && canManageProviders && verificationUrl ? (
+          <div className="ms-7 flex flex-col items-start gap-1 pb-1">
+            <code className="break-all text-2xs text-muted-foreground">
+              {formatVerificationUrlDisplay(verificationUrl)}
+            </code>
             <Button
-              render={
-                <a
-                  href={failureItem.failure.verificationUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                />
-              }
+              render={<a href={verificationUrl} target="_blank" rel="noopener noreferrer" />}
               size="xs"
               variant="outline"
             >

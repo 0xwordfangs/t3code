@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   applyServerProviderDeltas,
+  GoogleAccountVerificationUrl,
   OtlpEndpointCheckInput,
   resolveEnvironmentMachineKind,
   ServerConfigProviderStatusDeltasPayload,
@@ -165,6 +166,43 @@ describe("OtlpEndpointCheckInput", () => {
     );
     for (const url of ["data:text/plain,ok", "file:///etc/hosts", "collector:4318/v1/traces"]) {
       expect(() => decode({ signal: "traces", url })).toThrow();
+    }
+  });
+});
+
+describe("GoogleAccountVerificationUrl", () => {
+  const decode = Schema.decodeUnknownSync(GoogleAccountVerificationUrl);
+
+  it("accepts only Google Accounts signin/continue URLs with Google continue targets", () => {
+    for (const validUrl of [
+      "https://accounts.google.com/v3/signin/continue?plt=abc",
+      "https://accounts.google.com/signin/continue?plt=abc",
+      "https://accounts.google.com/v3/signin/continue?plt=abc&continue=https%3A%2F%2Fantigravity.google%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=abc&continue=https%3A%2F%2Fdevelopers.google.com%2Fprofile",
+      "https://accounts.google.com/v3/signin/continue?plt=abc&continueUrl=https%3A%2F%2Fgoogle.com%2F",
+    ]) {
+      expect(decode(validUrl)).toBe(validUrl);
+    }
+
+    for (const invalidUrl of [
+      "https://accounts.google.com/o/oauth2/v2/auth?client_id=123",
+      "https://accounts.google.com/Logout",
+      "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgoogle.com",
+      "https://@accounts.google.com/v3/signin/continue?plt=1",
+      "https://accounts.google.com/v3/signin/continue?plt=1#foo",
+      "https://accounts.google.com/v3/signin/continue?plt=1#",
+      "https://accounts.google.com/v3/signin/continue?plt=1&client_id=abc",
+      "https://accounts.google.com/v3/signin/continue?plt=1&redirect_uri=https%3A%2F%2Fgoogle.com",
+      "https://accounts.google.com/v3/signin/continue?plt=1&response_type=code",
+      "https://accounts.google.com/v3/signin/continue?plt=1&scope=openid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fattacker.invalid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continueUrl=https%3A%2F%2Fevilgoogle.com",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=http%3A%2F%2Fgoogle.com",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2F%40google.com",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2F.google%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F&continue=https%3A%2F%2Fattacker.invalid",
+    ]) {
+      expect(() => decode(invalidUrl)).toThrow();
     }
   });
 });

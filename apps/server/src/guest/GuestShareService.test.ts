@@ -5,6 +5,7 @@ import {
   ChatAttachmentId,
   CommandId,
   EventId,
+  GoogleAccountVerificationUrl,
   GuestShareId,
   type GuestStreamEvent,
   MessageId,
@@ -52,6 +53,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ResourceCleanupService from "../orchestration-v2/ResourceCleanupService.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
+import { threadStreamEventItem } from "../orchestration-v2/WireProjection.ts";
 import * as DocumentText from "../provider/DocumentText.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -1415,4 +1417,174 @@ it.effect("keeps a connected guest's images while other shares come and go", () 
     yield* Stream.runDrain(Stream.take(yield* guestShares.stream(next.token), 2));
     assert.equal((yield* guestShares.media(next.token, shot)).mimeType, "image/png");
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+it.effect(
+  "strips Google verificationUrl from guest snapshots, live events, item details, and history",
+  () =>
+    Effect.gen(function* () {
+      const { orchestrator, guestShares, credential } = yield* shareThread;
+      const { token: session } = yield* guestShares.redeem({ credential, name: "Sam" });
+      const runId = yield* ownerRun;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      const verificationUrl = GoogleAccountVerificationUrl.make(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-guest-token",
+      );
+      const makeItemEvent = (id: string, ordinal: number, payload: object) => ({
+        id: EventId.make(`event:${id}`),
+        type: "turn-item.updated" as const,
+        threadId,
+        driver: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(id),
+          threadId,
+          runId,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          title: null,
+          status: "failed" as const,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          ...payload,
+        } as OrchestrationV2TurnItem,
+      });
+      const errorFields = {
+        type: "error" as const,
+        failure: {
+          class: "permission_error" as const,
+          message: "Verify your Google account to continue.",
+          code: "VALIDATION_REQUIRED",
+          retryable: false,
+          verificationUrl,
+        },
+      };
+      yield* eventSink.write({
+        events: [
+          makeItemEvent("item:old-verification-error", 1, errorFields),
+          ...Array.from({ length: 25 }, (_, index) =>
+            makeItemEvent(`item:prompt-${index}`, index + 2, {
+              status: "completed" as const,
+              type: "user_message" as const,
+              messageId: MessageId.make(`msg:prompt-${index}`),
+              text: `Prompt ${index}`,
+              createdBy: "user" as const,
+              creationSource: "web" as const,
+              inputIntent: "turn_start" as const,
+              attachments: [],
+            }),
+          ),
+          makeItemEvent("item:snapshot-verification-error", 27, errorFields),
+        ],
+      });
+
+      const events = yield* guestShares.stream(session);
+      const liveEvent = makeItemEvent("item:live-verification-error", 28, errorFields);
+      const liveWrite = yield* eventSink.write({ events: [liveEvent] });
+      const cachedOwnerItem = threadStreamEventItem(liveWrite[0]!);
+
+      const detail = (yield* guestShares.item(session, "item:snapshot-verification-error")).item;
+      assert.equal(detail?.type, "error");
+      if (detail?.type !== "error") return assert.fail("Expected error item detail.");
+      assert.isUndefined(detail.failure.verificationUrl);
+      assert.isFalse("verificationUrl" in detail.failure);
+      assert.deepInclude(detail.failure, {
+        class: "permission_error",
+        message: "Verify your Google account to continue.",
+        code: "VALIDATION_REQUIRED",
+        retryable: false,
+      });
+
+      yield* orchestrator.dispatch({
+        type: "thread.guest-share.close",
+        commandId: CommandId.make("close-after-verification-error"),
+        threadId,
+      });
+      const received = Array.from(yield* Stream.runCollect(events));
+      const snapshotEvent = received.find(
+        (event) => event.type === "thread" && event.item.kind === "snapshot",
+      );
+      if (snapshotEvent?.type !== "thread" || snapshotEvent.item.kind !== "snapshot") {
+        return assert.fail("Expected guest opening snapshot.");
+      }
+      const snapshotVisibleError = snapshotEvent.item.projection.visibleTurnItems.find(
+        (row) => row.sourceItemId === "item:snapshot-verification-error",
+      )?.item;
+      const snapshotTurnError = snapshotEvent.item.projection.turnItems.find(
+        (item) => item.id === "item:snapshot-verification-error",
+      );
+      for (const candidate of [snapshotVisibleError, snapshotTurnError]) {
+        assert.equal(candidate?.type, "error");
+        if (candidate?.type !== "error") return assert.fail("Expected error item in snapshot.");
+        assert.isUndefined(candidate.failure.verificationUrl);
+        assert.isFalse("verificationUrl" in candidate.failure);
+        assert.equal(candidate.failure.code, "VALIDATION_REQUIRED");
+        assert.equal(candidate.failure.message, "Verify your Google account to continue.");
+      }
+
+      const liveErrorPayload = received
+        .flatMap((event) =>
+          event.type === "thread" &&
+          event.item.kind === "event" &&
+          event.item.event.type === "turn-item.updated" &&
+          event.item.event.payload.id === "item:live-verification-error"
+            ? [event.item.event.payload]
+            : [],
+        )
+        .at(0);
+      assert.equal(liveErrorPayload?.type, "error");
+      if (liveErrorPayload?.type !== "error") return assert.fail("Expected live error item.");
+      assert.isUndefined(liveErrorPayload.failure.verificationUrl);
+      assert.isFalse("verificationUrl" in liveErrorPayload.failure);
+      assert.equal(liveErrorPayload.failure.class, "permission_error");
+
+      // Re-open share briefly to read history page for the older error item.
+      const reopened = yield* guestShares.create({ threadId });
+      const { token: historySession } = yield* guestShares.redeem({
+        credential: reopened.url.slice(reopened.url.indexOf("#") + 1),
+        name: "Sam",
+      });
+      let cursor = snapshotEvent.item.historyCursor ?? null;
+      assert.isNotNull(cursor);
+      let historicalError: OrchestrationV2TurnItem | undefined;
+      while (cursor !== null && historicalError === undefined) {
+        const page: OrchestrationV2ThreadHistoryPage = yield* guestShares.history(
+          historySession,
+          cursor,
+        );
+        historicalError = page.items.find(
+          (row) => row.sourceItemId === "item:old-verification-error",
+        )?.item;
+        cursor = page.hasMoreHistory ? page.nextCursor : null;
+      }
+      assert.equal(historicalError?.type, "error");
+      if (historicalError?.type !== "error") return assert.fail("Expected error item in history.");
+      assert.isUndefined(historicalError.failure.verificationUrl);
+      assert.isFalse("verificationUrl" in historicalError.failure);
+      assert.equal(historicalError.failure.code, "VALIDATION_REQUIRED");
+
+      // Underlying stored items and the shared owner stream cache must remain intact.
+      const storedSnapshot = yield* orchestrator.getTurnItem({
+        threadId,
+        itemId: TurnItemId.make("item:snapshot-verification-error"),
+      });
+      assert.equal(
+        storedSnapshot?.type === "error" ? storedSnapshot.failure.verificationUrl : undefined,
+        verificationUrl,
+      );
+      assert.equal(
+        cachedOwnerItem.event.type === "turn-item.updated" &&
+          cachedOwnerItem.event.payload.type === "error"
+          ? cachedOwnerItem.event.payload.failure.verificationUrl
+          : undefined,
+        verificationUrl,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );

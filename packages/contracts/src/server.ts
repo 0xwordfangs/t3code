@@ -62,6 +62,13 @@ export const ServerProviderAuthStatus = Schema.Literals([
 export type ServerProviderAuthStatus = typeof ServerProviderAuthStatus.Type;
 
 const GOOGLE_ACCOUNT_VERIFICATION_ORIGIN = "https://accounts.google.com";
+const GOOGLE_ACCOUNT_VERIFICATION_PATH = /^\/(?:v\d+\/)?signin\/continue$/;
+const FORBIDDEN_VERIFICATION_QUERY_KEYS = new Set([
+  "client_id",
+  "redirect_uri",
+  "response_type",
+  "scope",
+]);
 
 function hasUnsafeVerificationUrlCharacter(value: string): boolean {
   if (/[\s\\]/u.test(value)) return true;
@@ -72,18 +79,61 @@ function hasUnsafeVerificationUrlCharacter(value: string): boolean {
   return false;
 }
 
-function isGoogleAccountVerificationUrl(value: string): boolean {
-  if (hasUnsafeVerificationUrlCharacter(value)) return false;
+function hasAuthorityUserinfo(value: string): boolean {
+  if (!/^https:\/\//i.test(value)) return true;
+  const afterScheme = value.slice("https://".length);
+  const authorityEnd = afterScheme.search(/[/?#]/);
+  const rawAuthority = authorityEnd === -1 ? afterScheme : afterScheme.slice(0, authorityEnd);
+  return rawAuthority.includes("@");
+}
+
+function isGoogleContinueTargetUrl(value: string): boolean {
+  if (hasUnsafeVerificationUrlCharacter(value) || hasAuthorityUserinfo(value)) return false;
   try {
     const url = new URL(value);
     return (
       url.protocol === "https:" &&
-      url.hostname === "accounts.google.com" &&
-      url.origin === GOOGLE_ACCOUNT_VERIFICATION_ORIGIN &&
       url.username === "" &&
       url.password === "" &&
-      url.pathname.startsWith("/")
+      !url.hostname.startsWith(".") &&
+      (url.hostname === "google.com" ||
+        url.hostname.endsWith(".google.com") ||
+        url.hostname.endsWith(".google"))
     );
+  } catch {
+    return false;
+  }
+}
+
+function isGoogleAccountVerificationUrl(value: string): boolean {
+  if (
+    hasUnsafeVerificationUrlCharacter(value) ||
+    hasAuthorityUserinfo(value) ||
+    value.includes("#")
+  ) {
+    return false;
+  }
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "accounts.google.com" ||
+      url.origin !== GOOGLE_ACCOUNT_VERIFICATION_ORIGIN ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.hash !== "" ||
+      !GOOGLE_ACCOUNT_VERIFICATION_PATH.test(url.pathname)
+    ) {
+      return false;
+    }
+    for (const [rawKey, paramValue] of url.searchParams) {
+      const key = rawKey.toLowerCase();
+      if (FORBIDDEN_VERIFICATION_QUERY_KEYS.has(key)) return false;
+      if ((key === "continue" || key === "continueurl") && !isGoogleContinueTargetUrl(paramValue)) {
+        return false;
+      }
+    }
+    return true;
   } catch {
     return false;
   }

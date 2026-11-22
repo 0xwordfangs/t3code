@@ -1,4 +1,5 @@
 import {
+  AuthProvidersManageScope,
   AuthSessionId,
   type AuthEnvironmentScope,
   EnvironmentAuthenticatedAuth,
@@ -6,14 +7,20 @@ import {
   EnvironmentHttpApi,
   EnvironmentId,
   EventId,
+  GoogleAccountVerificationUrl,
+  MessageId,
   ORCHESTRATION_PROTOCOL_HEADER,
   ORCHESTRATION_PROTOCOL_VERSION_TEXT,
   OrchestrationV2AppThread,
   OrchestrationV2Run,
+  OrchestrationV2ThreadBoundedSnapshot,
+  OrchestrationV2ThreadDetailSnapshot,
+  OrchestrationV2ThreadHistoryPage,
   OrchestrationV2TurnItem,
   OrchestrationV2ThreadTranscript,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
@@ -49,6 +56,15 @@ class TranscriptTestApi extends HttpApi.make("environment").add(
 ) {}
 const decodeTranscript = Schema.decodeUnknownEffect(
   Schema.toCodecJson(OrchestrationV2ThreadTranscript),
+);
+const decodeDetailSnapshot = Schema.decodeUnknownEffect(
+  Schema.toCodecJson(OrchestrationV2ThreadDetailSnapshot),
+);
+const decodeBoundedSnapshot = Schema.decodeUnknownEffect(
+  Schema.toCodecJson(OrchestrationV2ThreadBoundedSnapshot),
+);
+const decodeHistoryPage = Schema.decodeUnknownEffect(
+  Schema.toCodecJson(OrchestrationV2ThreadHistoryPage),
 );
 
 const now = DateTime.makeUnsafe("2026-09-29T00:00:00.000Z");
@@ -118,7 +134,10 @@ const rolledBackRun = Schema.decodeSync(OrchestrationV2Run)({
 });
 
 // Serves the orchestration HTTP routes over real stores; `allowed` gates the read scope.
-const serveOrchestrationHttp = (allowed: () => boolean) =>
+const serveOrchestrationHttp = (
+  allowed: () => boolean,
+  extraScopes: () => ReadonlyArray<AuthEnvironmentScope> = () => [],
+) =>
   Effect.gen(function* () {
     const runtime = ProviderReplayHarness.layerWithRegistry(
       { name: "thread-transcript" },
@@ -164,7 +183,9 @@ const serveOrchestrationHttp = (allowed: () => boolean) =>
                 sessionId: AuthSessionId.make("test-session"),
                 subject: "test",
                 method: "bearer-access-token",
-                scopes: new Set<AuthEnvironmentScope>(allowed() ? ["orchestration:read"] : []),
+                scopes: new Set<AuthEnvironmentScope>(
+                  allowed() ? ["orchestration:read", ...extraScopes()] : [],
+                ),
               }),
             ),
           ),
@@ -391,6 +412,154 @@ it.effect("leaves older settled threads out of the HTTP shell only when asked", 
     expect(yield* shell(`?resumeFrom=${full.snapshotSequence - 1}`)).toEqual({ resumable: true });
     for (const cursor of [full.snapshotSequence + 1, "x"]) {
       expect((yield* shell(`?omitOlderSettled=1&resumeFrom=${cursor}`)).threads).toHaveLength(26);
+    }
+  }),
+);
+
+it.effect("filters failure verificationUrl on HTTP thread routes by providers:manage", () =>
+  Effect.gen(function* () {
+    let canManageProviders = false;
+    const { eventSink, handler } = yield* serveOrchestrationHttp(
+      () => true,
+      () => (canManageProviders ? [AuthProvidersManageScope] : []),
+    );
+    const verificationUrl = GoogleAccountVerificationUrl.make(
+      "https://accounts.google.com/v3/signin/continue?plt=secret-http-token",
+    );
+    const makeErrorItem = (id: string, ordinal: number): OrchestrationV2TurnItem => ({
+      id: TurnItemId.make(id),
+      threadId: thread.id,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal,
+      type: "error",
+      status: "failed",
+      title: null,
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      failure: {
+        class: "permission_error",
+        message: "Verify your Google account to continue.",
+        code: "VALIDATION_REQUIRED",
+        retryable: false,
+        verificationUrl,
+      },
+    });
+    const makeUserMessageItem = (index: number): OrchestrationV2TurnItem => ({
+      id: TurnItemId.make(`user-msg-${index}`),
+      threadId: thread.id,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: index + 1,
+      type: "user_message",
+      status: "completed",
+      title: null,
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      createdBy: "user",
+      creationSource: "web",
+      messageId: MessageId.make(`msg-${index}`),
+      inputIntent: "turn_start",
+      text: `Question ${index}`,
+      attachments: [],
+    });
+
+    const seeded: ReadonlyArray<OrchestrationV2TurnItem> = [
+      makeErrorItem("error-old", 0),
+      ...Array.from({ length: 25 }, (_, index) => makeUserMessageItem(index)),
+      makeErrorItem("error-recent", 26),
+    ];
+    yield* eventSink.write({
+      events: seeded.map((item) => ({
+        id: EventId.make(`event-${item.id}`),
+        type: "turn-item.updated" as const,
+        threadId: thread.id,
+        occurredAt: now,
+        payload: item,
+      })),
+    });
+
+    const fetchJson = (path: string) =>
+      Effect.promise(async () => {
+        const response = await handler(
+          new Request(`http://localhost${path}`, {
+            headers: { [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT },
+          }),
+        );
+        expect(response.status).toBe(200);
+        return response.json();
+      });
+
+    for (const expectedUrl of [undefined, verificationUrl] as const) {
+      canManageProviders = expectedUrl !== undefined;
+
+      const snapshot = yield* decodeDetailSnapshot(
+        yield* fetchJson(`/api/orchestration/threads/${thread.id}`),
+      );
+      const snapshotError = snapshot.projection.turnItems.find(
+        (item) => item.id === "error-recent",
+      );
+      const snapshotVisibleError = snapshot.projection.visibleTurnItems.find(
+        (row) => row.sourceItemId === "error-recent",
+      )?.item;
+      for (const candidate of [snapshotError, snapshotVisibleError]) {
+        expect(candidate?.type).toBe("error");
+        if (candidate?.type !== "error") throw new Error("Expected error item");
+        expect(candidate.failure.verificationUrl).toBe(expectedUrl);
+        expect("verificationUrl" in candidate.failure).toBe(expectedUrl !== undefined);
+        expect(candidate.failure.code).toBe("VALIDATION_REQUIRED");
+      }
+
+      const transcript = yield* decodeTranscript(
+        yield* fetchJson(`/api/orchestration/threads/${thread.id}/transcript`),
+      );
+      const transcriptError = transcript.items.find(
+        (row) => row.sourceItemId === "error-recent",
+      )?.item;
+      expect(transcriptError?.type).toBe("error");
+      if (transcriptError?.type !== "error") throw new Error("Expected transcript error item");
+      expect(transcriptError.failure.verificationUrl).toBe(expectedUrl);
+      expect("verificationUrl" in transcriptError.failure).toBe(expectedUrl !== undefined);
+
+      const bounded = yield* decodeBoundedSnapshot(
+        yield* fetchJson(
+          `/api/orchestration/threads/${thread.id}/bounded?compactTurnItems=1&dedupeBodies=1`,
+        ),
+      );
+      const boundedError = bounded.projection.visibleTurnItems.find(
+        (row) => row.sourceItemId === "error-recent",
+      )?.item;
+      expect(boundedError?.type).toBe("error");
+      if (boundedError?.type !== "error") throw new Error("Expected bounded error item");
+      expect(boundedError.failure.verificationUrl).toBe(expectedUrl);
+      expect("verificationUrl" in boundedError.failure).toBe(expectedUrl !== undefined);
+
+      expect(bounded.historyCursor).not.toBeNull();
+      let cursor: string | null = bounded.historyCursor;
+      let historicalError: OrchestrationV2TurnItem | undefined;
+      while (cursor !== null && historicalError === undefined) {
+        const page = yield* decodeHistoryPage(
+          yield* fetchJson(
+            `/api/orchestration/threads/${thread.id}/history?cursor=${encodeURIComponent(cursor)}`,
+          ),
+        );
+        historicalError = page.items.find((row) => row.sourceItemId === "error-old")?.item;
+        cursor = page.hasMoreHistory ? page.nextCursor : null;
+      }
+      expect(historicalError?.type).toBe("error");
+      if (historicalError?.type !== "error") throw new Error("Expected history error item");
+      expect(historicalError.failure.verificationUrl).toBe(expectedUrl);
+      expect("verificationUrl" in historicalError.failure).toBe(expectedUrl !== undefined);
     }
   }),
 );

@@ -312,7 +312,10 @@ export function makeAntigravityAcpAdapterFlavor(
     requiresSignIn: isAntigravitySignInRequiredError,
     promptFailure: (cause) => {
       const failure = classifyAntigravityPromptFailure(cause);
-      if (failure.code === ANTIGRAVITY_VERIFICATION_REQUIRED_CODE) {
+      if (
+        failure.class === "permission_error" &&
+        failure.code === ANTIGRAVITY_VERIFICATION_REQUIRED_CODE
+      ) {
         const notice: AntigravityVerificationNotification = {
           message: failure.message,
           ...(failure.verificationUrl === undefined
@@ -343,7 +346,10 @@ export function makeAntigravityAcpAdapterFlavor(
                 (check) => (result: EffectAcpSchema.PromptResponse) =>
                   check(result).pipe(
                     Effect.tap((outcome) => {
-                      if (outcome?.failure.code !== ANTIGRAVITY_VERIFICATION_REQUIRED_CODE) {
+                      if (
+                        outcome?.failure.class !== "permission_error" ||
+                        outcome.failure.code !== ANTIGRAVITY_VERIFICATION_REQUIRED_CODE
+                      ) {
                         return Effect.void;
                       }
                       const notice: AntigravityVerificationNotification = {

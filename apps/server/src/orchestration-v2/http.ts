@@ -1,5 +1,6 @@
 import {
   AuthOrchestrationReadScope,
+  AuthProvidersManageScope,
   EnvironmentHttpApi,
   type OrchestrationProjectShell,
 } from "@t3tools/contracts";
@@ -37,7 +38,12 @@ import {
   projectIdentitiesDigest,
 } from "./ShellStream.ts";
 import { boundedSnapshotResponseFields } from "./ThreadStream.ts";
-import { projectThreadProjectionForWire } from "./WireProjection.ts";
+import {
+  projectThreadProjectionForWire,
+  stripThreadHistoryPageVerificationUrls,
+  stripThreadProjectionVerificationUrls,
+  stripThreadTranscriptVerificationUrls,
+} from "./WireProjection.ts";
 
 const isInvalidThreadHistoryCursorError = Schema.is(InvalidThreadHistoryCursorError);
 
@@ -199,14 +205,16 @@ export const layer = HttpApiBuilder.group(
         "threadSnapshot",
         Effect.fn("environment.orchestration.threadSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const session = yield* requireEnvironmentScope(AuthOrchestrationReadScope);
           const snapshot = yield* loadThreadSnapshot(
             args.params.threadId,
             "orchestration_thread_snapshot_failed",
           ).pipe(traceLocalHandlerWork);
           return {
             snapshotSequence: snapshot.snapshotSequence,
-            projection: snapshot.projection,
+            projection: session.scopes.has(AuthProvidersManageScope)
+              ? snapshot.projection
+              : stripThreadProjectionVerificationUrls(snapshot.projection),
           };
         }),
       )
@@ -214,8 +222,13 @@ export const layer = HttpApiBuilder.group(
         "threadTranscript",
         Effect.fn("environment.orchestration.threadTranscript")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const session = yield* requireEnvironmentScope(AuthOrchestrationReadScope);
           return yield* threadManagement.getThreadTranscript(args.params.threadId).pipe(
+            Effect.map((transcript) =>
+              session.scopes.has(AuthProvidersManageScope)
+                ? transcript
+                : stripThreadTranscriptVerificationUrls(transcript),
+            ),
             Effect.provideService(ServerEnvironment.ServerEnvironmentIdentity, environment),
             traceLocalHandlerWork,
             Effect.catch(
@@ -239,15 +252,18 @@ export const layer = HttpApiBuilder.group(
         "threadBoundedSnapshot",
         Effect.fn("environment.orchestration.threadBoundedSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const session = yield* requireEnvironmentScope(AuthOrchestrationReadScope);
           const snapshot = yield* loadThreadSnapshotWindow(
             args.params.threadId,
             undefined,
             undefined,
             args.query.deferWork === "1",
           ).pipe(traceLocalHandlerWork);
+          const projection = session.scopes.has(AuthProvidersManageScope)
+            ? snapshot.projection
+            : stripThreadProjectionVerificationUrls(snapshot.projection);
           const bounded = buildBoundedThreadProjection({
-            projection: snapshot.projection,
+            projection,
             snapshotSequence: snapshot.snapshotSequence,
           });
           return {
@@ -265,7 +281,7 @@ export const layer = HttpApiBuilder.group(
         "threadHistoryPage",
         Effect.fn("environment.orchestration.threadHistoryPage")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const session = yield* requireEnvironmentScope(AuthOrchestrationReadScope);
           const decoded = Result.try(() => decodeThreadHistoryCursor(args.query.cursor));
           if (Result.isFailure(decoded)) {
             const cause = decoded.failure;
@@ -286,9 +302,14 @@ export const layer = HttpApiBuilder.group(
                   : undefined,
             )
             .pipe(
-              Effect.map((page) =>
-                args.query.compactIds === "1" ? { ...page, idTable: true as const } : page,
-              ),
+              Effect.map((page) => {
+                const visible = session.scopes.has(AuthProvidersManageScope)
+                  ? page
+                  : stripThreadHistoryPageVerificationUrls(page);
+                return args.query.compactIds === "1"
+                  ? { ...visible, idTable: true as const }
+                  : visible;
+              }),
               traceLocalHandlerWork,
               Effect.catch(
                 Effect.fnUntraced(function* (cause) {

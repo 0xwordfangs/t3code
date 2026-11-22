@@ -3,6 +3,7 @@ import { SecretProviderId, type ServerProviderModel } from "@t3tools/contracts";
 
 import {
   deriveProviderModelsForDisplay,
+  formatVerificationUrlDisplay,
   nextProviderEnvironmentWithFieldSecret,
   nextProviderEnvironmentWithFieldValue,
 } from "./ProviderInstanceCard";
@@ -101,5 +102,19 @@ describe("provider environment helpers", () => {
         "new-key",
       ),
     ).toEqual([{ name: "OPENAI_API_KEY", value: "new-key", sensitive: true }]);
+  });
+});
+
+describe("formatVerificationUrlDisplay", () => {
+  it("strips query tokens and fragments while keeping origin and pathname", () => {
+    expect(
+      formatVerificationUrlDisplay(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-token&flow=1#step",
+      ),
+    ).toBe("https://accounts.google.com/v3/signin/continue");
+  });
+
+  it("falls back to the input when URL parsing fails", () => {
+    expect(formatVerificationUrlDisplay("not-a-valid-url")).toBe("not-a-valid-url");
   });
 });

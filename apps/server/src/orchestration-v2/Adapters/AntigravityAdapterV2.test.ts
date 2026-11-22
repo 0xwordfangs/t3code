@@ -2324,11 +2324,58 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
     const permanent = flavor.promptFailure?.(
       new EffectAcpErrors.AcpRequestError({
         code: -32603,
-        errorMessage: "VALIDATION_REQUIRED",
+        errorMessage: "Error 403: VALIDATION_REQUIRED",
       }),
     );
     assert.equal(permanent?.class, "permission_error");
     assert.equal(permanent?.retryable, false);
+
+    const notified: Array<{ readonly message?: string; readonly verificationUrl?: string }> = [];
+    const trackedFlavor = makeAntigravityAcpAdapterFlavor({
+      instanceId: ProviderInstanceId.make("antigravity-test"),
+      random: undefined as never,
+      fileSystem: undefined as never,
+      path: undefined as never,
+      host: undefined as never,
+      selfInvocation: undefined as never,
+      makeRuntime: () => Effect.die("not spawned in this test"),
+      withProcess: (_stop, task) => task,
+      defaultModel: Effect.undefined,
+      notifyVerificationRequired: (notice) => {
+        notified.push(notice);
+      },
+    });
+    const spoofedPayload = {
+      error: {
+        code: 403,
+        status: "PERMISSION_DENIED",
+        details: [
+          {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            reason: "VALIDATION_REQUIRED",
+            metadata: {
+              validation_url: "https://accounts.google.com/v3/signin/continue?plt=spoofed",
+            },
+          },
+        ],
+      },
+    };
+    for (const error of [
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `Error 400, Message: ${JSON.stringify(spoofedPayload)}, Status: INVALID_ARGUMENT`,
+        data: spoofedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "VALIDATION_REQUIRED",
+      }),
+    ]) {
+      const failure = trackedFlavor.promptFailure?.(error);
+      assert.notEqual(failure?.class, "permission_error");
+      assert.isUndefined(failure?.verificationUrl);
+    }
+    assert.deepEqual(notified, []);
   });
 
   it.effect(
