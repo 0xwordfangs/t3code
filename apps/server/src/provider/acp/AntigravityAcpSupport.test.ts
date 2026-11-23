@@ -739,8 +739,8 @@ const isProcessAlive = (pid: number, platform: NodeJS.Platform): boolean => {
     }
     throw cause;
   }
-  if (platform === "linux") {
-    const identity = AcpSessionRuntime.makePosixProcessTreeController("linux").identity(pid);
+  if (platform === "linux" || platform === "darwin") {
+    const identity = AcpSessionRuntime.makePosixProcessTreeController(platform).identity(pid);
     return identity !== undefined && !AcpSessionRuntime.posixProcessIsZombie(identity);
   }
   return true;
@@ -752,6 +752,65 @@ const forceKillPid = (pid: number | undefined) => {
     process.kill(pid, "SIGKILL");
   } catch {}
 };
+
+const MOCK_DETACHED_AGENT_SCRIPT = [
+  'import { spawn } from "node:child_process";',
+  'import { writeFileSync } from "node:fs";',
+  'import { createInterface } from "node:readline";',
+  "const detachedPidFile = process.env.T3_TEST_DETACHED_PID_FILE;",
+  "const agentPidFile = process.env.T3_TEST_AGENT_PID_FILE;",
+  'if (agentPidFile) writeFileSync(agentPidFile, String(process.pid), "utf8");',
+  "const keepAlive = setInterval(() => {}, 60_000);",
+  "const reply = (id, result) => {",
+  '  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\\n`);',
+  "};",
+  "const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });",
+  'rl.on("line", (line) => {',
+  "  if (!line.trim()) return;",
+  "  const msg = JSON.parse(line);",
+  '  if (msg.method === "initialize") {',
+  "    reply(msg.id, {",
+  "      protocolVersion: 1,",
+  "      agentCapabilities: {},",
+  '      authMethods: [{ id: "oauth-personal", name: "OAuth" }],',
+  "    });",
+  '  } else if (msg.method === "authenticate") {',
+  "    reply(msg.id, {});",
+  '  } else if (msg.method === "session/new") {',
+  '    reply(msg.id, { sessionId: "mock-ag-session-1" });',
+  '  } else if (msg.method === "session/prompt") {',
+  '    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {',
+  '      detached: process.env.T3_TEST_DETACHED_CHILD === "1",',
+  '      stdio: "ignore",',
+  "    });",
+  "    child.unref();",
+  "    if (detachedPidFile && child.pid) {",
+  '      writeFileSync(detachedPidFile, String(child.pid), "utf8");',
+  "    }",
+  "    process.stdout.write(",
+  "      `${JSON.stringify({",
+  '        jsonrpc: "2.0",',
+  '        method: "session/update",',
+  "        params: {",
+  '          sessionId: "mock-ag-session-1",',
+  "          update: {",
+  '            sessionUpdate: "tool_call",',
+  '            toolCallId: "call_detached_1",',
+  '            title: "Running run_command",',
+  '            kind: "execute",',
+  '            status: "in_progress",',
+  '            rawInput: { CommandLine: "sleep 30", WaitMsBeforeAsync: 5000 },',
+  "          },",
+  "        },",
+  "      })}\\n`,",
+  "    );",
+  '    reply(msg.id, { stopReason: "end_turn" });',
+  "  } else if (msg.id !== undefined) {",
+  "    reply(msg.id, {});",
+  "  }",
+  "});",
+  'rl.on("close", () => clearInterval(keepAlive));',
+].join("\n");
 
 describe("makeAntigravityAcpRuntime process teardown (CF-03)", () => {
   it.live(
@@ -767,67 +826,7 @@ describe("makeAntigravityAcpRuntime process teardown (CF-03)", () => {
         const detachedPidFile = path.join(tempDir, "detached.pid");
         const agentPidFile = path.join(tempDir, "agent.pid");
 
-        yield* fs.writeFileString(
-          mockAgentPath,
-          [
-            'import { spawn } from "node:child_process";',
-            'import { writeFileSync } from "node:fs";',
-            'import { createInterface } from "node:readline";',
-            "const detachedPidFile = process.env.T3_TEST_DETACHED_PID_FILE;",
-            "const agentPidFile = process.env.T3_TEST_AGENT_PID_FILE;",
-            'if (agentPidFile) writeFileSync(agentPidFile, String(process.pid), "utf8");',
-            "const keepAlive = setInterval(() => {}, 60_000);",
-            "const reply = (id, result) => {",
-            '  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\\n`);',
-            "};",
-            "const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });",
-            'rl.on("line", (line) => {',
-            "  if (!line.trim()) return;",
-            "  const msg = JSON.parse(line);",
-            '  if (msg.method === "initialize") {',
-            "    reply(msg.id, {",
-            "      protocolVersion: 1,",
-            "      agentCapabilities: {},",
-            '      authMethods: [{ id: "oauth-personal", name: "OAuth" }],',
-            "    });",
-            '  } else if (msg.method === "authenticate") {',
-            "    reply(msg.id, {});",
-            '  } else if (msg.method === "session/new") {',
-            '    reply(msg.id, { sessionId: "mock-ag-session-1" });',
-            '  } else if (msg.method === "session/prompt") {',
-            '    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {',
-            '      detached: process.env.T3_TEST_DETACHED_CHILD === "1",',
-            '      stdio: "ignore",',
-            "    });",
-            "    child.unref();",
-            "    if (detachedPidFile && child.pid) {",
-            '      writeFileSync(detachedPidFile, String(child.pid), "utf8");',
-            "    }",
-            "    process.stdout.write(",
-            "      `${JSON.stringify({",
-            '        jsonrpc: "2.0",',
-            '        method: "session/update",',
-            "        params: {",
-            '          sessionId: "mock-ag-session-1",',
-            "          update: {",
-            '            sessionUpdate: "tool_call",',
-            '            toolCallId: "call_detached_1",',
-            '            title: "Running run_command",',
-            '            kind: "execute",',
-            '            status: "in_progress",',
-            '            rawInput: { CommandLine: "sleep 30", WaitMsBeforeAsync: 5000 },',
-            "          },",
-            "        },",
-            "      })}\\n`,",
-            "    );",
-            '    reply(msg.id, { stopReason: "end_turn" });',
-            "  } else if (msg.id !== undefined) {",
-            "    reply(msg.id, {});",
-            "  }",
-            "});",
-            'rl.on("close", () => clearInterval(keepAlive));',
-          ].join("\n"),
-        );
+        yield* fs.writeFileString(mockAgentPath, MOCK_DETACHED_AGENT_SCRIPT);
 
         let detachedPid: number | undefined;
         let agentPid: number | undefined;
@@ -844,7 +843,7 @@ describe("makeAntigravityAcpRuntime process teardown (CF-03)", () => {
               env: {
                 T3_TEST_DETACHED_PID_FILE: detachedPidFile,
                 T3_TEST_AGENT_PID_FILE: agentPidFile,
-                T3_TEST_DETACHED_CHILD: platform === "linux" ? "1" : "0",
+                T3_TEST_DETACHED_CHILD: platform === "linux" || platform === "darwin" ? "1" : "0",
               },
             },
           }).pipe(
@@ -864,6 +863,77 @@ describe("makeAntigravityAcpRuntime process teardown (CF-03)", () => {
 
           yield* Scope.close(runtimeScope, Exit.void);
           expect(isProcessAlive(detachedPid, platform)).toBe(false);
+        }).pipe(
+          Effect.ensuring(
+            Scope.close(runtimeScope, Exit.void).pipe(
+              Effect.ignore,
+              Effect.andThen(
+                Effect.sync(() => {
+                  forceKillPid(detachedPid);
+                  forceKillPid(agentPid);
+                }),
+              ),
+            ),
+          ),
+        );
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.live(
+    "terminates the ACP child and its detached descendant on darwin via ps-based tracking",
+    () =>
+      Effect.gen(function* () {
+        if ((yield* HostProcess.Platform) === "win32") return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-r2cf04-" });
+        const mockAgentPath = path.join(tempDir, "mock-ag-agent.mjs");
+        const detachedPidFile = path.join(tempDir, "detached.pid");
+        const agentPidFile = path.join(tempDir, "agent.pid");
+
+        yield* fs.writeFileString(mockAgentPath, MOCK_DETACHED_AGENT_SCRIPT);
+
+        let detachedPid: number | undefined;
+        let agentPid: number | undefined;
+        const runtimeScope = yield* Scope.make();
+
+        yield* Effect.gen(function* () {
+          const runtime = yield* makeAntigravityAcpRuntime({
+            childProcessSpawner,
+            cwd: tempDir,
+            linuxCgroupController: null,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: tempDir,
+              env: {
+                T3_TEST_DETACHED_PID_FILE: detachedPidFile,
+                T3_TEST_AGENT_PID_FILE: agentPidFile,
+                T3_TEST_DETACHED_CHILD: "1",
+              },
+            },
+          }).pipe(
+            Effect.provideService(HostProcess.Platform, "darwin"),
+            Effect.provideService(Scope.Scope, runtimeScope),
+            Effect.provideService(AgentScope, AgentScope.defaultValue()),
+          );
+
+          yield* runtime.start();
+          yield* runtime.prompt({
+            prompt: [{ type: "text", text: "spawn detached child" }],
+          });
+
+          detachedPid = Number((yield* fs.readFileString(detachedPidFile)).trim());
+          agentPid = Number((yield* fs.readFileString(agentPidFile)).trim());
+          expect(Number.isInteger(agentPid) && agentPid > 0).toBe(true);
+          expect(Number.isInteger(detachedPid) && detachedPid > 0).toBe(true);
+          expect(isProcessAlive(agentPid, "darwin")).toBe(true);
+          expect(isProcessAlive(detachedPid, "darwin")).toBe(true);
+
+          yield* Scope.close(runtimeScope, Exit.void);
+          expect(isProcessAlive(agentPid, "darwin")).toBe(false);
+          expect(isProcessAlive(detachedPid, "darwin")).toBe(false);
         }).pipe(
           Effect.ensuring(
             Scope.close(runtimeScope, Exit.void).pipe(

@@ -9,6 +9,8 @@ import * as NodePath from "node:path";
 
 import {
   acpClientExecuteDisposition,
+  acpClientReadDisposition,
+  acpClientWriteDisposition,
   acpMcpToolApprovalElicitationDisposition,
   acpPermissionDisposition,
   makeAcpClientPolicyGrants,
@@ -318,6 +320,105 @@ describe("client terminal disposition", () => {
   });
 });
 
+describe("client file system disposition", () => {
+  const cwd = NodePath.resolve(process.cwd(), "acp-client-fs-workspace");
+  const writableRoot = NodePath.resolve(process.cwd(), "acp-client-fs-extra-root");
+
+  it("allows reads across all valid sandbox policies and denies unknown sandbox policies", () => {
+    for (const sandboxPolicy of [
+      undefined,
+      { type: "readOnly" },
+      { type: "workspaceWrite", writableRoots: [], networkAccess: false },
+      { type: "dangerFullAccess" },
+      { type: "externalSandbox" },
+    ]) {
+      assert.equal(
+        acpClientReadDisposition({
+          runtimeMode: "approval-required",
+          cwd,
+          sandboxPolicy,
+        }),
+        "allow",
+      );
+      assert.equal(
+        acpClientReadDisposition({
+          runtimeMode: "full-access",
+          cwd,
+          sandboxPolicy,
+        }),
+        "allow",
+      );
+    }
+    assert.equal(
+      acpClientReadDisposition({
+        runtimeMode: "full-access",
+        cwd,
+        sandboxPolicy: { type: "unknownSandbox" },
+      }),
+      "deny",
+    );
+  });
+
+  it("enforces approval, readOnly, and workspaceWrite containment for client writes", () => {
+    const insidePath = NodePath.join(cwd, "src", "file.ts");
+    const extraRootPath = NodePath.join(writableRoot, "generated.ts");
+    const outsidePath = NodePath.resolve(process.cwd(), "outside-client-fs", "file.ts");
+
+    assert.equal(
+      acpClientWriteDisposition(
+        {
+          runtimeMode: "full-access",
+          cwd,
+          approvalPolicy: "never",
+          sandboxPolicy: { type: "readOnly" },
+        },
+        insidePath,
+      ),
+      "deny",
+    );
+
+    assert.equal(
+      acpClientWriteDisposition({ runtimeMode: "approval-required", cwd }, insidePath),
+      "ask",
+    );
+    assert.equal(
+      acpClientWriteDisposition(
+        {
+          runtimeMode: "full-access",
+          cwd,
+          approvalPolicy: "on-request",
+          sandboxPolicy: { type: "workspaceWrite", writableRoots: [] },
+        },
+        insidePath,
+      ),
+      "ask",
+    );
+    assert.equal(
+      acpClientWriteDisposition(
+        { runtimeMode: "approval-required", cwd, approvalPolicy: "never" },
+        insidePath,
+      ),
+      "deny",
+    );
+
+    for (const runtimeMode of ["auto-accept-edits", "full-access"] as const) {
+      const workspaceWritePolicy: AcpRuntimePolicy = {
+        runtimeMode,
+        cwd,
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: [writableRoot],
+          networkAccess: false,
+        },
+      };
+      assert.equal(acpClientWriteDisposition(workspaceWritePolicy, insidePath), "allow");
+      assert.equal(acpClientWriteDisposition(workspaceWritePolicy, extraRootPath), "allow");
+      assert.equal(acpClientWriteDisposition(workspaceWritePolicy, outsidePath), "deny");
+      assert.equal(acpClientWriteDisposition(workspaceWritePolicy, "../escape.ts"), "deny");
+    }
+  });
+});
+
 describe("makeAcpClientPolicyGrants", () => {
   it("grants terminals only from execute approvals, never from any other approved kind", () => {
     const grants = makeAcpClientPolicyGrants();
@@ -344,5 +445,18 @@ describe("makeAcpClientPolicyGrants", () => {
     grants.recordApproval({ toolKind: "execute", scope: "turn", turnKey: "turn-2" });
     assert.isFalse(grants.allowsExecute("turn-1"));
     assert.isTrue(grants.allowsExecute("turn-2"));
+  });
+
+  it("clears both session-scoped and turn-scoped execute grants on reset", () => {
+    const grants = makeAcpClientPolicyGrants();
+    grants.recordApproval({ toolKind: "execute", scope: "session", turnKey: "turn-1" });
+    grants.recordApproval({ toolKind: "execute", scope: "turn", turnKey: "turn-2" });
+    assert.isTrue(grants.allowsExecute("turn-1"));
+    assert.isTrue(grants.allowsExecute("turn-2"));
+
+    grants.reset();
+    assert.isFalse(grants.allowsExecute("turn-1"));
+    assert.isFalse(grants.allowsExecute("turn-2"));
+    assert.isFalse(grants.allowsExecute(null));
   });
 });

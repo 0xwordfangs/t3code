@@ -297,6 +297,8 @@ describe("AntigravityAdapterV2 client file system", () => {
       // effect-acp keeps the last handler registered per method; so does this.
       let readTextFile: Parameters<RuntimeService["handleReadTextFile"]>[0] | undefined;
       let writeTextFile: Parameters<RuntimeService["handleWriteTextFile"]>[0] | undefined;
+      const promptStarted = yield* Deferred.make<void>();
+      const promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
       const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-log-" });
       const requestLog = path.join(logs, "requests.ndjson");
       const crypto = yield* SecureRandom.SecureRandom;
@@ -318,6 +320,10 @@ describe("AntigravityAdapterV2 client file system", () => {
             Effect.provideService(SecureRandom.SecureRandom, crypto),
             Effect.map((runtime): RuntimeService => ({
               ...runtime,
+              prompt: () =>
+                Deferred.succeed(promptStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(promptGate)),
+                ),
               handleReadTextFile: (handler) =>
                 Effect.sync(() => {
                   readTextFile = handler;
@@ -355,7 +361,16 @@ describe("AntigravityAdapterV2 client file system", () => {
         modelSelection,
         runtimePolicy,
       });
-      yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* session.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
       const initialize = (yield* fileSystem.readFileString(requestLog))
         .trim()
         .split("\n")
@@ -381,6 +396,71 @@ describe("AntigravityAdapterV2 client file system", () => {
       const insidePath = path.join(workspace, "src", "inside.ts");
       yield* fileSystem.makeDirectory(path.dirname(insidePath), { recursive: true });
       yield* fileSystem.writeFileString(insidePath, "inside");
+
+      const beforeTurnRead = yield* readTextFile(
+        { sessionId: "mock-session-1", path: insidePath },
+        context("fs/read_text_file"),
+      ).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(beforeTurnRead), "reads are denied before a turn starts");
+
+      const now = yield* DateTime.now;
+      yield* session
+        .startTurn({
+          appThread: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project-antigravity-containment"),
+            title: "Antigravity containment",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          threadId,
+          runId: RunId.make("run-antigravity-containment"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-containment"),
+          rootNodeId: NodeId.make("node-antigravity-containment"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-containment"),
+            text: "read files",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(promptStarted);
+      let turnId:
+        | Extract<
+            ProviderAdapter.ProviderAdapterV2Event,
+            { type: "provider_turn.updated" }
+          >["providerTurn"]["id"]
+        | undefined;
+      while (turnId === undefined) {
+        const event = yield* Queue.take(events);
+        if (event.type === "provider_turn.updated" && event.providerTurn.status === "running") {
+          turnId = event.providerTurn.id;
+        }
+      }
+
       const pasted = yield* readTextFile(
         { sessionId: "mock-session-1", path: attachment },
         context("fs/read_text_file"),
@@ -425,6 +505,21 @@ describe("AntigravityAdapterV2 client file system", () => {
         context("fs/read_text_file"),
       );
       assert.equal(viaInsideLink.content, "inside");
+
+      yield* Deferred.succeed(promptGate, { stopReason: "end_turn" });
+      while ((yield* Queue.take(events)).type !== "turn.terminal") {
+        // drain Turn 1
+      }
+      yield* session.interruptTurn({
+        providerThread,
+        providerTurnId: turnId,
+        requestRuntimeRestart: true,
+      });
+      const afterStopRead = yield* readTextFile(
+        { sessionId: "mock-session-1", path: insidePath },
+        context("fs/read_text_file"),
+      ).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(afterStopRead), "reads are denied after Stop");
     }).pipe(Effect.provide(layerSession)),
   );
 });
@@ -1303,6 +1398,8 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
     let onOutgoingResponse: AntigravityAdapterV2RuntimeInput["onOutgoingResponse"];
     let onTermination: AntigravityAdapterV2RuntimeInput["onTermination"];
     let cancelCount = 0;
+    let terminateProcessGroupCount = 0;
+    let runtimeCreateCount = 0;
     let cancelCalled = yield* Deferred.make<void>();
     let promptStarted = yield* Deferred.make<void>();
     let promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
@@ -1318,6 +1415,7 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
         ? {}
         : { profileDirectory: options.profileDirectory }),
       makeRuntime: (input) => {
+        runtimeCreateCount += 1;
         onOutgoingResponse = input.onOutgoingResponse;
         onTermination = input.onTermination;
         return makeAntigravityAcpRuntime({
@@ -1337,6 +1435,14 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
               cancelCount += 1;
               return Deferred.succeed(cancelCalled, undefined).pipe(Effect.andThen(runtime.cancel));
             }),
+            ...(runtime.terminateProcessGroup === undefined
+              ? {}
+              : {
+                  terminateProcessGroup: Effect.suspend(() => {
+                    terminateProcessGroupCount += 1;
+                    return runtime.terminateProcessGroup!;
+                  }),
+                }),
             handleSessionUpdate: (handler) =>
               Effect.sync(() => {
                 sessionUpdateHandler = handler;
@@ -1464,6 +1570,12 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
       },
       get cancelCount() {
         return cancelCount;
+      },
+      get terminateProcessGroupCount() {
+        return terminateProcessGroupCount;
+      },
+      get runtimeCreateCount() {
+        return runtimeCreateCount;
       },
       get cancelCalled() {
         return cancelCalled;
@@ -1898,7 +2010,7 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
         });
 
         assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
-        assert.isAtLeast(harness.cancelCount, 1);
+        assert.isAtLeast(harness.terminateProcessGroupCount, 1);
 
         const drained = yield* Queue.takeAll(harness.events);
         const interruptedCmd = drained.find(
@@ -1957,13 +2069,158 @@ describe("AntigravityAdapterV2 background commands and post-settle wakeup", () =
         while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
           // drain Turn 1
         }
+        assert.isAtLeast(harness.terminateProcessGroupCount, 1);
+        yield* Queue.clear(harness.events);
 
-        // Permission request arriving while stoppedRunQuarantine is active must cancel, not auto-approve.
-        const postStopPerm = yield* harness.requestPermission({
-          toolCall: { toolCallId: "call_after_stop", kind: "execute", title: "echo nope" },
-          options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+        // Stale gen-0 permission request after hard Stop must be suppressed (never auto-approve).
+        const postStopPermFiber = yield* harness
+          .requestPermission({
+            toolCall: { toolCallId: "call_after_stop", kind: "execute", title: "echo nope" },
+            options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+          })
+          .pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        assert.isUndefined(postStopPermFiber.pollUnsafe());
+        const trailingEvents = yield* Queue.clear(harness.events);
+        assert.isFalse(trailingEvents.some((event) => event.type === "runtime_request.updated"));
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "terminates the runtime process group on Stop after a completed run_command and respawns on Turn 2",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "r2-cf03-completed-cmd-stop",
+          runtimeMode: "full-access",
         });
-        assert.deepEqual(postStopPerm, { outcome: { outcome: "cancelled" } });
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        let turn1Id:
+          | Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "provider_turn.updated" }
+            >["providerTurn"]["id"]
+          | undefined;
+        while (turn1Id === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "provider_turn.updated" && event.providerTurn.status === "running") {
+            turn1Id = event.providerTurn.id;
+          }
+        }
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_completed_before_stop",
+          kind: "execute",
+          title: "Running run_command",
+          status: "in_progress",
+          rawInput: { CommandLine: "echo done" },
+        });
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_completed_before_stop",
+          status: "completed",
+          rawOutput: { combinedOutput: "done\n", exitCode: 0 },
+        });
+
+        yield* harness.session.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn1Id,
+          requestRuntimeRestart: true,
+        });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+        assert.isAtLeast(harness.terminateProcessGroupCount, 1);
+
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        let turn2Status: string | undefined;
+        while (turn2Status === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal") turn2Status = event.status;
+        }
+        assert.equal(turn2Status, "completed");
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "terminates the runtime process group on Stop while a native invoke_subagent is in_progress and respawns on Turn 2",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          threadName: "r2-cf03-active-subagent-stop",
+          runtimeMode: "full-access",
+        });
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        let turn1Id:
+          | Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "provider_turn.updated" }
+            >["providerTurn"]["id"]
+          | undefined;
+        while (turn1Id === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "provider_turn.updated" && event.providerTurn.status === "running") {
+            turn1Id = event.providerTurn.id;
+          }
+        }
+
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "subagent-in-progress-stop",
+          kind: "other",
+          title: "Running invoke_subagent",
+          status: "in_progress",
+          rawInput: {
+            Subagents: [{ Role: "Codebase Researcher", Prompt: "Inspect adapters" }],
+          },
+        });
+
+        yield* harness.session.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn1Id,
+          requestRuntimeRestart: true,
+        });
+        const stopEvents: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          stopEvents.push(event);
+          if (event.type === "turn.terminal") {
+            assert.equal(event.status, "interrupted");
+            break;
+          }
+        }
+        assert.isAtLeast(harness.terminateProcessGroupCount, 1);
+        assert.isTrue(
+          stopEvents.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "subagent" &&
+              event.turnItem.status === "interrupted",
+          ),
+        );
+
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        let turn2Status: string | undefined;
+        while (turn2Status === undefined) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal") turn2Status = event.status;
+        }
+        assert.equal(turn2Status, "completed");
       }).pipe(Effect.provide(layerSession)),
   );
 

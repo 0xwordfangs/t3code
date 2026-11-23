@@ -306,6 +306,8 @@ export function makeAntigravityAcpAdapterFlavor(
     offerPostSettleContinuationOnActiveTool: true,
     allowPostSettleWakeWhileBackgroundWorkRuns: true,
     postToolDeferredFinalizeDebounce: "15 seconds",
+    restartRuntimeAfterInterrupt: true,
+    terminateRuntimeProcessGroupOnInterrupt: true,
     supportsImagePrompts: true,
     // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,

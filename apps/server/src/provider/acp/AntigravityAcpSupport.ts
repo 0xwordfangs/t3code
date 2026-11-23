@@ -135,7 +135,8 @@ function antigravityAcpRuntimeProcessOwnership(
   "ownDescendantProcessGroups" | "ownDetachedProcessGroup" | "processGroupPlatform"
 > {
   return {
-    ownDescendantProcessGroups: processGroupPlatform === "linux",
+    ownDescendantProcessGroups:
+      processGroupPlatform === "linux" || processGroupPlatform === "darwin",
     ownDetachedProcessGroup: true,
     processGroupPlatform,
   };

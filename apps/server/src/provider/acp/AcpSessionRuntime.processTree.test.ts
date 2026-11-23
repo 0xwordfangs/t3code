@@ -614,7 +614,19 @@ describe("terminatePosixOwnedProcessTree", () => {
       expect(AcpSessionRuntime.posixProcessIsZombie({ ...identity(1, 0, 1, 1), state: "Z" })).toBe(
         true,
       );
+      expect(AcpSessionRuntime.posixProcessIsZombie({ ...identity(1, 0, 1, 1), state: "Z+" })).toBe(
+        true,
+      );
+      expect(AcpSessionRuntime.posixProcessIsZombie({ ...identity(1, 0, 1, 1), state: "ZN" })).toBe(
+        true,
+      );
+      expect(AcpSessionRuntime.posixProcessIsZombie({ ...identity(1, 0, 1, 1), state: "Zs" })).toBe(
+        true,
+      );
       expect(AcpSessionRuntime.posixProcessIsZombie({ ...identity(1, 0, 1, 1), state: "S" })).toBe(
+        false,
+      );
+      expect(AcpSessionRuntime.posixProcessIsZombie({ ...identity(1, 0, 1, 1), state: "R+" })).toBe(
         false,
       );
       const withoutState: AcpSessionRuntime.AcpPosixProcessIdentity = {
@@ -628,14 +640,14 @@ describe("terminatePosixOwnedProcessTree", () => {
       expect(AcpSessionRuntime.posixProcessIsZombie(withoutState)).toBe(false);
 
       const root = identity(100, process.pid, 100, 100);
-      const zombieChild = identity(110, 100, 110, 110, "110", "Z");
+      const zombieChild = identity(110, 100, 110, 110, "110", "Z+");
       const fixture = makeController({
         processes: [server(), root, zombieChild],
         onProcess: (processes, pid) => {
           // Kill leaves a zombie with the same pid/starttime until reaped.
           const current = processes.get(pid);
           if (current === undefined) return;
-          processes.set(pid, { ...current, state: "Z" });
+          processes.set(pid, { ...current, state: pid === 100 ? "Z" : "Z+" });
         },
       });
       yield* AcpSessionRuntime.terminatePosixOwnedProcessTree({
@@ -644,7 +656,7 @@ describe("terminatePosixOwnedProcessTree", () => {
         rootPid: 100,
       });
       expect(fixture.processes.get(100)?.state).toBe("Z");
-      expect(fixture.processes.get(110)?.state).toBe("Z");
+      expect(fixture.processes.get(110)?.state).toBe("Z+");
     }),
   );
 
@@ -841,13 +853,375 @@ describe("terminatePosixOwnedProcessTree", () => {
     },
   );
 
+  it("parses Darwin ps output including masked or hex sess, BSD states, and malformed rows", () => {
+    const stdout = [
+      "",
+      "  101     1   101        0 R+   Mon Nov  3 10:50:16 2026",
+      "  102   101   102 1a2b3c4d Z+   Mon Nov 23 10:50:17 2026",
+      "  103   101   103      103 SN   Mon Nov 23 10:50:18 2026\r",
+      "  104   103   104 99999999999999999999 ZN Mon Nov 23 10:50:19 2026",
+      "    0     0     0        0 S    Mon Nov 23 10:50:16 2026",
+      "  -5     1     1        0 S    Mon Nov 23 10:50:16 2026",
+      "  abc    1     1        0 S    Mon Nov 23 10:50:16 2026",
+      "  105   101   105        0 S    Mon Nov 23 10:50:16",
+      "  106   101  bad         0 S    Mon Nov 23 10:50:16 2026",
+    ].join("\n");
+
+    expect(AcpSessionRuntime.parseDarwinPsProcessTable(stdout)).toEqual([
+      {
+        executable: undefined,
+        pgid: 101,
+        pid: 101,
+        ppid: 1,
+        sid: 0,
+        startTime: "Mon Nov 3 10:50:16 2026",
+        state: "R",
+      },
+      {
+        executable: undefined,
+        pgid: 102,
+        pid: 102,
+        ppid: 101,
+        sid: 0,
+        startTime: "Mon Nov 23 10:50:17 2026",
+        state: "Z",
+      },
+      {
+        executable: undefined,
+        pgid: 103,
+        pid: 103,
+        ppid: 101,
+        sid: 103,
+        startTime: "Mon Nov 23 10:50:18 2026",
+        state: "S",
+      },
+      {
+        executable: undefined,
+        pgid: 104,
+        pid: 104,
+        ppid: 103,
+        sid: 0,
+        startTime: "Mon Nov 23 10:50:19 2026",
+        state: "Z",
+      },
+    ]);
+  });
+
+  it.live(
+    "terminates detached Darwin descendants when sess is masked to 0 while protecting current pgid",
+    () =>
+      Effect.gen(function* () {
+        const currentPid = process.pid;
+        const rootPid = currentPid + 1000;
+        const detachedPid = currentPid + 1001;
+        const zombiePid = currentPid + 1003;
+        const liveRows = new Map<number, string>([
+          [currentPid, `${currentPid} 1 ${currentPid} 0 S+ Mon Nov 23 10:50:00 2026`],
+          [rootPid, `${rootPid} ${currentPid} ${rootPid} 0 SN Mon Nov 23 10:50:01 2026`],
+          [detachedPid, `${detachedPid} ${rootPid} ${detachedPid} 0 R+ Mon Nov 23 10:50:02 2026`],
+          [zombiePid, `${zombiePid} ${rootPid} ${zombiePid} 0 Z+ Mon Nov 23 10:50:04 2026`],
+        ]);
+        const signals: Array<string> = [];
+        const controller = AcpSessionRuntime.makeDarwinProcessTreeController({
+          readPsTable: () => [...liveRows.values()].join("\n"),
+          signalProcess: (pid, signal) => {
+            signals.push(`${pid}:${signal}`);
+            if (pid !== zombiePid) liveRows.delete(pid);
+          },
+        });
+
+        yield* AcpSessionRuntime.terminatePosixOwnedProcessTree({
+          controller,
+          grace: 0,
+          rootPid,
+        });
+
+        expect(signals).toContain(`${detachedPid}:SIGTERM`);
+        expect(signals).toContain(`${rootPid}:SIGTERM`);
+        expect(signals.some((entry) => entry.startsWith(`${currentPid}:`))).toBe(false);
+        expect(liveRows.has(detachedPid)).toBe(false);
+        expect(liveRows.has(rootPid)).toBe(false);
+
+        const sameGroupPid = currentPid + 1002;
+        const protectedRows = new Map<number, string>([
+          [currentPid, `${currentPid} 1 ${currentPid} 0 S+ Mon Nov 23 10:50:00 2026`],
+          [rootPid, `${rootPid} ${currentPid} ${rootPid} 0 SN Mon Nov 23 10:50:01 2026`],
+          [sameGroupPid, `${sameGroupPid} ${rootPid} ${currentPid} 0 S Mon Nov 23 10:50:03 2026`],
+        ]);
+        const protectedSignals: Array<string> = [];
+        const protectedController = AcpSessionRuntime.makeDarwinProcessTreeController({
+          readPsTable: () => [...protectedRows.values()].join("\n"),
+          signalProcess: (pid, signal) => {
+            protectedSignals.push(`${pid}:${signal}`);
+            protectedRows.delete(pid);
+          },
+        });
+
+        const protectedResult = yield* Effect.exit(
+          AcpSessionRuntime.terminatePosixOwnedProcessTree({
+            controller: protectedController,
+            grace: 0,
+            rootPid,
+          }),
+        );
+
+        expect(Exit.isFailure(protectedResult)).toBe(true);
+        expect(protectedSignals).toContain(`${rootPid}:SIGTERM`);
+        expect(protectedSignals.some((entry) => entry.startsWith(`${currentPid}:`))).toBe(false);
+        expect(protectedSignals.some((entry) => entry.startsWith(`${sameGroupPid}:`))).toBe(false);
+        expect(protectedRows.has(sameGroupPid)).toBe(true);
+      }),
+  );
+
+  it("caches Darwin ps reads within the TTL and refreshes on snapshot or signalProcess", () => {
+    let clockMs = 100;
+    let reads = 0;
+    let tableText = [
+      "100 1 100 0 S Mon Nov 23 10:50:00 2026",
+      "101 100 101 0 S Mon Nov 23 10:50:01 2026",
+    ].join("\n");
+    const sent: Array<string> = [];
+    const controller = AcpSessionRuntime.makeDarwinProcessTreeController({
+      cacheTtlMs: 15,
+      now: () => clockMs,
+      readPsTable: () => {
+        reads += 1;
+        return tableText;
+      },
+      signalProcess: (pid, signal) => {
+        sent.push(`${pid}:${signal}`);
+        if (pid === 999) {
+          throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+        }
+        if (pid === 888) {
+          throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+        }
+      },
+    });
+
+    expect(controller.identity(100)?.pid).toBe(100);
+    expect(controller.childPidsOf(100)).toEqual([101]);
+    expect(controller.childrenOf(100).map((entry) => entry.pid)).toEqual([101]);
+    expect(reads).toBe(1);
+
+    clockMs += 10;
+    expect(controller.identity(101)?.pid).toBe(101);
+    expect(reads).toBe(1);
+
+    clockMs += 5;
+    expect(controller.identity(101)?.pid).toBe(101);
+    expect(reads).toBe(2);
+
+    tableText = "100 1 100 0 S Mon Nov 23 10:50:00 2026";
+    expect(controller.snapshot().map((entry) => entry.pid)).toEqual([100]);
+    expect(reads).toBe(3);
+    expect(controller.identity(101)).toBeUndefined();
+    expect(reads).toBe(3);
+
+    controller.signalProcess(999, "SIGTERM");
+    expect(controller.identity(100)?.pid).toBe(100);
+    expect(reads).toBe(4);
+
+    expect(() => controller.signalProcess(888, "SIGTERM")).toThrow("EPERM");
+    expect(controller.identity(100)?.pid).toBe(100);
+    expect(reads).toBe(5);
+    expect(sent).toEqual(["999:SIGTERM", "888:SIGTERM"]);
+  });
+
+  it("throws on transient Darwin ps errors without wiping the ownership frontier", () => {
+    let clockMs = 100;
+    let failRead = false;
+    let tableText = "100 1 100 0 S Mon Nov 23 10:50:00 2026";
+    const controller = AcpSessionRuntime.makeDarwinProcessTreeController({
+      cacheTtlMs: 15,
+      now: () => clockMs,
+      readPsTable: () => {
+        if (failRead) throw new Error("ps timed out");
+        return tableText;
+      },
+    });
+    const frontier = new Map<number, AcpSessionRuntime.AcpOwnedPosixProcess>();
+    const childQueues = new Map<number, Array<number>>();
+    const ledger = new Map<string, AcpSessionRuntime.AcpOwnedPosixProcess>();
+    const root: AcpSessionRuntime.AcpPosixOwnershipRoot = { value: undefined };
+
+    AcpSessionRuntime.observePosixOwnershipLedger({
+      childQueues,
+      controller,
+      frontier,
+      ledger,
+      root,
+      rootPid: 100,
+    });
+    expect(frontier.has(100)).toBe(true);
+    expect(ledger.size).toBe(1);
+
+    clockMs += 20;
+    failRead = true;
+    expect(() => controller.identity(100)).toThrow(
+      AcpSessionRuntime.AcpProcessGroupTerminationError,
+    );
+    expect(() =>
+      AcpSessionRuntime.observePosixOwnershipLedger({
+        childQueues,
+        controller,
+        frontier,
+        ledger,
+        root,
+        rootPid: 100,
+      }),
+    ).toThrow(AcpSessionRuntime.AcpProcessGroupTerminationError);
+    expect(frontier.has(100)).toBe(true);
+
+    failRead = false;
+    tableText = [
+      "100 1 100 0 S Mon Nov 23 10:50:00 2026",
+      "101 100 101 0 S Mon Nov 23 10:50:01 2026",
+    ].join("\n");
+    AcpSessionRuntime.observePosixOwnershipLedger({
+      childQueues,
+      controller,
+      frontier,
+      ledger,
+      root,
+      rootPid: 100,
+    });
+    expect(frontier.has(100)).toBe(true);
+    expect(frontier.has(101)).toBe(true);
+    expect([...ledger.values()].map((entry) => entry.pid).toSorted((a, b) => a - b)).toEqual([
+      100, 101,
+    ]);
+  });
+
+  it.effect(
+    "populates Darwin process cache via refreshAsync without invoking sync readPsTable",
+    () =>
+      Effect.gen(function* () {
+        let clockMs = 100;
+        let syncReads = 0;
+        let asyncReads = 0;
+        let failAsync = false;
+        const tableText = [
+          "100 1 100 0 S Mon Nov 23 10:50:00 2026",
+          "101 100 101 0 S Mon Nov 23 10:50:01 2026",
+        ].join("\n");
+        const controller = AcpSessionRuntime.makeDarwinProcessTreeController({
+          cacheTtlMs: 15,
+          now: () => clockMs,
+          readPsTable: () => {
+            syncReads += 1;
+            return tableText;
+          },
+          readPsTableAsync: () =>
+            Effect.suspend(() => {
+              asyncReads += 1;
+              return failAsync
+                ? Effect.fail(
+                    new AcpSessionRuntime.AcpProcessGroupTerminationError({ detail: "ps failed" }),
+                  )
+                : Effect.succeed(tableText);
+            }),
+        });
+
+        expect(controller.observeIntervalMs?.(1)).toBeGreaterThanOrEqual(250);
+        expect(controller.observeIntervalMs?.(32)).toBeGreaterThanOrEqual(250);
+        expect(controller.observeIntervalMs?.(64)).toBeGreaterThanOrEqual(500);
+        expect(controller.observeIntervalMs?.(200)).toBeGreaterThanOrEqual(1000);
+        expect(controller.refreshAsync).toBeDefined();
+
+        yield* controller.refreshAsync!();
+        expect(asyncReads).toBe(1);
+        expect(syncReads).toBe(0);
+
+        clockMs += 100;
+        expect(controller.identity(100)?.pid).toBe(100);
+        expect(controller.childrenOf(100).map((entry) => entry.pid)).toEqual([101]);
+        expect(syncReads).toBe(0);
+
+        failAsync = true;
+        const failure = yield* Effect.flip(controller.refreshAsync!());
+        expect(failure).toBeInstanceOf(AcpSessionRuntime.AcpProcessGroupTerminationError);
+        expect(syncReads).toBe(0);
+      }),
+  );
+
+  it.live("terminates a real detached descendant process via the Darwin ps controller", () =>
+    Effect.gen(function* () {
+      if ((yield* HostProcess.Platform) === "win32") return;
+      const rootChild = NodeChildProcess.spawn(
+        process.execPath,
+        [
+          "-e",
+          [
+            'const { spawn } = require("node:child_process");',
+            'const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { detached: true, stdio: "ignore" });',
+            "grandchild.unref();",
+            "process.stdout.write(`${grandchild.pid}\\n`);",
+            "setTimeout(() => {}, 30000);",
+          ].join(" "),
+        ],
+        { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+      );
+      let grandchildPid: number | undefined;
+      const forceKill = (pid: number | undefined) => {
+        if (pid === undefined || pid <= 0) return;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      };
+      yield* Effect.gen(function* () {
+        const rootPid = rootChild.pid;
+        expect(rootPid).toBeDefined();
+        grandchildPid = yield* Effect.promise(
+          () =>
+            new Promise<number>((resolve, reject) => {
+              let buffer = "";
+              rootChild.stdout.setEncoding("utf8");
+              rootChild.stdout.on("data", (chunk: string) => {
+                buffer += chunk;
+                const newline = buffer.indexOf("\n");
+                if (newline !== -1) {
+                  resolve(Number(buffer.slice(0, newline).trim()));
+                }
+              });
+              rootChild.once("error", reject);
+              rootChild.once("exit", () => reject(new Error("root exited before printing pid")));
+            }),
+        );
+        expect(Number.isSafeInteger(grandchildPid) && grandchildPid > 0).toBe(true);
+
+        const controller = AcpSessionRuntime.makePosixProcessTreeController("darwin");
+        expect(controller.identity(grandchildPid)).toBeDefined();
+
+        yield* AcpSessionRuntime.terminatePosixOwnedProcessTree({
+          controller,
+          grace: 0,
+          rootPid: rootPid!,
+        });
+
+        const remainingGrandchild = controller.identity(grandchildPid);
+        expect(
+          remainingGrandchild === undefined ||
+            AcpSessionRuntime.posixProcessIsZombie(remainingGrandchild),
+        ).toBe(true);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            forceKill(grandchildPid);
+            forceKill(rootChild.pid);
+          }),
+        ),
+      );
+    }),
+  );
+
   it("fails closed where a stable POSIX identity provider is unavailable", () => {
     try {
-      AcpSessionRuntime.makePosixProcessTreeController("darwin");
-      throw new Error("Expected Darwin process ownership to fail closed");
+      AcpSessionRuntime.makePosixProcessTreeController("freebsd");
+      throw new Error("Expected unsupported POSIX process ownership to fail closed");
     } catch (error) {
       expect(error).toMatchObject({
-        detail: "Detached ACP descendant ownership is unsupported on darwin",
+        detail: "Detached ACP descendant ownership is unsupported on freebsd",
       });
     }
   });

@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -200,6 +201,8 @@ export interface AcpPosixProcessTreeController {
   readonly identity: (pid: number) => AcpPosixProcessIdentity | undefined;
   readonly snapshot: () => ReadonlyArray<AcpPosixProcessIdentity>;
   readonly signalProcess: (pid: number, signal: NodeJS.Signals) => void;
+  readonly refreshAsync?: () => Effect.Effect<void, AcpProcessGroupTerminationError>;
+  readonly observeIntervalMs?: (frontierSize: number) => number;
 }
 
 export interface AcpLinuxCgroupLease {
@@ -586,9 +589,9 @@ function readLinuxProcessIdentity(pid: number): AcpPosixProcessIdentity | undefi
   }
 }
 
-/** Linux zombies keep pid/starttime until reaped; they are not live survivors. */
+/** POSIX zombies keep pid/starttime until reaped; they are not live survivors. */
 export function posixProcessIsZombie(process: AcpPosixProcessIdentity): boolean {
-  return process.state === "Z";
+  return process.state?.startsWith("Z") === true;
 }
 
 function readLinuxChildPids(pid: number): ReadonlyArray<number> {
@@ -635,6 +638,220 @@ function makeLinuxProcessTreeController(): AcpPosixProcessTreeController {
   };
 }
 
+function parseStrictNonNegativeInt(token: string | undefined): number | undefined {
+  if (token === undefined || !/^\d+$/.test(token)) return undefined;
+  const value = Number(token);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+/** Parses `ps -ax -o pid=,ppid=,pgid=,sess=,state=,lstart=` with `LC_ALL=C`. */
+export function parseDarwinPsProcessTable(stdout: string): ReadonlyArray<AcpPosixProcessIdentity> {
+  const processes: Array<AcpPosixProcessIdentity> = [];
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (trimmed.length === 0) continue;
+    const tokens = trimmed.split(/\s+/);
+    if (tokens.length < 10) continue;
+    const pid = parseStrictNonNegativeInt(tokens[0]);
+    const ppid = parseStrictNonNegativeInt(tokens[1]);
+    const pgid = parseStrictNonNegativeInt(tokens[2]);
+    const stateToken = tokens[4];
+    if (
+      pid === undefined ||
+      pid <= 0 ||
+      ppid === undefined ||
+      pgid === undefined ||
+      stateToken === undefined ||
+      stateToken.length === 0
+    ) {
+      continue;
+    }
+    // macOS XNU masks kernel session pointers as `0` (or hex) for non-root ps queries.
+    const sid = parseStrictNonNegativeInt(tokens[3]) ?? 0;
+    const state = stateToken[0]!;
+    const startTime = tokens.slice(5).join(" ");
+    if (startTime.length === 0) continue;
+    processes.push({
+      executable: undefined,
+      pgid,
+      pid,
+      ppid,
+      sid,
+      startTime,
+      state,
+    });
+  }
+  return processes;
+}
+
+const DEFAULT_DARWIN_PS_CACHE_TTL_MS = 15;
+const DARWIN_PS_ASYNC_CACHE_TTL_MS = 500;
+const DARWIN_PS_ARGS = ["-ax", "-o", "pid=,ppid=,pgid=,sess=,state=,lstart="] as const;
+const DARWIN_PS_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+const DARWIN_PS_TIMEOUT_MS = 5_000;
+
+function darwinPsEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, LC_ALL: "C", LANG: "C" };
+}
+
+function readDarwinPsTableAsync(): Effect.Effect<string, AcpProcessGroupTerminationError> {
+  return Effect.callback<string, AcpProcessGroupTerminationError>((resume) => {
+    let settled = false;
+    const child = NodeChildProcess.execFile(
+      "ps",
+      DARWIN_PS_ARGS,
+      {
+        encoding: "utf8",
+        env: darwinPsEnv(),
+        maxBuffer: DARWIN_PS_MAX_BUFFER_BYTES,
+        timeout: DARWIN_PS_TIMEOUT_MS,
+      },
+      (error, stdout) => {
+        if (settled) return;
+        settled = true;
+        if (error !== null) {
+          resume(
+            Effect.fail(
+              new AcpProcessGroupTerminationError({
+                cause: error,
+                detail: "Failed to query Darwin process table via ps",
+              }),
+            ),
+          );
+          return;
+        }
+        resume(Effect.succeed(stdout));
+      },
+    );
+    return Effect.sync(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    });
+  });
+}
+
+interface DarwinPsTableCache {
+  readonly byPid: ReadonlyMap<number, AcpPosixProcessIdentity>;
+  readonly childrenByPpid: ReadonlyMap<number, ReadonlyArray<AcpPosixProcessIdentity>>;
+  readonly expiresAtMs: number;
+  readonly table: ReadonlyArray<AcpPosixProcessIdentity>;
+}
+
+export function makeDarwinProcessTreeController(options?: {
+  readonly readPsTable?: () => string;
+  readonly readPsTableAsync?: () => Effect.Effect<string, AcpProcessGroupTerminationError>;
+  readonly signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
+  readonly cacheTtlMs?: number;
+  readonly now?: () => number;
+}): AcpPosixProcessTreeController {
+  const readPsTable =
+    options?.readPsTable ??
+    (() =>
+      NodeChildProcess.execFileSync("ps", DARWIN_PS_ARGS, {
+        encoding: "utf8",
+        env: darwinPsEnv(),
+        maxBuffer: DARWIN_PS_MAX_BUFFER_BYTES,
+        timeout: DARWIN_PS_TIMEOUT_MS,
+      }));
+  const readPsTableAsync = options?.readPsTableAsync ?? readDarwinPsTableAsync;
+  const sendSignal =
+    options?.signalProcess ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+  const cacheTtlMs = options?.cacheTtlMs ?? DEFAULT_DARWIN_PS_CACHE_TTL_MS;
+  const now = options?.now ?? (() => performance.now());
+
+  let cache: DarwinPsTableCache | undefined;
+  let cacheGeneration = 0;
+
+  const toQueryError = (cause: unknown): AcpProcessGroupTerminationError =>
+    isAcpProcessGroupTerminationError(cause)
+      ? cause
+      : new AcpProcessGroupTerminationError({
+          cause,
+          detail: "Failed to query Darwin process table via ps",
+        });
+
+  const buildCache = (stdout: string, ttlMs: number): DarwinPsTableCache => {
+    const table = parseDarwinPsProcessTable(stdout);
+    const byPid = new Map<number, AcpPosixProcessIdentity>();
+    const childrenByPpid = new Map<number, Array<AcpPosixProcessIdentity>>();
+    for (const entry of table) {
+      byPid.set(entry.pid, entry);
+      const siblings = childrenByPpid.get(entry.ppid);
+      if (siblings === undefined) {
+        childrenByPpid.set(entry.ppid, [entry]);
+      } else {
+        siblings.push(entry);
+      }
+    }
+    return {
+      byPid,
+      childrenByPpid,
+      expiresAtMs: now() + ttlMs,
+      table,
+    };
+  };
+
+  const refresh = (): DarwinPsTableCache => {
+    cacheGeneration += 1;
+    let stdout: string;
+    try {
+      stdout = readPsTable();
+    } catch (cause) {
+      cache = undefined;
+      throw toQueryError(cause);
+    }
+    const next = buildCache(stdout, Math.max(0, cacheTtlMs));
+    cache = next;
+    return next;
+  };
+
+  const getCachedOrRefresh = (): DarwinPsTableCache => {
+    if (cache !== undefined && now() < cache.expiresAtMs) {
+      return cache;
+    }
+    return refresh();
+  };
+
+  return {
+    childPidsOf: (pid) =>
+      (getCachedOrRefresh().childrenByPpid.get(pid) ?? []).map((entry) => entry.pid),
+    childrenOf: (pid) => getCachedOrRefresh().childrenByPpid.get(pid) ?? [],
+    identity: (pid) => getCachedOrRefresh().byPid.get(pid),
+    observeIntervalMs: (frontierSize) =>
+      frontierSize <= 32 ? 250 : frontierSize <= 128 ? 500 : 1000,
+    refreshAsync: () =>
+      Effect.suspend(() => {
+        const generation = cacheGeneration;
+        return readPsTableAsync().pipe(
+          Effect.map((stdout) => {
+            if (generation === cacheGeneration) {
+              cache = buildCache(stdout, Math.max(cacheTtlMs, DARWIN_PS_ASYNC_CACHE_TTL_MS));
+            }
+          }),
+          Effect.mapError(toQueryError),
+        );
+      }),
+    snapshot: () => refresh().table,
+    signalProcess: (pid, signal) => {
+      cacheGeneration += 1;
+      cache = undefined;
+      try {
+        sendSignal(pid, signal);
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException | undefined)?.code !== "ESRCH") {
+          throw cause;
+        }
+      } finally {
+        cacheGeneration += 1;
+        cache = undefined;
+      }
+    },
+  };
+}
+
 export function observePosixOwnershipLedger(input: {
   readonly childQueues: Map<number, Array<number>>;
   readonly controller: AcpPosixProcessTreeController;
@@ -676,11 +893,11 @@ export function observePosixOwnershipLedger(input: {
     const entry = pending.shift();
     if (entry === undefined) continue;
     const [parentPid, parent] = entry;
-    input.frontier.delete(parentPid);
     if (visited.has(parent.pid)) continue;
     visited.add(parent.pid);
     remainingBudget -= 1;
     const observedParent = input.controller.identity(parent.pid);
+    input.frontier.delete(parentPid);
     if (!samePosixProcessIdentity(parent, observedParent)) {
       input.childQueues.delete(parent.pid);
       continue;
@@ -695,10 +912,11 @@ export function observePosixOwnershipLedger(input: {
       queuedChildren = [...input.controller.childPidsOf(refreshedParent.pid)];
     }
     while (queuedChildren.length > 0 && remainingBudget > 0) {
-      const childPid = queuedChildren.shift();
-      if (childPid === undefined) continue;
+      const childPid = queuedChildren[0];
+      if (childPid === undefined) break;
       remainingBudget -= 1;
       const child = input.controller.identity(childPid);
+      queuedChildren.shift();
       if (child === undefined) continue;
       if (child.ppid !== parent.pid) continue;
       let reservedPid = input.frontier.get(child.pid);
@@ -737,10 +955,22 @@ function observePosixOwnershipLedgerContinuously(input: {
   return Effect.forever(
     Effect.gen(function* () {
       const startedAt = yield* Clock.currentTimeMillis;
-      yield* Effect.sync(() => observePosixOwnershipLedger({ ...input, maxProcesses: 64 })).pipe(
-        Effect.exit,
-      );
-      const targetInterval = input.frontier.size <= 32 ? 25 : input.frontier.size <= 128 ? 50 : 100;
+      let canObserve = true;
+      if (input.controller.refreshAsync !== undefined) {
+        const refreshExit = yield* input.controller.refreshAsync().pipe(Effect.exit);
+        if (Exit.isFailure(refreshExit) && Cause.hasInterrupts(refreshExit.cause)) {
+          return yield* Effect.interrupt;
+        }
+        canObserve = Exit.isSuccess(refreshExit);
+      }
+      if (canObserve) {
+        yield* Effect.sync(() => observePosixOwnershipLedger({ ...input, maxProcesses: 64 })).pipe(
+          Effect.exit,
+        );
+      }
+      const targetInterval =
+        input.controller.observeIntervalMs?.(input.frontier.size) ??
+        (input.frontier.size <= 32 ? 25 : input.frontier.size <= 128 ? 50 : 100);
       const completedAt = yield* Clock.currentTimeMillis;
       yield* Effect.sleep(`${Math.max(5, targetInterval - (completedAt - startedAt))} millis`);
     }),
@@ -751,6 +981,7 @@ export function makePosixProcessTreeController(
   platform: NodeJS.Platform,
 ): AcpPosixProcessTreeController {
   if (platform === "linux") return makeLinuxProcessTreeController();
+  if (platform === "darwin") return makeDarwinProcessTreeController();
   throw new AcpProcessGroupTerminationError({
     detail: `Detached ACP descendant ownership is unsupported on ${platform}`,
   });
@@ -942,7 +1173,7 @@ export function terminatePosixOwnedProcessTree(input: {
         candidate.pid === process.pid ||
         observed === undefined ||
         observed.pgid === current.pgid ||
-        observed.sid === current.sid ||
+        (current.sid > 0 && observed.sid > 0 && observed.sid === current.sid) ||
         !samePosixProcessIdentity(candidate, observed)
       ) {
         continue;
@@ -1806,7 +2037,24 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
   );
   yield* Scope.addFinalizer(
     runtimeScope,
-    Ref.set(stoppingRef, true).pipe(Effect.andThen(Deferred.succeed(runtimeClosed, undefined))),
+    Ref.set(stoppingRef, true).pipe(
+      Effect.andThen(Deferred.succeed(runtimeClosed, undefined)),
+      Effect.andThen(
+        posixController !== undefined && linuxCgroupLease === undefined
+          ? Effect.sync(() => {
+              // Snapshot before the ACP transport closes stdin so fast-exiting agents cannot reparent descendants unseen.
+              try {
+                capturePosixOwnershipLedger({
+                  controller: posixController,
+                  ledger: posixOwnershipLedger,
+                  root: posixOwnershipRoot,
+                  rootPid: Number(child.pid),
+                });
+              } catch {}
+            })
+          : Effect.void,
+      ),
+    ),
   );
   const initializeClientCapabilities = {
     fs: {

@@ -215,6 +215,19 @@ export function acpMcpToolApprovalElicitationDisposition(
   return acpPolicyRequiresApproval(runtimePolicy) ? "ask" : "allow";
 }
 
+export function acpClientReadDisposition(
+  runtimePolicy: AcpRuntimePolicy,
+): AcpPermissionDisposition {
+  return acpReadDisposition(runtimePolicy);
+}
+
+export function acpClientWriteDisposition(
+  runtimePolicy: AcpRuntimePolicy,
+  path: string,
+): AcpPermissionDisposition {
+  return acpOperationDisposition(runtimePolicy, { kind: "edit", locations: [{ path }] });
+}
+
 export function acpClientExecuteDisposition(
   runtimePolicy: AcpRuntimePolicy,
 ): AcpPermissionDisposition {
@@ -231,6 +244,7 @@ export interface AcpApprovalGrantInput {
 export interface AcpClientPolicyGrants {
   readonly recordApproval: (input: AcpApprovalGrantInput) => void;
   readonly allowsExecute: (turnKey: string | null) => boolean;
+  readonly reset: () => void;
 }
 
 /** ACP cannot link commands to terminals; approved execute requests grant execution for the turn or accepted session. */
@@ -248,5 +262,9 @@ export function makeAcpClientPolicyGrants(): AcpClientPolicyGrants {
       }
     },
     allowsExecute: (turnKey) => sessionExecute || (turnKey !== null && turnExecute === turnKey),
+    reset: () => {
+      sessionExecute = false;
+      turnExecute = null;
+    },
   };
 }

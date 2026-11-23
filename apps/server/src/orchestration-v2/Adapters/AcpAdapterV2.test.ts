@@ -5507,12 +5507,19 @@ describe("AcpAdapterV2", () => {
       let waitForTerminalExit:
         | Parameters<RuntimeService["handleTerminalWaitForExit"]>[0]
         | undefined;
+      const promptStarted = yield* Deferred.make<void>();
+      const promptGate = yield* Deferred.make<void>();
       const makeRuntime = makeMockRuntime({
         childProcessSpawner,
         mockAgentPath,
         protocolEvents,
         wrapRuntime: (runtime) => ({
           ...runtime,
+          prompt: (payload, promptOptions) =>
+            Deferred.succeed(promptStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(promptGate)),
+              Effect.andThen(runtime.prompt(payload, promptOptions)),
+            ),
           handleCreateTerminal: (handler) =>
             Effect.sync(() => {
               createTerminal = handler;
@@ -5637,6 +5644,18 @@ describe("AcpAdapterV2", () => {
       ) {
         return yield* Effect.die("ACP runtime must register terminal handlers");
       }
+      yield* runtime
+        .startTurn(
+          makeTurnInput({
+            threadId: targetThreadId,
+            providerThread: forkedProviderThread,
+            instanceId,
+            runtimePolicy,
+            now: yield* DateTime.now,
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(promptStarted);
       const unknownTerminal = yield* createTerminal(
         {
           sessionId: "mock-child-session-without-credential-scope",
@@ -5690,6 +5709,16 @@ describe("AcpAdapterV2", () => {
         terminalOutput.output,
         "thread-acp-native-fork-target\nBearer target-thread-token",
       );
+      yield* Deferred.succeed(promptGate, undefined);
+      const terminalEvent = Option.getOrThrow(
+        yield* runtime.events.pipe(
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.runHead,
+        ),
+      );
+      if (terminalEvent.type === "turn.terminal") {
+        assert.equal(terminalEvent.status, "completed");
+      }
     }).pipe(Effect.provide(layerTest)),
   );
 
