@@ -219,6 +219,95 @@ describe("acpPermissionDisposition", () => {
       );
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect(
+    "denies dangling external symlinks with or without trailing separators while keeping legitimate paths writable (R3-CF-06)",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-dangling-workspace-",
+        });
+        const outside = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-dangling-outside-",
+        });
+        yield* fileSystem.makeDirectory(path.join(workspace, "sub"), { recursive: true });
+        yield* fileSystem.writeFileString(path.join(workspace, "existing.ts"), "existing");
+        yield* fileSystem.symlink(
+          path.join(outside, "missing-target"),
+          path.join(workspace, "escape"),
+        );
+        yield* fileSystem.symlink(
+          path.join(outside, "missing-sub-target"),
+          path.join(workspace, "sub", "escape-sub"),
+        );
+
+        const policies: ReadonlyArray<AcpRuntimePolicy> = [
+          {
+            runtimeMode: "full-access",
+            cwd: workspace,
+            approvalPolicy: "never",
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [],
+              networkAccess: false,
+            },
+          },
+          {
+            runtimeMode: "auto-accept-edits",
+            cwd: workspace,
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [],
+              networkAccess: false,
+            },
+          },
+        ];
+
+        const escapingPaths = [
+          "escape",
+          "escape/",
+          "escape///",
+          "escape/.",
+          "escape/..",
+          "escape//nested.txt",
+          "sub/escape-sub/",
+          "sub//escape-sub/",
+          `${path.join(workspace, "escape")}/`,
+        ] as const;
+
+        for (const realPolicy of policies) {
+          for (const candidate of escapingPaths) {
+            assert.equal(
+              acpClientWriteDisposition(realPolicy, candidate),
+              "deny",
+              `expected client write deny for ${candidate}`,
+            );
+            for (const kind of ["edit", "delete", "move"] as const) {
+              assert.equal(
+                acpPermissionDisposition(
+                  realPolicy,
+                  permissionRequest(kind, [{ path: candidate }]),
+                ),
+                "deny",
+                `expected permission ${kind} deny for ${candidate}`,
+              );
+            }
+          }
+
+          assert.equal(acpClientWriteDisposition(realPolicy, "new-dir/"), "allow");
+          assert.equal(acpClientWriteDisposition(realPolicy, "sub/new-file.txt"), "allow");
+          assert.equal(acpClientWriteDisposition(realPolicy, "existing.ts"), "allow");
+          assert.equal(
+            acpPermissionDisposition(realPolicy, permissionRequest("edit", [{ path: "new-dir/" }])),
+            "allow",
+          );
+          assert.equal(acpClientWriteDisposition(realPolicy, "/"), "deny");
+          assert.equal(acpClientWriteDisposition(realPolicy, "///"), "deny");
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });
 
 describe("acpMcpToolApprovalElicitationDisposition", () => {

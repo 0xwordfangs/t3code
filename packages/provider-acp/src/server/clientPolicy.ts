@@ -37,10 +37,22 @@ function acpPathIsWithinRoot(path: string, root: string): boolean {
   );
 }
 
+function stripTrailingSeparators(value: string): string {
+  const root = NodePath.parse(value).root;
+  let trimmed = value;
+  while (
+    trimmed.length > root.length &&
+    (trimmed.endsWith("/") || (NodePath.sep === "\\" && trimmed.endsWith("\\")))
+  ) {
+    trimmed = trimmed.slice(0, -1);
+  }
+  return trimmed;
+}
+
 // Canonicalize existing ancestors for symlink-aware checks of new paths; fail closed on errors.
 function acpCanonicalPathForContainment(path: string): string | undefined {
   // realpath must resolve symlinks before ..; lexical normalization can hide traversal.
-  let candidate = path;
+  let candidate = stripTrailingSeparators(path);
   const missingSuffix: Array<string> = [];
 
   while (true) {
@@ -61,7 +73,7 @@ function acpCanonicalPathForContainment(path: string): string | undefined {
       }
     }
 
-    const parent = NodePath.dirname(candidate);
+    const parent = stripTrailingSeparators(NodePath.dirname(candidate));
     if (parent === candidate) return undefined;
     missingSuffix.unshift(NodePath.basename(candidate));
     candidate = parent;

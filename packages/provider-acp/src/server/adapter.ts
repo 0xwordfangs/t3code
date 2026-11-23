@@ -2492,19 +2492,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const activeSessionId = yield* Ref.make<string | null>(null);
         // session/load replays history before activeSessionId names the loaded session.
         const loadingSessionId = yield* Ref.make<string | null>(null);
-        const activatingSessionCount = yield* Ref.make(0);
-        const isActivatingSession = Ref.get(activatingSessionCount).pipe(
-          Effect.map((count) => count > 0),
-        );
-        const withActivatingSession = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-          Effect.uninterruptibleMask((restore) =>
-            Ref.update(activatingSessionCount, (count) => count + 1).pipe(
-              Effect.andThen(restore(effect)),
-              Effect.ensuring(
-                Ref.update(activatingSessionCount, (count) => Math.max(0, count - 1)),
-              ),
-            ),
-          );
         const contextUsageBySessionId = yield* Ref.make(
           new Map<string, ThreadTokenUsageSnapshot>(),
         );
@@ -2593,19 +2580,68 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           >(),
         );
         const pendingRuntimeRequests = yield* Ref.make(new Map<string, PendingRuntimeRequest>());
-        const pendingUrlElicitations = yield* Ref.make(new Set<Deferred.Deferred<void>>());
-        const cancelPendingUrlElicitations = Ref.getAndSet(
-          pendingUrlElicitations,
-          new Set<Deferred.Deferred<void>>(),
-        ).pipe(
-          Effect.flatMap((signals) =>
-            Effect.forEach(
-              signals,
-              (signal) => Deferred.succeed(signal, undefined).pipe(Effect.ignore),
-              { concurrency: "unbounded", discard: true },
-            ),
-          ),
+        type UrlElicitationScope =
+          | { readonly _tag: "Activation"; readonly epoch: number }
+          | { readonly _tag: "Turn"; readonly turn: ActiveAcpTurn };
+        interface PendingUrlElicitation {
+          readonly scope: UrlElicitationScope;
+          readonly cancel: Deferred.Deferred<void>;
+          readonly settled: Deferred.Deferred<void>;
+        }
+        const activatingSessionState = yield* Ref.make({ count: 0, epoch: 0 });
+        const pendingUrlElicitations = yield* Ref.make(new Set<PendingUrlElicitation>());
+        const cancelPendingUrlElicitationsWhere = (
+          predicate?: (entry: PendingUrlElicitation) => boolean,
+        ) =>
+          Ref.get(pendingUrlElicitations).pipe(
+            Effect.flatMap((current) => {
+              const cancelled =
+                predicate === undefined ? [...current] : [...current].filter(predicate);
+              return Effect.forEach(
+                cancelled,
+                (entry) => Deferred.succeed(entry.cancel, undefined).pipe(Effect.ignore),
+                { concurrency: "unbounded", discard: true },
+              ).pipe(Effect.as(cancelled));
+            }),
+          );
+        const cancelPendingUrlElicitations = cancelPendingUrlElicitationsWhere().pipe(
+          Effect.asVoid,
         );
+        const withActivatingSession = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              yield* runtimeCallbackPermit.withPermit(
+                Ref.update(activatingSessionState, (state) => ({
+                  count: state.count + 1,
+                  epoch: state.count === 0 ? state.epoch + 1 : state.epoch,
+                })),
+              );
+              return yield* restore(effect).pipe(
+                Effect.ensuring(
+                  Effect.gen(function* () {
+                    const cancelled = yield* runtimeCallbackPermit.withPermit(
+                      Effect.gen(function* () {
+                        const next = yield* Ref.updateAndGet(activatingSessionState, (state) => ({
+                          count: Math.max(0, state.count - 1),
+                          epoch: state.epoch,
+                        }));
+                        if (next.count > 0) return [] as ReadonlyArray<PendingUrlElicitation>;
+                        return yield* cancelPendingUrlElicitationsWhere(
+                          (entry) => entry.scope._tag === "Activation",
+                        );
+                      }),
+                    );
+                    if (cancelled.length > 0) {
+                      yield* Effect.forEach(cancelled, (entry) => Deferred.await(entry.settled), {
+                        concurrency: "unbounded",
+                        discard: true,
+                      });
+                    }
+                  }),
+                ),
+              );
+            }),
+          );
         const emitNativeResponseLifecycle =
           options.testHooks?.onNativeResponseLifecycle ?? (() => Effect.void);
         const nextElicitationOrdinal = yield* Ref.make(0);
@@ -8128,8 +8164,30 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               holdingAgentRequest(handlerGeneration),
             ),
           );
-          yield* targetRuntime.handleElicitation((params, requestContext) =>
-            Effect.gen(function* () {
+          yield* targetRuntime.handleElicitation((params, requestContext) => {
+            let admittedUrlElicitation: PendingUrlElicitation | undefined;
+            const settleAdmittedUrlElicitation = Effect.uninterruptible(
+              Effect.suspend(() => {
+                const entry = admittedUrlElicitation;
+                if (entry === undefined) return Effect.void;
+                return Ref.update(pendingUrlElicitations, (current) => {
+                  if (!current.has(entry)) return current;
+                  const next = new Set(current);
+                  next.delete(entry);
+                  return next;
+                }).pipe(
+                  Effect.andThen(Deferred.succeed(entry.settled, undefined).pipe(Effect.ignore)),
+                  Effect.andThen(
+                    Effect.sync(() => {
+                      if (admittedUrlElicitation === entry) {
+                        admittedUrlElicitation = undefined;
+                      }
+                    }),
+                  ),
+                );
+              }),
+            );
+            return Effect.gen(function* () {
               const transportRequestId = requestContext.requestId;
               if (
                 params.mode === "form" &&
@@ -8216,12 +8274,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               ) {
                 const { elicitationId, url } = params;
                 const awaitsContinuation = postSettleRequestsAwaitContinuation();
-                let admittedSignal: Deferred.Deferred<void> | undefined;
-                while (admittedSignal === undefined) {
+                let admittedEntry: PendingUrlElicitation | undefined;
+                while (admittedEntry === undefined) {
                   const attempt = yield* runRuntimeCallbackAtGeneration(
                     handlerGeneration,
                     Effect.gen(function* () {
                       const rawContext = yield* Ref.get(activeTurn);
+                      const activationState = yield* Ref.get(activatingSessionState);
                       if (
                         rawContext?.interrupted === true ||
                         (yield* Ref.get(stoppedRunQuarantine)) ||
@@ -8230,23 +8289,33 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         return { _tag: "Cancel" as const };
                       }
                       if (rawContext === null || rawContext.finalized) {
+                        if (rawContext === null && activationState.count > 0) {
+                          const entry: PendingUrlElicitation = {
+                            scope: { _tag: "Activation", epoch: activationState.epoch },
+                            cancel: yield* Deferred.make<void>(),
+                            settled: yield* Deferred.make<void>(),
+                          };
+                          admittedUrlElicitation = entry;
+                          yield* Ref.update(pendingUrlElicitations, (current) =>
+                            new Set(current).add(entry),
+                          );
+                          return { _tag: "Admit" as const, entry };
+                        }
                         if (awaitsContinuation && (yield* Ref.get(lastTurnRoute)) !== null) {
                           return { _tag: "AwaitTurn" as const };
                         }
-                        if (rawContext === null && (yield* isActivatingSession)) {
-                          const signal = yield* Deferred.make<void>();
-                          yield* Ref.update(pendingUrlElicitations, (current) =>
-                            new Set(current).add(signal),
-                          );
-                          return { _tag: "Admit" as const, signal };
-                        }
                         return { _tag: "Cancel" as const };
                       }
-                      const signal = yield* Deferred.make<void>();
+                      const entry: PendingUrlElicitation = {
+                        scope: { _tag: "Turn", turn: rawContext },
+                        cancel: yield* Deferred.make<void>(),
+                        settled: yield* Deferred.make<void>(),
+                      };
+                      admittedUrlElicitation = entry;
                       yield* Ref.update(pendingUrlElicitations, (current) =>
-                        new Set(current).add(signal),
+                        new Set(current).add(entry),
                       );
-                      return { _tag: "Admit" as const, signal };
+                      return { _tag: "Admit" as const, entry };
                     }),
                   );
                   if (Option.isNone(attempt)) return yield* Effect.never;
@@ -8259,20 +8328,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     }
                     continue;
                   }
-                  admittedSignal = attempt.value.signal;
+                  admittedEntry = attempt.value.entry;
                 }
-                const signal = admittedSignal;
-                const removePendingUrlElicitation = Ref.update(
-                  pendingUrlElicitations,
-                  (current) => {
-                    if (!current.has(signal)) return current;
-                    const next = new Set(current);
-                    next.delete(signal);
-                    return next;
-                  },
-                );
-                if (yield* Deferred.isDone(signal)) {
-                  yield* removePendingUrlElicitation;
+                const entry = admittedEntry;
+                if (yield* Deferred.isDone(entry.cancel)) {
                   return { action: "cancel" } as const;
                 }
                 const outcome = yield* Effect.raceFirst(
@@ -8283,18 +8342,24 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       message: params.message,
                     }) ?? Effect.succeed(false)
                   ).pipe(Effect.map((accepted) => ({ _tag: "Responded" as const, accepted }))),
-                  Deferred.await(signal).pipe(Effect.as({ _tag: "Cancelled" as const })),
-                ).pipe(Effect.ensuring(removePendingUrlElicitation));
+                  Deferred.await(entry.cancel).pipe(Effect.as({ _tag: "Cancelled" as const })),
+                );
                 const resolved = yield* runRuntimeCallbackAtGeneration(
                   handlerGeneration,
                   Effect.gen(function* () {
                     const rawContext = yield* Ref.get(activeTurn);
+                    const activationState = yield* Ref.get(activatingSessionState);
+                    const scopeStillActive =
+                      entry.scope._tag === "Activation"
+                        ? activationState.count > 0 && activationState.epoch === entry.scope.epoch
+                        : rawContext === entry.scope.turn &&
+                          !rawContext.finalized &&
+                          !rawContext.interrupted;
                     if (
                       outcome._tag === "Cancelled" ||
                       rawContext?.interrupted === true ||
                       (yield* Ref.get(stoppedRunQuarantine)) ||
-                      (!(yield* isActivatingSession) &&
-                        (rawContext === null || rawContext.finalized))
+                      !scopeStillActive
                     ) {
                       return { action: "cancel" } as const;
                     }
@@ -8312,7 +8377,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       : ({ action: "decline" } as const);
                   }),
                 );
-                if (Option.isNone(resolved)) return yield* Effect.never;
+                if (Option.isNone(resolved)) {
+                  yield* settleAdmittedUrlElicitation;
+                  return yield* Effect.never;
+                }
                 return resolved.value;
               }
               if (params.mode !== "form" || !("requestedSchema" in params)) {
@@ -8366,8 +8434,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   : form.respond(userInput.answers);
               yield* userInput.acknowledgeNativeResponse;
               return response;
-            }).pipe(holdingAgentRequest(handlerGeneration)),
-          );
+            }).pipe(
+              holdingAgentRequest(handlerGeneration),
+              Effect.ensuring(settleAdmittedUrlElicitation),
+            );
+          });
           if (flavor.registerExtensions !== undefined) {
             yield* flavor.registerExtensions({
               runtime: targetRuntime,

@@ -3969,4 +3969,545 @@ describe("AcpRegistryAdapterV2", () => {
         }).pipe(Effect.provide(layerCoordinatorTest)),
     );
   });
+
+  describe("activation-phase URL elicitation scoping (R3-CF-04)", () => {
+    const layerCoordinatorTest = Layer.mergeAll(layerTest, AcpRegistryRuntimeCoordinator.layer);
+
+    const makeActivationUrlHarness = Effect.fnUntraced(function* (options: {
+      readonly name: string;
+      readonly startGate?: Deferred.Deferred<
+        AcpSessionRuntime.AcpSessionRuntimeStartResult,
+        EffectAcpErrors.AcpError
+      >;
+      readonly startStarted?: Deferred.Deferred<void>;
+      readonly loadGate?: Deferred.Deferred<
+        AcpSessionRuntime.AcpSessionRuntimeStartResult,
+        EffectAcpErrors.AcpError
+      >;
+      readonly loadStarted?: Deferred.Deferred<void>;
+    }) {
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let elicitationHandler: Parameters<RuntimeService["handleElicitation"]>[0] | undefined;
+      let onOutgoingResponse: ((requestId: string) => Effect.Effect<void>) | undefined;
+      let runtimeCreateCount = 0;
+      let promptStarted = yield* Deferred.make<void>();
+      let promptGate = yield* Deferred.make<
+        EffectAcpSchema.PromptResponse,
+        EffectAcpErrors.AcpError
+      >();
+      const continuationOffered = yield* Queue.unbounded<ProviderContinuationRequest>();
+
+      const makeStartResult = (
+        sessionId: string,
+      ): AcpSessionRuntime.AcpSessionRuntimeStartResult => ({
+        sessionId,
+        initializeResult: {
+          protocolVersion: 1,
+          agentCapabilities: { loadSession: true },
+        },
+        sessionSetupResult: {},
+        modelConfigId: undefined,
+      });
+      const initialSessionId = `sess-initial-${options.name}`;
+      const unsupported = (method: string) =>
+        Effect.fail(EffectAcpErrors.AcpRequestError.methodNotFound(method));
+
+      const instanceId = ProviderInstanceId.make(`acp-registry-r3-cf04-${options.name}`);
+      const coordinator = yield* AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator;
+      const adapter = yield* makeAcpRegistryAdapterV2({
+        selfInvocation: yield* resolveSelfInvocation(),
+        instanceId,
+        settings: yield* decodeAcpRegistryAdapterSettings({
+          source: "local",
+          commandPath: "hermes",
+        }),
+        environment: {},
+        continuationRequests: {
+          offer: (request) => Queue.offer(continuationOffered, request).pipe(Effect.asVoid),
+        },
+        makeRuntime: (runtimeInput) => {
+          runtimeCreateCount += 1;
+          const createOrdinal = runtimeCreateCount;
+          const runtimeSessionId =
+            createOrdinal === 1
+              ? initialSessionId
+              : `sess-replacement-${options.name}-${createOrdinal}`;
+          onOutgoingResponse = runtimeInput.onOutgoingResponse;
+          return Effect.succeed({
+            handleRequestPermission: () => Effect.void,
+            handleElicitation: (handler) =>
+              Effect.sync(() => {
+                elicitationHandler = handler;
+              }),
+            handleMcpConnect: () => Effect.void,
+            handleMcpMessage: () => Effect.void,
+            handleMcpDisconnect: () => Effect.void,
+            handleMcpNotification: () => Effect.void,
+            handleReadTextFile: () => Effect.void,
+            handleWriteTextFile: () => Effect.void,
+            handleCreateTerminal: () => Effect.void,
+            handleTerminalOutput: () => Effect.void,
+            handleTerminalWaitForExit: () => Effect.void,
+            handleTerminalKill: () => Effect.void,
+            handleTerminalRelease: () => Effect.void,
+            handleSessionUpdate: () => Effect.void,
+            handleElicitationComplete: () => Effect.void,
+            handleUnknownExtRequest: () => Effect.void,
+            handleUnknownExtNotification: () => Effect.void,
+            handleExtRequest: () => Effect.void,
+            handleExtNotification: () => Effect.void,
+            initialize: () => Effect.succeed(makeStartResult(runtimeSessionId).initializeResult),
+            start: () =>
+              createOrdinal === 1 && options.startGate !== undefined
+                ? Effect.gen(function* () {
+                    if (options.startStarted !== undefined) {
+                      yield* Deferred.succeed(options.startStarted, undefined);
+                    }
+                    return yield* Deferred.await(options.startGate!);
+                  })
+                : Effect.succeed(makeStartResult(runtimeSessionId)),
+            getEvents: () => Stream.empty,
+            drainEvents: Effect.void,
+            getModeState: Effect.undefined,
+            getConfigOptions: Effect.succeed([]),
+            configOptionChanges: Stream.empty,
+            loadSession: (requestedSessionId) =>
+              options.loadGate !== undefined
+                ? Effect.gen(function* () {
+                    if (options.loadStarted !== undefined) {
+                      yield* Deferred.succeed(options.loadStarted, undefined);
+                    }
+                    return yield* Deferred.await(options.loadGate!);
+                  })
+                : Effect.succeed(makeStartResult(requestedSessionId)),
+            resumeSession: (requestedSessionId) =>
+              Effect.succeed(makeStartResult(requestedSessionId)),
+            forkSession: () => Effect.succeed(makeStartResult(runtimeSessionId)),
+            listSessions: () => unsupported("session/list"),
+            closeSession: () => Effect.succeed({}),
+            deleteSession: () => unsupported("session/delete"),
+            listProviders: unsupported("provider/list"),
+            setProvider: () => unsupported("provider/set"),
+            disableProvider: () => unsupported("provider/disable"),
+            logout: unsupported("logout"),
+            prompt: (_payload, promptOptions) =>
+              Effect.gen(function* () {
+                if (promptOptions?.dispatched !== undefined) {
+                  yield* Deferred.succeed(promptOptions.dispatched, undefined);
+                }
+                yield* Deferred.succeed(promptStarted, undefined);
+                return yield* Deferred.await(promptGate);
+              }),
+            cancel: Effect.void,
+            setMode: () => Effect.succeed({}),
+            setSessionModel: () => Effect.succeed({}),
+            setConfigOption: () => Effect.succeed({ configOptions: [] }),
+            setModel: () => Effect.void,
+            request: (method) => unsupported(method),
+            notify: () => Effect.void,
+          } satisfies RuntimeService);
+        },
+      }).pipe(Effect.provide(layerInjectedRuntimeCatalog));
+
+      const threadId = ThreadId.make(`thread-r3-cf04-${options.name}`);
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const now = yield* DateTime.now;
+      const awaitUrlAuthPublished = (expectedElicitationId: string) =>
+        Effect.gen(function* () {
+          const published = yield* Deferred.make<void>();
+          const watcher = yield* coordinator
+            .watchUrlAuthAction(instanceId, (action) =>
+              action !== null && action.elicitationId === expectedElicitationId
+                ? Deferred.succeed(published, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+            )
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(published).pipe(Effect.ensuring(Fiber.interrupt(watcher)));
+        });
+
+      return {
+        instanceId,
+        threadId,
+        runtimePolicy,
+        modelSelection,
+        coordinator,
+        adapter,
+        initialSessionId,
+        makeStartResult,
+        awaitUrlAuthPublished,
+        openSession: () =>
+          adapter.openSession({
+            threadId,
+            providerSessionId: ProviderSessionId.make(`provider-session-r3-cf04-${options.name}`),
+            modelSelection,
+            runtimePolicy,
+          }),
+        elicitUrl: (
+          sessionId: string,
+          elicitationId: string,
+          url: string,
+          message: string,
+          requestId: string,
+        ) =>
+          elicitationHandler!(
+            {
+              sessionId,
+              mode: "url",
+              elicitationId,
+              url,
+              message,
+            },
+            { requestId, method: "elicitation/create" },
+          ).pipe(Effect.tap(() => onOutgoingResponse?.(requestId) ?? Effect.void)),
+        makeTurn: (
+          providerThread: Parameters<typeof makeTurnInput>[0]["providerThread"],
+          ordinal: number,
+        ) => makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now, ordinal }),
+        get promptStarted() {
+          return promptStarted;
+        },
+        get promptGate() {
+          return promptGate;
+        },
+        get runtimeCreateCount() {
+          return runtimeCreateCount;
+        },
+        resetPrompt: Effect.gen(function* () {
+          promptStarted = yield* Deferred.make<void>();
+          promptGate = yield* Deferred.make<
+            EffectAcpSchema.PromptResponse,
+            EffectAcpErrors.AcpError
+          >();
+        }),
+      };
+    });
+
+    it.effect(
+      "cancels activation URL elicitation and clears background work on failed resumeThread so forceNewNativeThread succeeds immediately",
+      () =>
+        Effect.gen(function* () {
+          const loadStarted = yield* Deferred.make<void>();
+          const loadGate = yield* Deferred.make<
+            AcpSessionRuntime.AcpSessionRuntimeStartResult,
+            EffectAcpErrors.AcpError
+          >();
+          const harness = yield* makeActivationUrlHarness({
+            name: "failed-resume",
+            loadStarted,
+            loadGate,
+          });
+          const session = yield* harness.openSession();
+          const initialThread = yield* session.ensureThread({
+            threadId: harness.threadId,
+            modelSelection: harness.modelSelection,
+            runtimePolicy: harness.runtimePolicy,
+          });
+          const staleProviderThread = {
+            ...initialThread,
+            nativeThreadRef: {
+              driver: initialThread.driver,
+              nativeId: "sess-stale-resume",
+              strength: "strong" as const,
+            },
+          };
+
+          const resumeFiber = yield* session
+            .resumeThread({
+              providerThread: staleProviderThread,
+              modelSelection: harness.modelSelection,
+              runtimePolicy: harness.runtimePolicy,
+            })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(loadStarted);
+
+          const elicitFiber = yield* harness
+            .elicitUrl(
+              "sess-stale-resume",
+              "elicit-failed-resume",
+              "https://example.test/auth/failed-resume",
+              "Sign in during failed resume",
+              "req-url-failed-resume",
+            )
+            .pipe(Effect.forkScoped);
+          yield* harness.awaitUrlAuthPublished("elicit-failed-resume");
+          assert.isTrue(yield* session.hasPendingBackgroundWork!);
+
+          yield* Deferred.fail(
+            loadGate,
+            EffectAcpErrors.AcpRequestError.internalError("session/load failed"),
+          );
+          const resumeExit = yield* Fiber.await(resumeFiber);
+          assert.isTrue(Exit.isFailure(resumeExit));
+
+          // Immediately after failed resumeThread, auth prompt, wire cancel, and agentRequests must all be settled.
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+          assert.deepEqual(yield* Fiber.join(elicitFiber), { action: "cancel" });
+          assert.isFalse(yield* session.hasPendingBackgroundWork!);
+
+          const replacementThread = yield* session.ensureThread({
+            threadId: harness.threadId,
+            modelSelection: harness.modelSelection,
+            runtimePolicy: harness.runtimePolicy,
+            forceNewNativeThread: true,
+            existingProviderThread: initialThread,
+          });
+          assert.equal(harness.runtimeCreateCount, 2);
+          assert.notEqual(
+            replacementThread.nativeThreadRef?.nativeId,
+            initialThread.nativeThreadRef?.nativeId,
+          );
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+
+    it.effect(
+      "cancels stale activation URL elicitation when resumeThread resolves into idle and rejects late acceptance during a later turn",
+      () =>
+        Effect.gen(function* () {
+          const loadStarted = yield* Deferred.make<void>();
+          const loadGate = yield* Deferred.make<
+            AcpSessionRuntime.AcpSessionRuntimeStartResult,
+            EffectAcpErrors.AcpError
+          >();
+          const harness = yield* makeActivationUrlHarness({
+            name: "success-resume-idle",
+            loadStarted,
+            loadGate,
+          });
+          const session = yield* harness.openSession();
+          const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+          yield* session.events.pipe(
+            Stream.runForEach((event) => Queue.offer(events, event)),
+            Effect.forkScoped,
+          );
+          const initialThread = yield* session.ensureThread({
+            threadId: harness.threadId,
+            modelSelection: harness.modelSelection,
+            runtimePolicy: harness.runtimePolicy,
+          });
+          const targetSessionId = "sess-resumed-idle";
+          const targetProviderThread = {
+            ...initialThread,
+            nativeThreadRef: {
+              driver: initialThread.driver,
+              nativeId: targetSessionId,
+              strength: "strong" as const,
+            },
+          };
+
+          const resumeFiber = yield* session
+            .resumeThread({
+              providerThread: targetProviderThread,
+              modelSelection: harness.modelSelection,
+              runtimePolicy: harness.runtimePolicy,
+            })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(loadStarted);
+
+          const elicitFiber = yield* harness
+            .elicitUrl(
+              targetSessionId,
+              "elicit-resume-idle",
+              "https://example.test/auth/resume-idle",
+              "Sign in during resume",
+              "req-url-resume-idle",
+            )
+            .pipe(Effect.forkScoped);
+          yield* harness.awaitUrlAuthPublished("elicit-resume-idle");
+
+          yield* Deferred.succeed(loadGate, harness.makeStartResult(targetSessionId));
+          const resumedThread = yield* Fiber.join(resumeFiber);
+
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+          assert.deepEqual(yield* Fiber.join(elicitFiber), { action: "cancel" });
+          assert.isFalse(yield* session.hasPendingBackgroundWork!);
+
+          yield* session.startTurn(harness.makeTurn(resumedThread, 1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          assert.isFalse(
+            yield* harness.coordinator.acceptUrlAuthentication({
+              instanceId: harness.instanceId,
+              elicitationId: "elicit-resume-idle",
+            }),
+          );
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          while ((yield* Queue.take(events)).type !== "turn.terminal") {
+            // drain Turn 1
+          }
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+
+    it.effect(
+      "cancels stale activation URL elicitation when openSession completes and rejects late acceptance during a later turn",
+      () =>
+        Effect.gen(function* () {
+          const startStarted = yield* Deferred.make<void>();
+          const startGate = yield* Deferred.make<
+            AcpSessionRuntime.AcpSessionRuntimeStartResult,
+            EffectAcpErrors.AcpError
+          >();
+          const harness = yield* makeActivationUrlHarness({
+            name: "success-open-session",
+            startStarted,
+            startGate,
+          });
+
+          const openFiber = yield* harness.openSession().pipe(Effect.forkScoped);
+          yield* Deferred.await(startStarted);
+
+          const elicitFiber = yield* harness
+            .elicitUrl(
+              harness.initialSessionId,
+              "elicit-open-session",
+              "https://example.test/auth/open-session",
+              "Sign in during startup",
+              "req-url-open-session",
+            )
+            .pipe(Effect.forkScoped);
+          yield* harness.awaitUrlAuthPublished("elicit-open-session");
+
+          yield* Deferred.succeed(startGate, harness.makeStartResult(harness.initialSessionId));
+          const session = yield* Fiber.join(openFiber);
+
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+          assert.deepEqual(yield* Fiber.join(elicitFiber), { action: "cancel" });
+          assert.isFalse(yield* session.hasPendingBackgroundWork!);
+
+          const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+          yield* session.events.pipe(
+            Stream.runForEach((event) => Queue.offer(events, event)),
+            Effect.forkScoped,
+          );
+          const providerThread = yield* session.ensureThread({
+            threadId: harness.threadId,
+            modelSelection: harness.modelSelection,
+            runtimePolicy: harness.runtimePolicy,
+          });
+          yield* session.startTurn(harness.makeTurn(providerThread, 1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          assert.isFalse(
+            yield* harness.coordinator.acceptUrlAuthentication({
+              instanceId: harness.instanceId,
+              elicitationId: "elicit-open-session",
+            }),
+          );
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          while ((yield* Queue.take(events)).type !== "turn.terminal") {
+            // drain Turn 1
+          }
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+
+    it.effect(
+      "still accepts legitimate in-progress activation URL elicitation and active-turn URL elicitation",
+      () =>
+        Effect.gen(function* () {
+          const loadStarted = yield* Deferred.make<void>();
+          const loadGate = yield* Deferred.make<
+            AcpSessionRuntime.AcpSessionRuntimeStartResult,
+            EffectAcpErrors.AcpError
+          >();
+          const harness = yield* makeActivationUrlHarness({
+            name: "legitimate-url-elicitations",
+            loadStarted,
+            loadGate,
+          });
+          const session = yield* harness.openSession();
+          const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+          yield* session.events.pipe(
+            Stream.runForEach((event) => Queue.offer(events, event)),
+            Effect.forkScoped,
+          );
+          const initialThread = yield* session.ensureThread({
+            threadId: harness.threadId,
+            modelSelection: harness.modelSelection,
+            runtimePolicy: harness.runtimePolicy,
+          });
+          const targetSessionId = "sess-legitimate-resume";
+          const targetProviderThread = {
+            ...initialThread,
+            nativeThreadRef: {
+              driver: initialThread.driver,
+              nativeId: targetSessionId,
+              strength: "strong" as const,
+            },
+          };
+
+          // 1. Legitimate activation URL elicitation accepted before session/load completes.
+          const resumeFiber = yield* session
+            .resumeThread({
+              providerThread: targetProviderThread,
+              modelSelection: harness.modelSelection,
+              runtimePolicy: harness.runtimePolicy,
+            })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(loadStarted);
+
+          const activationElicitFiber = yield* harness
+            .elicitUrl(
+              targetSessionId,
+              "elicit-activation-accept",
+              "https://example.test/auth/activation",
+              "Sign in to load session",
+              "req-url-activation-accept",
+            )
+            .pipe(Effect.forkScoped);
+          yield* harness.awaitUrlAuthPublished("elicit-activation-accept");
+          assert.isTrue(
+            yield* harness.coordinator.acceptUrlAuthentication({
+              instanceId: harness.instanceId,
+              elicitationId: "elicit-activation-accept",
+            }),
+          );
+          assert.deepEqual(yield* Fiber.join(activationElicitFiber), { action: "accept" });
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+
+          yield* Deferred.succeed(loadGate, harness.makeStartResult(targetSessionId));
+          const resumedThread = yield* Fiber.join(resumeFiber);
+
+          // 2. Legitimate active-turn URL elicitation accepted before Turn 1 settles.
+          yield* session.startTurn(harness.makeTurn(resumedThread, 1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+
+          const turnElicitFiber = yield* harness
+            .elicitUrl(
+              targetSessionId,
+              "elicit-turn-accept",
+              "https://example.test/auth/turn",
+              "Sign in for tool",
+              "req-url-turn-accept",
+            )
+            .pipe(Effect.forkScoped);
+          yield* harness.awaitUrlAuthPublished("elicit-turn-accept");
+          assert.isTrue(
+            yield* harness.coordinator.acceptUrlAuthentication({
+              instanceId: harness.instanceId,
+              elicitationId: "elicit-turn-accept",
+            }),
+          );
+          assert.deepEqual(yield* Fiber.join(turnElicitFiber), { action: "accept" });
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          while ((yield* Queue.take(events)).type !== "turn.terminal") {
+            // drain Turn 1
+          }
+          assert.isFalse(yield* session.hasPendingBackgroundWork!);
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+  });
 });
