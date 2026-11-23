@@ -95,6 +95,7 @@ export interface ThreadLaunchInput {
   readonly title: string;
   readonly generateTitle?: boolean;
   readonly modelSelection: ModelSelection;
+  readonly antigravityFailoverPinned?: boolean;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
   readonly workspaceStrategy: ThreadLaunchWorkspaceStrategy;
@@ -1344,6 +1345,9 @@ const make = Effect.gen(function* () {
                 projectId: input.projectId,
                 title: input.title,
                 modelSelection: input.modelSelection,
+                ...(input.antigravityFailoverPinned === undefined
+                  ? {}
+                  : { antigravityFailoverPinned: input.antigravityFailoverPinned }),
                 runtimeMode: input.runtimeMode,
                 interactionMode: input.interactionMode,
                 branch: initialBranch,
@@ -1397,6 +1401,9 @@ const make = Effect.gen(function* () {
                 commandId: messageCommandId,
                 threadId,
                 modelSelection: input.modelSelection,
+                ...(input.antigravityFailoverPinned === undefined
+                  ? {}
+                  : { antigravityFailoverPinned: input.antigravityFailoverPinned }),
                 dispatchMode: { type: "defer_start", workspaceStrategy },
                 createdBy: input.createdBy,
                 creationSource: input.creationSource,

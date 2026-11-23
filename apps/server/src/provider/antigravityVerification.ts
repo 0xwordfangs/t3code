@@ -17,36 +17,85 @@ const isGoogleAccountVerificationUrl = Schema.is(GoogleAccountVerificationUrl);
 const EMBEDDED_ERROR_OBJECT_START = /\{\s*"error"\s*:/gu;
 const VALIDATION_REQUIRED_WORD = /\bVALIDATION_REQUIRED\b/;
 const OUTER_HTTP_STATUS =
-  /\b(?:Error|HTTP(?:\/\d(?:\.\d)?)?|status(?:\s*code)?)\s*[:=]?\s*([1-5]\d{2})\b/i;
-const TRAILING_API_STATUS = /,\s*Status:\s*([A-Z_]+)\b/;
+  /\b(?:Error|HTTP(?:\/\d(?:\.\d)?)?|status(?:\s*code)?)(?:\s*[:=]\s*|\s+)([1-5]\d{2})\b/gi;
+const TRAILING_API_STATUS = /,\s*Status:\s*([A-Z_]+)\b/g;
 const OUTER_VERIFICATION_FRAMING =
-  /(?:\bError\s+403\b|\bHTTP(?:\/\d(?:\.\d)?)?\s*403\b|\bcode\s*[:=]?\s*403\b|\bPERMISSION_DENIED\b)/i;
+  /(?:\bError\s+403\b|\bHTTP(?:\/\d(?:\.\d)?)?\s*403\b|\bcode(?:\s*[:=]\s*|\s+)403\b|\bPERMISSION_DENIED\b)/i;
 const MAX_VERIFICATION_TEXT_CHARS = 32_768;
 const MAX_CANDIDATE_JSON_MATCHES = 8;
+
+interface EmbeddedErrorCandidate {
+  readonly startIndex: number;
+  readonly endIndex: number;
+  readonly slice: string;
+}
 
 function textBeforeFirstJsonObject(text: string): string {
   const braceIndex = text.indexOf("{");
   return braceIndex === -1 ? text : text.slice(0, braceIndex);
 }
 
-function textAfterLastJsonObject(text: string): string {
-  const braceIndex = text.lastIndexOf("}");
-  return braceIndex === -1 ? "" : text.slice(braceIndex + 1);
+function findEmbeddedErrorObjects(bounded: string): ReadonlyArray<EmbeddedErrorCandidate> {
+  const candidates: Array<EmbeddedErrorCandidate> = [];
+  let inspected = 0;
+  let skipUntil = 0;
+  for (const match of bounded.matchAll(EMBEDDED_ERROR_OBJECT_START)) {
+    const startIndex = match.index;
+    if (startIndex === undefined || startIndex < skipUntil) continue;
+    if (inspected >= MAX_CANDIDATE_JSON_MATCHES) break;
+    inspected += 1;
+    const candidate = sliceBalancedJsonObject(bounded, startIndex);
+    if (candidate === undefined) continue;
+    skipUntil = candidate.endIndex;
+    candidates.push({ startIndex, endIndex: candidate.endIndex, slice: candidate.slice });
+  }
+  return candidates;
+}
+
+function envelopeOutsideRanges(
+  text: string,
+  ranges: ReadonlyArray<{ readonly startIndex: number; readonly endIndex: number }>,
+): string {
+  if (ranges.length === 0) return text;
+  let result = "";
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.startIndex > cursor) {
+      result += text.slice(cursor, range.startIndex);
+    }
+    result += "\n";
+    cursor = Math.max(cursor, range.endIndex);
+  }
+  if (cursor < text.length) {
+    result += text.slice(cursor);
+  }
+  return result;
+}
+
+function hasConflictingStatusInEnvelope(envelope: string): boolean {
+  for (const match of envelope.matchAll(OUTER_HTTP_STATUS)) {
+    if (match[1] !== "403") return true;
+  }
+  for (const match of envelope.matchAll(TRAILING_API_STATUS)) {
+    if (match[1] !== "PERMISSION_DENIED" && match[1] !== ANTIGRAVITY_VERIFICATION_REQUIRED_CODE) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function hasConflictingNon403ApiError(text: string): boolean {
-  const outerStatus = OUTER_HTTP_STATUS.exec(textBeforeFirstJsonObject(text));
-  if (outerStatus !== null) {
-    return outerStatus[1] !== "403";
-  }
-  const trailingStatus = TRAILING_API_STATUS.exec(textAfterLastJsonObject(text));
-  if (trailingStatus !== null) {
-    return (
-      trailingStatus[1] !== "PERMISSION_DENIED" &&
-      trailingStatus[1] !== ANTIGRAVITY_VERIFICATION_REQUIRED_CODE
-    );
-  }
-  return false;
+  const bounded =
+    text.length > MAX_VERIFICATION_TEXT_CHARS ? text.slice(0, MAX_VERIFICATION_TEXT_CHARS) : text;
+  const envelope = envelopeOutsideRanges(bounded, findEmbeddedErrorObjects(bounded));
+  return hasConflictingStatusInEnvelope(envelope);
+}
+
+export function hasOuterAntigravityVerificationFraming(text: string): boolean {
+  const bounded =
+    text.length > MAX_VERIFICATION_TEXT_CHARS ? text.slice(0, MAX_VERIFICATION_TEXT_CHARS) : text;
+  const envelope = envelopeOutsideRanges(bounded, findEmbeddedErrorObjects(bounded));
+  return OUTER_VERIFICATION_FRAMING.test(envelope);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -156,50 +205,36 @@ function sliceBalancedJsonObject(
 
 export function extractAntigravityVerificationFromText(
   text: string,
+  options?: { readonly skipConflictCheck?: boolean },
 ): AntigravityVerificationRequired | undefined {
   const bounded =
     text.length > MAX_VERIFICATION_TEXT_CHARS ? text.slice(0, MAX_VERIFICATION_TEXT_CHARS) : text;
-  if (!VALIDATION_REQUIRED_WORD.test(bounded) || hasConflictingNon403ApiError(bounded)) {
+  if (!VALIDATION_REQUIRED_WORD.test(bounded)) {
     return undefined;
   }
+  const candidates = findEmbeddedErrorObjects(bounded);
+  const envelope = envelopeOutsideRanges(bounded, candidates);
+  if (options?.skipConflictCheck !== true && hasConflictingStatusInEnvelope(envelope)) {
+    return undefined;
+  }
+  const hasValidEnvelopeForJson =
+    envelope.trim().length === 0 || OUTER_VERIFICATION_FRAMING.test(envelope);
   let fallback: AntigravityVerificationRequired | undefined;
-  let inspected = 0;
-  let skipUntil = 0;
-  const rejectedRanges: Array<readonly [number, number]> = [];
-  for (const match of bounded.matchAll(EMBEDDED_ERROR_OBJECT_START)) {
-    const startIndex = match.index;
-    if (startIndex === undefined || startIndex < skipUntil) continue;
-    if (inspected >= MAX_CANDIDATE_JSON_MATCHES) break;
-    inspected += 1;
-    const candidate = sliceBalancedJsonObject(bounded, startIndex);
-    if (candidate === undefined) continue;
-    skipUntil = candidate.endIndex;
-    try {
-      const parsed = extractAntigravityVerificationRequired(JSON.parse(candidate.slice));
-      if (parsed === undefined) {
-        rejectedRanges.push([startIndex, candidate.endIndex]);
+  if (hasValidEnvelopeForJson) {
+    for (const candidate of candidates) {
+      try {
+        const parsed = extractAntigravityVerificationRequired(JSON.parse(candidate.slice));
+        if (parsed === undefined) continue;
+        if (parsed.verificationUrl !== undefined) return parsed;
+        fallback ??= parsed;
+      } catch {
         continue;
       }
-      if (parsed.verificationUrl !== undefined) return parsed;
-      fallback ??= parsed;
-    } catch {
-      rejectedRanges.push([startIndex, candidate.endIndex]);
-      continue;
     }
   }
   if (fallback !== undefined) return fallback;
-  let outsideRejected = bounded;
-  if (rejectedRanges.length > 0) {
-    outsideRejected = "";
-    let cursor = 0;
-    for (const [start, end] of rejectedRanges) {
-      outsideRejected += bounded.slice(cursor, start);
-      cursor = end;
-    }
-    outsideRejected += bounded.slice(cursor);
-  }
-  if (outsideRejected.trimStart().startsWith("{")) return undefined;
-  const outerText = textBeforeFirstJsonObject(outsideRejected);
+  if (envelope.trimStart().startsWith("{")) return undefined;
+  const outerText = textBeforeFirstJsonObject(envelope);
   if (!VALIDATION_REQUIRED_WORD.test(outerText) || !OUTER_VERIFICATION_FRAMING.test(outerText)) {
     return undefined;
   }

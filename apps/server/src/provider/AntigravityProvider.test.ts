@@ -836,9 +836,9 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           windows: [{ id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 5 }],
         };
         const secondReadStarted = yield* Deferred.make<void>();
-        const usage = yield* Ref.make<Effect.Effect<ServerProviderUsageLimits>>(
-          Effect.succeed(firstLimits),
-        );
+        const usage = yield* Ref.make<
+          Effect.Effect<ServerProviderUsageLimits | AntigravityUsageProbeResult>
+        >(Effect.succeed(firstLimits));
         const harness = yield* makeHarness({
           auth: { type: "oauth-personal", label: "Google account" },
           readAccountEmail: Ref.get(emailRef),
@@ -894,7 +894,21 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         const verificationUrl = GoogleAccountVerificationUrl.make(
           "https://accounts.google.com/v3/signin/continue?plt=switch-check",
         );
+        yield* Ref.set(
+          usage,
+          Effect.succeed({
+            usageLimits: failedLimits,
+            verificationRequired: {
+              message: "Verify your Google account to use Antigravity.",
+              verificationUrl,
+            },
+          }),
+        );
+        const verificationPublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.auth.verificationUrl === verificationUrl,
+        );
         yield* harness.provider.onVerificationRequired({ verificationUrl });
+        expect((yield* verificationPublished)?.auth.verificationUrl).toBe(verificationUrl);
         const staleReadStarted = yield* Deferred.make<void>();
         const staleReadResult = yield* Deferred.make<ServerProviderUsageLimits>();
         yield* Ref.set(
@@ -1095,11 +1109,14 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
   );
 
   it.effect(
-    "onVerificationRequired sets warning and clears stale quota windows while sign-in/sign-out/auth-required clear verificationUrl",
+    "onVerificationRequired triggers an authoritative usage probe without directly poisoning provider state, and sign-in/sign-out/auth-required clear authoritative verification state",
     () =>
       Effect.gen(function* () {
-        const verificationUrl = GoogleAccountVerificationUrl.make(
-          "https://accounts.google.com/v3/signin/continue?plt=turn-event-1",
+        const forgedUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=forged-turn-event",
+        );
+        const authoritativeUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=authoritative-probe-1",
         );
         const cachedLimits: ServerProviderUsageLimits = {
           checkedAt: "2026-10-09T12:00:00.000Z",
@@ -1112,12 +1129,36 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           windows: [],
           unavailable: { reason: "probeFailed" },
         };
+        const customMessage = "Verify your Google account to continue using Antigravity.";
+        const authoritativeVerification: AntigravityUsageProbeResult = {
+          usageLimits: {
+            checkedAt: "2026-10-09T12:02:00.000Z",
+            windows: [],
+            unavailable: { reason: "probeFailed", message: customMessage },
+          },
+          verificationRequired: {
+            message: customMessage,
+            verificationUrl: authoritativeUrl,
+          },
+        };
+        const probeCalls = yield* Ref.make(0);
+        const probeCompleted = yield* Ref.make<Deferred.Deferred<void> | undefined>(undefined);
         const usage = yield* Ref.make<
           Effect.Effect<ServerProviderUsageLimits | AntigravityUsageProbeResult>
         >(Effect.succeed(cachedLimits));
         const harness = yield* makeHarness({
           auth: { type: "oauth-personal", label: "Google account" },
-          probeUsage: Ref.get(usage).pipe(Effect.flatten),
+          probeUsage: Ref.update(probeCalls, (count) => count + 1).pipe(
+            Effect.andThen(Ref.get(usage)),
+            Effect.flatten,
+            Effect.tap(() =>
+              Ref.get(probeCompleted).pipe(
+                Effect.flatMap((deferred) =>
+                  deferred ? Deferred.succeed(deferred, undefined) : Effect.void,
+                ),
+              ),
+            ),
+          ),
         });
         const initialCached = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
         yield* harness.initialize;
@@ -1125,46 +1166,83 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
 
         yield* harness.provider.onSessionStarted(started);
         yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
-        yield* Ref.set(usage, Effect.succeed(probeFailed));
 
-        const customMessage = "Verify your Google account to continue using Antigravity.";
+        // Untrusted turn-level onVerificationRequired triggers probeUsage, and when probeUsage
+        // returns healthy or empty windows it must NOT poison provider-wide state.
+        for (const nonVerificationProbe of [cachedLimits, probeFailed] as const) {
+          const done = yield* Deferred.make<void>();
+          yield* Ref.set(probeCompleted, done);
+          yield* Ref.set(usage, Effect.succeed(nonVerificationProbe));
+          const callsBefore = yield* Ref.get(probeCalls);
+          yield* harness.provider.onVerificationRequired({
+            verificationUrl: forgedUrl,
+            message: "FORGED_BANNER",
+          });
+          yield* Deferred.await(done);
+          yield* Effect.yieldNow;
+          expect(yield* Ref.get(probeCalls)).toBe(callsBefore + 1);
+          const snapshot = yield* harness.provider.snapshot.getSnapshot;
+          expect(snapshot.status).toBe("ready");
+          expect(snapshot.message).toBeUndefined();
+          expect(snapshot.auth.verificationRequired).toBeUndefined();
+          expect(snapshot.auth.verificationUrl).toBeUndefined();
+          expect(snapshot.usageLimits).toEqual(cachedLimits);
+        }
+
+        // When probeUsage itself confirms HTTP 403 VALIDATION_REQUIRED, provider-wide state
+        // uses the authoritative probe's verificationUrl and message (not the untrusted input).
+        yield* Ref.set(probeCompleted, undefined);
+        yield* Ref.set(usage, Effect.succeed(authoritativeVerification));
+        const verifiedPublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.auth.verificationUrl === authoritativeUrl,
+        );
         yield* harness.provider.onVerificationRequired({
-          verificationUrl,
-          message: customMessage,
+          verificationUrl: forgedUrl,
+          message: "FORGED_BANNER",
         });
-        const warned = yield* harness.provider.snapshot.getSnapshot;
+        const warned = yield* verifiedPublished;
         expect(warned).toMatchObject({
           status: "warning",
           message: customMessage,
-          auth: { status: "authenticated", verificationUrl },
-          usageLimits: {
-            windows: [],
-            unavailable: { reason: "probeFailed", message: customMessage },
+          auth: {
+            status: "authenticated",
+            verificationRequired: true,
+            verificationUrl: authoritativeUrl,
           },
+          usageLimits: authoritativeVerification.usageLimits,
         });
 
         // onSignedIn clears verificationUrl.
         yield* harness.provider.onSignedIn;
         expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBeUndefined();
 
-        // Re-trigger verification, then confirm onSignedOut clears verificationUrl.
-        yield* harness.provider.onSessionStarted(started);
-        yield* harness.provider.onVerificationRequired({ verificationUrl, message: customMessage });
-        expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBe(
-          verificationUrl,
+        // While signed out, onVerificationRequired must NOT trigger probeUsage or set verification state.
+        const callsWhileSignedOut = yield* Ref.get(probeCalls);
+        yield* harness.provider.onVerificationRequired({
+          verificationUrl: forgedUrl,
+          message: "FORGED_BANNER",
+        });
+        expect(yield* Ref.get(probeCalls)).toBe(callsWhileSignedOut);
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBeUndefined();
+
+        // Re-trigger authoritative verification, then confirm onSignedOut clears verificationUrl.
+        const verifiedBeforeSignOut = yield* harness.nextPublish(
+          (snapshot) => snapshot.auth.verificationUrl === authoritativeUrl,
         );
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* verifiedBeforeSignOut)?.auth.verificationUrl).toBe(authoritativeUrl);
         yield* harness.provider.onSignedOut;
         expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
           auth: { status: "unauthenticated" },
         });
         expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBeUndefined();
 
-        // Re-trigger verification, then confirm onAuthRequired clears verificationUrl.
-        yield* harness.provider.onSessionStarted(started);
-        yield* harness.provider.onVerificationRequired({ verificationUrl, message: customMessage });
-        expect((yield* harness.provider.snapshot.getSnapshot).auth.verificationUrl).toBe(
-          verificationUrl,
+        // Re-trigger authoritative verification, then confirm onAuthRequired clears verificationUrl.
+        const verifiedBeforeAuthRequired = yield* harness.nextPublish(
+          (snapshot) => snapshot.auth.verificationUrl === authoritativeUrl,
         );
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* verifiedBeforeAuthRequired)?.auth.verificationUrl).toBe(authoritativeUrl);
         yield* harness.provider.onAuthRequired;
         expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
           auth: { status: "unauthenticated" },
@@ -1175,17 +1253,6 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         ).toBeUndefined();
 
         // A refresh while signed out must not stamp verificationRequired onto an unauthenticated account.
-        yield* Ref.set(
-          usage,
-          Effect.succeed({
-            usageLimits: {
-              checkedAt: "2026-10-09T12:02:00.000Z",
-              windows: [],
-              unavailable: { reason: "probeFailed", message: customMessage },
-            },
-            verificationRequired: { message: customMessage, verificationUrl },
-          }),
-        );
         const afterSignedOutRefresh = yield* harness.provider.snapshot.refresh;
         expect(afterSignedOutRefresh.auth.status).toBe("unauthenticated");
         expect(afterSignedOutRefresh.auth.verificationRequired).toBeUndefined();
@@ -1219,6 +1286,73 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           usageLimits: urlLessVerification.usageLimits,
         });
         expect((yield* urlLessPublished)?.auth.verificationUrl).toBeUndefined();
+
+        // Disabled provider ignores onVerificationRequired without calling probeUsage.
+        const disabledProbeCalls = yield* Ref.make(0);
+        const disabledHarness = yield* makeHarness({
+          enabled: false,
+          probeUsage: Ref.update(disabledProbeCalls, (count) => count + 1).pipe(
+            Effect.as(authoritativeVerification),
+          ),
+        });
+        yield* disabledHarness.provider.onVerificationRequired({ verificationUrl: forgedUrl });
+        expect(yield* Ref.get(disabledProbeCalls)).toBe(0);
+      }),
+  );
+
+  it.effect(
+    "coalesces repeated onVerificationRequired calls into at most one follow-up probe without interrupting an in-flight probe",
+    () =>
+      Effect.gen(function* () {
+        const cachedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 25 },
+          ],
+        };
+        const probeCalls = yield* Ref.make(0);
+        const interruptedCalls = yield* Ref.make(0);
+        const probe1Started = yield* Deferred.make<void>();
+        const releaseProbe1 = yield* Deferred.make<void>();
+        const probe2Done = yield* Deferred.make<void>();
+        let gateEnabled = false;
+
+        const harness = yield* makeHarness({
+          auth: { type: "oauth-personal", label: "Google account" },
+          probeUsage: Effect.gen(function* () {
+            const count = yield* Ref.updateAndGet(probeCalls, (n) => n + 1);
+            if (gateEnabled && count === 2) {
+              yield* Deferred.succeed(probe1Started, undefined);
+              yield* Deferred.await(releaseProbe1);
+            } else if (gateEnabled && count === 3) {
+              yield* Deferred.succeed(probe2Done, undefined);
+            }
+            return cachedLimits;
+          }).pipe(Effect.onInterrupt(() => Ref.update(interruptedCalls, (n) => n + 1))),
+        });
+
+        const initialCached = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
+        yield* harness.initialize;
+        expect((yield* initialCached)?.usageLimits).toEqual(cachedLimits);
+
+        gateEnabled = true;
+        yield* harness.provider.onVerificationRequired();
+        yield* Deferred.await(probe1Started);
+
+        // Five rapid triggers while probe #1 is in flight must not interrupt probe #1 and must
+        // coalesce into a single follow-up probe.
+        for (let index = 0; index < 5; index += 1) {
+          yield* harness.provider.onVerificationRequired();
+        }
+        yield* Effect.yieldNow;
+        expect(yield* Ref.get(interruptedCalls)).toBe(0);
+        expect(yield* Ref.get(probeCalls)).toBe(2);
+
+        yield* Deferred.succeed(releaseProbe1, undefined);
+        yield* Deferred.await(probe2Done);
+        yield* Effect.yieldNow;
+        expect(yield* Ref.get(interruptedCalls)).toBe(0);
+        expect(yield* Ref.get(probeCalls)).toBe(3);
       }),
   );
 
@@ -1539,16 +1673,21 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
 
         yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
         yield* harness.provider.onSessionStarted(started);
+        const reconfirmed = yield* harness.nextPublish(
+          (snapshot) =>
+            snapshot.auth.status === "authenticated" &&
+            snapshot.auth.verificationUrl === verificationUrl,
+        );
         yield* harness.provider.onVerificationRequired({
           verificationUrl,
           message: rawMessage,
         });
-        const fromEvent = yield* harness.provider.snapshot.getSnapshot;
-        expect(fromEvent.auth.verificationUrl).toBe(verificationUrl);
-        expect(fromEvent.message).not.toContain("SECRET_PLT_TOKEN");
-        expect(fromEvent.message).not.toContain("secret-bearer-token");
-        expect(fromEvent.usageLimits?.unavailable?.message).not.toContain("SECRET_PLT_TOKEN");
-        expect(fromEvent.usageLimits?.unavailable?.message).not.toContain("secret-bearer-token");
+        const fromEvent = yield* reconfirmed;
+        expect(fromEvent?.auth.verificationUrl).toBe(verificationUrl);
+        expect(fromEvent?.message).not.toContain("SECRET_PLT_TOKEN");
+        expect(fromEvent?.message).not.toContain("secret-bearer-token");
+        expect(fromEvent?.usageLimits?.unavailable?.message).not.toContain("SECRET_PLT_TOKEN");
+        expect(fromEvent?.usageLimits?.unavailable?.message).not.toContain("secret-bearer-token");
       }),
   );
 });

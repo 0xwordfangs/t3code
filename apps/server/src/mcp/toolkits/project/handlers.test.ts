@@ -943,6 +943,8 @@ it.effect(
         })
         .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
       expect(launched[0]?.modelSelection).toEqual(pinnedModel);
+      expect(launched[0]?.antigravityFailoverPinned).toBe(true);
+      expect(launched[1]?.antigravityFailoverPinned).toBeUndefined();
       expect(suppressedPreflight).toEqual([true, false]);
     }),
 );

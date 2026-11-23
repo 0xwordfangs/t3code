@@ -563,7 +563,10 @@ export interface AcpAdapterV2Flavor {
     toolCall: AcpToolCallState,
   ) => AcpAdapterV2SubagentUpdate | undefined;
   readonly isProvisionalSubagentTool?: (toolCall: AcpToolCallState) => boolean;
-  readonly normalizeToolCall?: (toolCall: AcpToolCallState) => AcpToolCallState;
+  readonly normalizeToolCall?: (
+    toolCall: AcpToolCallState,
+    context?: { readonly cwd: string | null },
+  ) => AcpToolCallState;
   readonly extractProposedPlanMarkdown?: (toolCall: AcpToolCallState) => string | undefined;
   readonly extractBackgroundTaskId?: (toolCall: AcpToolCallState) => string | undefined;
   /** Distinguishes commands from monitors when lifecycle notifications omit their kind. */
@@ -1663,7 +1666,7 @@ export function acpPostSettleContinuationOfferEvidence(
     return parseSessionUpdateEvent(notification).events.some((event) => {
       if (event._tag !== "ToolCallUpdated") return false;
       // Grok monitor start ACKs say completed while the task is still running.
-      const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
+      const toolCall = flavor.normalizeToolCall?.(event.toolCall, { cwd: null }) ?? event.toolCall;
       return (
         toolCall.status === "completed" ||
         toolCall.status === "failed" ||
@@ -2935,9 +2938,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             notification: EffectAcpSchema.SessionNotification,
           ): Effect.fn.Return<void> {
             if (flavor.extractBackgroundTaskId === undefined) return;
+            const currentTurn = yield* Ref.get(activeTurn);
+            const cwd = currentTurn?.input.runtimePolicy.cwd ?? latestRuntimePolicy.cwd;
             for (const event of parseSessionUpdateEvent(notification).events) {
               if (event._tag !== "ToolCallUpdated") continue;
-              const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
+              const toolCall =
+                flavor.normalizeToolCall?.(event.toolCall, { cwd }) ?? event.toolCall;
               const taskId = flavor.extractBackgroundTaskId(toolCall);
               if (taskId === undefined) continue;
               const status = toolStatus(toolCall.status);
@@ -4378,7 +4384,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
             for (const event of parseSessionUpdateEvent(notification).events) {
               if (event._tag === "ToolCallUpdated") {
-                const tool = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
+                const tool =
+                  flavor.normalizeToolCall?.(event.toolCall, {
+                    cwd: owner.owner.input.runtimePolicy.cwd,
+                  }) ?? event.toolCall;
                 yield* projectSubagentTool(
                   subagent,
                   notification.sessionId,
@@ -4765,7 +4774,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           yield* closeTextStream(context, "user");
           const previous = context.tools.get(incoming.toolCallId);
           const merged = mergeToolCallState(previous, incoming);
-          const normalized = flavor.normalizeToolCall?.(merged) ?? merged;
+          const normalized =
+            flavor.normalizeToolCall?.(merged, { cwd: context.input.runtimePolicy.cwd }) ?? merged;
           const extractedBackgroundTaskId = flavor.extractBackgroundTaskId?.(normalized);
           const backgroundTaskId = extractedBackgroundTaskId ?? previous?.backgroundCommandTaskId;
           const backgroundCommandTaskId =
@@ -5775,7 +5785,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             // Long-timeout get_command_or_subagent_output consumption ends with TaskOutput alone.
             for (const event of parseSessionUpdateEvent(notification).events) {
               if (event._tag !== "ToolCallUpdated") continue;
-              const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
+              const toolCall =
+                flavor.normalizeToolCall?.(event.toolCall, { cwd: latestRuntimePolicy.cwd }) ??
+                event.toolCall;
               const proposedPlanMarkdown = flavor.extractProposedPlanMarkdown?.(toolCall);
               if (proposedPlanMarkdown !== undefined && proposedPlanMarkdown.length > 0) {
                 yield* captureProposedPlan({ planMarkdown: proposedPlanMarkdown });
@@ -6232,7 +6244,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             ) {
               for (const event of parseSessionUpdateEvent(notification).events) {
                 if (event._tag !== "ToolCallUpdated") continue;
-                const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
+                const toolCall =
+                  flavor.normalizeToolCall?.(event.toolCall, { cwd: latestRuntimePolicy.cwd }) ??
+                  event.toolCall;
                 const subagentUpdate = extractSubagentUpdate(toolCall);
                 if (subagentUpdate === undefined) continue;
                 if (!acpSubagentStatusIsTerminal(subagentUpdate.status)) {
@@ -6392,7 +6406,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 subagent.task.nativeTaskRef?.nativeId ?? String(subagent.task.id);
               for (const event of parseSessionUpdateEvent(notification).events) {
                 if (event._tag !== "ToolCallUpdated") continue;
-                const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
+                const toolCall =
+                  flavor.normalizeToolCall?.(event.toolCall, {
+                    cwd: context.input.runtimePolicy.cwd,
+                  }) ?? event.toolCall;
                 const subagentUpdate = extractSubagentUpdate(toolCall);
                 if (subagentUpdate !== undefined) {
                   if (
@@ -7356,7 +7373,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           ) {
             for (const event of parseSessionUpdateEvent(notification).events) {
               if (event._tag !== "ToolCallUpdated") continue;
-              const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
+              const toolCall =
+                flavor.normalizeToolCall?.(event.toolCall, {
+                  cwd: context.input.runtimePolicy.cwd,
+                }) ?? event.toolCall;
               const subagentUpdate = extractSubagentUpdate(toolCall);
               if (
                 subagentUpdate === undefined ||
@@ -7889,7 +7909,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   for (const event of parseSessionUpdateEvent(entry).events) {
                     if (event._tag !== "ToolCallUpdated") continue;
                     const merged = mergeToolCallState(tracked, event.toolCall);
-                    tracked = flavor.normalizeToolCall?.(merged) ?? merged;
+                    tracked =
+                      flavor.normalizeToolCall?.(merged, {
+                        cwd: trackedTurn?.input.runtimePolicy.cwd ?? latestRuntimePolicy.cwd,
+                      }) ?? merged;
                   }
                 }
                 return tracked;

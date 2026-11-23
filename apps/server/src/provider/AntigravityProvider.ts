@@ -37,10 +37,7 @@ import {
   isCommandMissingCause,
   type ServerProviderDraft,
 } from "@t3tools/provider-core/server/snapshotProbe";
-import {
-  makeUnavailableUsageLimits,
-  resolveUsageLimitsAfterProbe,
-} from "@t3tools/provider-core/server/usageLimits";
+import { resolveUsageLimitsAfterProbe } from "@t3tools/provider-core/server/usageLimits";
 
 import { antigravityThinkingConfig } from "./acp/AntigravityAcpSupport.ts";
 import type { AntigravityUsageProbeResult } from "./antigravityUsageLimits.ts";
@@ -283,121 +280,153 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   // The quota read can take 30 seconds, so it never blocks readiness or a session start.
   // One read runs at a time; sign-in and sign-out interrupt it so a stale account never lands.
   const usageRead = yield* FiberHandle.make();
+  let usageReadGeneration = 0;
+  let usageReadActive = false;
+  let reprobeRequested = false;
   const republish = yield* Deferred.make<Effect.Effect<ServerProvider>>();
   const scope = yield* Effect.scope;
-  const refreshUsage = Effect.fn("AntigravityProvider.refreshUsage")(function* () {
-    if (!options.probeUsage || (yield* PublishingUsage)) return;
+  const runUsageProbeOnce = Effect.fn("AntigravityProvider.runUsageProbeOnce")(function* () {
+    if (!options.probeUsage) return;
     const startedState = yield* SubscriptionRef.get(metadata);
     if (startedState.draft.auth.status === "unauthenticated") return;
     const startedEmail = startedState.draft.auth.email;
     const startedRevision = startedState.authRevision;
+    const probed = normalizeUsageProbeResult(yield* options.probeUsage);
+    const applied = yield* SubscriptionRef.modify(
+      metadata,
+      (state): readonly [boolean, AntigravityProviderState] => {
+        if (
+          state.draft.auth.status === "unauthenticated" ||
+          state.authRevision !== startedRevision ||
+          isDifferentEmail(startedEmail, state.draft.auth.email)
+        ) {
+          return [false, state];
+        }
+        if (probed.verificationRequired !== undefined) {
+          const verificationMessage =
+            sanitizeProviderFailureMessage(probed.verificationRequired.message) ||
+            ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
+          const verificationUrl =
+            probed.verificationRequired.verificationUrl ?? state.draft.auth.verificationUrl;
+          return [
+            true,
+            {
+              ...state,
+              verificationRequired: true,
+              draft: {
+                ...state.draft,
+                auth: withAuthVerification(state.draft.auth, {
+                  required: true,
+                  url: verificationUrl,
+                }),
+                status: "warning",
+                message: verificationMessage,
+                usageLimits: probed.usageLimits,
+              },
+            },
+          ];
+        }
+        const shouldClearVerification = probed.usageLimits.windows.length > 0;
+        const nextUsageLimits =
+          state.verificationRequired && !shouldClearVerification
+            ? state.draft.usageLimits
+            : resolveUsageLimitsAfterProbe({
+                published: state.draft.usageLimits,
+                probed: probed.usageLimits,
+              });
+        if (!shouldClearVerification) {
+          return [
+            true,
+            {
+              ...state,
+              draft: {
+                ...state.draft,
+                usageLimits: nextUsageLimits,
+              },
+            },
+          ];
+        }
+        const hadVerification =
+          state.verificationRequired ||
+          state.draft.auth.verificationRequired === true ||
+          state.draft.auth.verificationUrl !== undefined;
+        const { message: _previousMessage, ...draftWithoutMessage } = state.draft;
+        const clearedAuth = withAuthVerification(state.draft.auth, undefined);
+        const restoredMessage =
+          clearedAuth.status === "authenticated" ? undefined : authUncheckedMessage;
+        return [
+          true,
+          {
+            ...state,
+            verificationRequired: false,
+            draft: {
+              ...(hadVerification && state.draft.status === "warning"
+                ? draftWithoutMessage
+                : state.draft),
+              auth: clearedAuth,
+              ...(hadVerification && state.draft.status === "warning"
+                ? {
+                    status: clearedAuth.status === "authenticated" ? "ready" : "warning",
+                    ...(restoredMessage ? { message: restoredMessage } : {}),
+                  }
+                : {}),
+              usageLimits: nextUsageLimits,
+            },
+          },
+        ];
+      },
+    );
+    // Enrichment cannot change published limits; a health check publishes them.
+    if (applied) {
+      yield* Deferred.await(republish).pipe(
+        Effect.flatten,
+        Effect.provideService(PublishingUsage, true),
+        Effect.ignoreCause({ log: true }),
+        Effect.forkIn(scope),
+      );
+    }
+  });
+  const refreshUsage = Effect.fn("AntigravityProvider.refreshUsage")(function* (refreshOptions?: {
+    readonly force?: boolean;
+  }) {
+    if (!options.probeUsage || (yield* PublishingUsage)) return;
+    const startedState = yield* SubscriptionRef.get(metadata);
+    if (startedState.draft.auth.status === "unauthenticated") return;
+    if (usageReadActive) {
+      // Coalesce repeated triggers into at most one follow-up probe without interrupting in-flight HTTP calls.
+      if (refreshOptions?.force === true) {
+        reprobeRequested = true;
+      }
+      return;
+    }
+    const generation = ++usageReadGeneration;
+    usageReadActive = true;
+    reprobeRequested = false;
     yield* FiberHandle.run(
       usageRead,
-      options.probeUsage.pipe(
-        Effect.map(normalizeUsageProbeResult),
-        Effect.flatMap((probed) =>
-          SubscriptionRef.modify(
-            metadata,
-            (state): readonly [boolean, AntigravityProviderState] => {
-              if (
-                state.draft.auth.status === "unauthenticated" ||
-                state.authRevision !== startedRevision ||
-                isDifferentEmail(startedEmail, state.draft.auth.email)
-              ) {
-                return [false, state];
-              }
-              if (probed.verificationRequired !== undefined) {
-                const verificationMessage =
-                  sanitizeProviderFailureMessage(probed.verificationRequired.message) ||
-                  ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
-                const verificationUrl =
-                  probed.verificationRequired.verificationUrl ?? state.draft.auth.verificationUrl;
-                return [
-                  true,
-                  {
-                    ...state,
-                    verificationRequired: true,
-                    draft: {
-                      ...state.draft,
-                      auth: withAuthVerification(state.draft.auth, {
-                        required: true,
-                        url: verificationUrl,
-                      }),
-                      status: "warning",
-                      message: verificationMessage,
-                      usageLimits: probed.usageLimits,
-                    },
-                  },
-                ];
-              }
-              const shouldClearVerification = probed.usageLimits.windows.length > 0;
-              const nextUsageLimits =
-                state.verificationRequired && !shouldClearVerification
-                  ? state.draft.usageLimits
-                  : resolveUsageLimitsAfterProbe({
-                      published: state.draft.usageLimits,
-                      probed: probed.usageLimits,
-                    });
-              if (!shouldClearVerification) {
-                return [
-                  true,
-                  {
-                    ...state,
-                    draft: {
-                      ...state.draft,
-                      usageLimits: nextUsageLimits,
-                    },
-                  },
-                ];
-              }
-              const hadVerification =
-                state.verificationRequired ||
-                state.draft.auth.verificationRequired === true ||
-                state.draft.auth.verificationUrl !== undefined;
-              const { message: _previousMessage, ...draftWithoutMessage } = state.draft;
-              const clearedAuth = withAuthVerification(state.draft.auth, undefined);
-              const restoredMessage =
-                clearedAuth.status === "authenticated" ? undefined : authUncheckedMessage;
-              return [
-                true,
-                {
-                  ...state,
-                  verificationRequired: false,
-                  draft: {
-                    ...(hadVerification && state.draft.status === "warning"
-                      ? draftWithoutMessage
-                      : state.draft),
-                    auth: clearedAuth,
-                    ...(hadVerification && state.draft.status === "warning"
-                      ? {
-                          status: clearedAuth.status === "authenticated" ? "ready" : "warning",
-                          ...(restoredMessage ? { message: restoredMessage } : {}),
-                        }
-                      : {}),
-                    usageLimits: nextUsageLimits,
-                  },
-                },
-              ];
-            },
-          ),
-        ),
-        // Enrichment cannot change published limits; a health check publishes them.
-        Effect.flatMap((applied) =>
-          applied
-            ? Deferred.await(republish).pipe(
-                Effect.flatten,
-                Effect.provideService(PublishingUsage, true),
-                Effect.ignoreCause({ log: true }),
-                Effect.forkIn(scope),
-              )
-            : Effect.void,
+      Effect.gen(function* () {
+        do {
+          reprobeRequested = false;
+          yield* runUsageProbeOnce();
+        } while (reprobeRequested && usageReadGeneration === generation);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (usageReadGeneration === generation) {
+              usageReadActive = false;
+            }
+          }),
         ),
       ),
       // Store the fiber before it runs, so a sign-out during the read can interrupt it.
-      { onlyIfMissing: true, startImmediately: false },
+      // Replacing a handle whose loop already exited is safe and closes the post-loop finalizer window.
+      { onlyIfMissing: refreshOptions?.force !== true, startImmediately: false },
     );
   });
   const resetUsage = Effect.gen(function* () {
+    usageReadGeneration += 1;
+    usageReadActive = false;
+    reprobeRequested = false;
     yield* FiberHandle.clear(usageRead);
     if (options.clearUsage) yield* options.clearUsage;
   });
@@ -749,44 +778,16 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   });
 
   const onVerificationRequired = Effect.fn("AntigravityProvider.onVerificationRequired")(
-    function* (input: {
+    function* (_input?: {
       readonly verificationUrl?: GoogleAccountVerificationUrl;
       readonly message?: string;
     }) {
       if (!settings.enabled) return;
-      yield* FiberHandle.clear(usageRead);
-      const updatedAt = DateTime.formatIso(yield* DateTime.now);
-      const verificationMessage =
-        (input.message !== undefined ? sanitizeProviderFailureMessage(input.message) : "") ||
-        ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
-      yield* SubscriptionRef.update(metadata, (state) => {
-        if (state.draft.auth.status === "unauthenticated") return state;
-        const verificationUrl = input.verificationUrl ?? state.draft.auth.verificationUrl;
-        return {
-          authRevision: state.authRevision + 1,
-          verificationRequired: true,
-          draft: {
-            ...state.draft,
-            auth: withAuthVerification(state.draft.auth, {
-              required: true,
-              url: verificationUrl,
-            }),
-            status: "warning",
-            message: verificationMessage,
-            checkedAt: updatedAt,
-            usageLimits: makeUnavailableUsageLimits({
-              checkedAt: updatedAt,
-              reason: "probeFailed",
-              message: verificationMessage,
-            }),
-          },
-        } satisfies AntigravityProviderState;
-      });
-      yield* Deferred.await(republish).pipe(
-        Effect.flatten,
-        Effect.provideService(PublishingUsage, true),
-        Effect.ignoreCause({ log: true }),
-      );
+      const current = yield* SubscriptionRef.get(metadata);
+      if (current.draft.auth.status === "unauthenticated") return;
+      // Untrusted turn/ACP/trajectory errors never write provider-wide verification state
+      // directly; trigger an authoritative Cloud Code quota probe to confirm.
+      yield* refreshUsage({ force: true });
     },
   );
 

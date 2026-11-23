@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vite-plus/test";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { describe, expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as AcpWireSchema from "effect-acp/schema-v1";
@@ -422,6 +426,45 @@ describe("Antigravity tool results", () => {
       expect(acpToolCallDiffPatch(toolCall.data.content)).toBeUndefined();
     }
   });
+
+  it.effect(
+    "does not read from the filesystem when normalizeAntigravityToolCall is called without a scoped reader",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-protocol-noread-" });
+        const secretFile = pathService.join(tempDir, "secret.env");
+        yield* fs.writeFileString(secretFile, "HEADER=1\nSECRET_TOKEN=alpha\nFOOTER=2\n");
+        const pending = parseToolUpdate({
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "edit-noread",
+            title: "Run edit_file?",
+            kind: "edit",
+            status: "pending",
+            content: [
+              {
+                type: "diff",
+                path: secretFile,
+                oldText: "SECRET_TOKEN=alpha",
+                newText: "SECRET_TOKEN=beta",
+              },
+            ],
+            rawInput: {
+              TargetContent: "SECRET_TOKEN=alpha",
+              ReplacementContent: "SECRET_TOKEN=beta",
+              TargetFile: secretFile,
+            },
+          },
+        }).toolCall;
+
+        const normalized = normalizeAntigravityToolCall(pending);
+        expect(normalized.data.content).toMatchObject([{ patch: { format: "snippet" } }]);
+        expect(acpToolCallDiffPatch(normalized.data.content)).toBeUndefined();
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 
   it.each([
     { CommandLine: "pwd", Cwd: "/one" },

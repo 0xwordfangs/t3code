@@ -569,6 +569,255 @@ it.effect("waitForThread returns the cut run once its continuation is declined",
   }),
 );
 
+it.effect(
+  "waitForThread wakes when untilDelegatedWorkSettled awaits a later resultRun whose failover declines",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project:thread-management:wait-delegated-declined");
+      const threadId = ThreadId.make("thread:thread-management:wait-delegated-declined");
+      const selectedRunId = RunId.make("run:thread-management:wait-delegated-selected");
+      const laterRunId = RunId.make("run:thread-management:wait-delegated-later");
+      const awaitedRunIds: Array<RunId> = [];
+      const declined = yield* Deferred.make<void>();
+      const awaitingStarted = yield* Deferred.make<void>();
+      let pending = true;
+      const runs = [
+        { id: selectedRunId, ordinal: 1, status: "completed", activeAttemptId: "attempt:1" },
+        { id: laterRunId, ordinal: 2, status: "failed", activeAttemptId: "attempt:2" },
+      ];
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: () => Effect.succeed(false),
+            delegatedTaskResultPending: () => Effect.succeed(pending),
+            awaitRestartContinuation: (run) =>
+              Effect.sync(() => {
+                awaitedRunIds.push(run.id);
+              }).pipe(
+                Effect.andThen(Deferred.succeed(awaitingStarted, undefined)),
+                Effect.andThen(Deferred.await(declined)),
+              ),
+            streamStoredEventsFrom: () => Stream.never,
+            getThreadRecords: () =>
+              Effect.succeed({
+                thread: { id: threadId, projectId, deletedAt: null },
+                runs,
+                messages: [],
+                subagents: [],
+                providerThreads: [],
+              } as unknown as OrchestrationV2ThreadProjection),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(layerTest),
+      );
+      const fiber = yield* service
+        .waitForThread({
+          projectId,
+          threadId,
+          runId: selectedRunId,
+          untilDelegatedWorkSettled: true,
+          timeoutMs: 24 * 60 * 60 * 1_000,
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(awaitingStarted);
+      expect(awaitedRunIds).toEqual([laterRunId]);
+      pending = false;
+      yield* Deferred.succeed(declined, undefined);
+      const result = yield* Fiber.join(fiber);
+
+      expect(result).toMatchObject({
+        timedOut: false,
+        run: { id: selectedRunId, status: "completed" },
+        resultRun: { id: laterRunId, status: "failed" },
+      });
+    }),
+);
+
+it.effect(
+  "waitForThread reloads superseded Attempt 1 when Attempt 2 commits and completes during restartContinuationPending",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project:thread-management:wait-superseded-attempt");
+      const threadId = ThreadId.make("thread:thread-management:wait-superseded-attempt");
+      const runId = RunId.make("run:thread-management:wait-superseded-attempt");
+      let currentRun: {
+        readonly id: RunId;
+        readonly status: "failed" | "completed";
+        readonly activeAttemptId: string;
+      } = {
+        id: runId,
+        status: "failed",
+        activeAttemptId: "attempt:1",
+      };
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: (run) =>
+              Effect.sync(() => {
+                if (run.activeAttemptId === "attempt:1") {
+                  currentRun = {
+                    id: runId,
+                    status: "completed",
+                    activeAttemptId: "attempt:2",
+                  };
+                }
+                return false;
+              }),
+            streamStoredEventsFrom: () => Stream.never,
+            getThreadRecords: () =>
+              Effect.succeed({
+                thread: { id: threadId, projectId, deletedAt: null },
+                runs: [currentRun],
+              } as unknown as OrchestrationV2ThreadProjection),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(layerTest),
+      );
+      const result = yield* service.waitForThread({
+        projectId,
+        threadId,
+        runId,
+        timeoutMs: 60_000,
+      });
+
+      expect(result).toMatchObject({
+        timedOut: false,
+        run: { id: runId, status: "completed", activeAttemptId: "attempt:2" },
+      });
+    }),
+);
+
+it.effect(
+  "settleThread({ byOwnAgent: true }) deduplicates settleAfterRun fibers per active run and cleans up after completion",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project:thread-management:settle-dedupe");
+      const threadId = ThreadId.make("thread:thread-management:settle-dedupe");
+      const run1Id = RunId.make("run:thread-management:settle-dedupe-1");
+      const run2Id = RunId.make("run:thread-management:settle-dedupe-2");
+      let activeRunId: RunId | null = run1Id;
+      let run1Status: "running" | "failed" = "running";
+      let run2Status: "running" | "failed" = "running";
+      const run1Queue = yield* Queue.unbounded<unknown>();
+      const run2Queue = yield* Queue.unbounded<unknown>();
+      const subscribedStreams: Array<{ readonly eventType: string | undefined }> = [];
+      const firstRunSubscribed = yield* Deferred.make<void>();
+      const secondRunSubscribed = yield* Deferred.make<void>();
+      let runUpdatedStreamCount = 0;
+
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadShell: () =>
+              Effect.succeed({
+                id: threadId,
+                projectId,
+                activeRunId,
+              } as never),
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: () => Effect.succeed(false),
+            awaitRestartContinuation: () => Effect.void,
+            streamStoredEventsFrom: (input) =>
+              Stream.unwrap(
+                Effect.gen(function* () {
+                  subscribedStreams.push({ eventType: input?.eventType });
+                  if (input?.eventType !== "run.updated") {
+                    return Stream.never;
+                  }
+                  runUpdatedStreamCount += 1;
+                  const streamNumber = runUpdatedStreamCount;
+                  if (streamNumber === 1) {
+                    yield* Deferred.succeed(firstRunSubscribed, undefined);
+                    return Stream.fromQueue(run1Queue) as never;
+                  }
+                  yield* Deferred.succeed(secondRunSubscribed, undefined);
+                  return Stream.fromQueue(run2Queue) as never;
+                }),
+              ),
+            getThreadRecords: () =>
+              Effect.succeed({
+                thread: { id: threadId, projectId, deletedAt: null },
+                runs: [
+                  { id: run1Id, ordinal: 1, status: run1Status, activeAttemptId: "attempt:1" },
+                  ...(activeRunId === run2Id
+                    ? [{ id: run2Id, ordinal: 2, status: run2Status, activeAttemptId: "attempt:2" }]
+                    : []),
+                ],
+              } as unknown as OrchestrationV2ThreadProjection),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
+
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const first = yield* service.settleThread({
+          commandId: CommandId.make("cmd:settle-dedupe-1"),
+          threadId,
+          byOwnAgent: true,
+        });
+        const second = yield* service.settleThread({
+          commandId: CommandId.make("cmd:settle-dedupe-2"),
+          threadId,
+          byOwnAgent: true,
+        });
+        const third = yield* service.settleThread({
+          commandId: CommandId.make("cmd:settle-dedupe-3"),
+          threadId,
+          byOwnAgent: true,
+        });
+        expect(first).toEqual({ settlesWhenTurnEnds: true });
+        expect(second).toEqual({ settlesWhenTurnEnds: true });
+        expect(third).toEqual({ settlesWhenTurnEnds: true });
+
+        yield* Deferred.await(firstRunSubscribed);
+        yield* Effect.yieldNow;
+        expect(runUpdatedStreamCount).toBe(1);
+        expect(subscribedStreams.filter((entry) => entry.eventType === "run.updated")).toHaveLength(
+          1,
+        );
+
+        // Ending run 1 lets the deduplicated settleAfterRun fiber exit and release its key.
+        run1Status = "failed";
+        yield* Queue.offer(run1Queue, {
+          event: { type: "run.updated", payload: { id: run1Id, status: "failed" } },
+        });
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+
+        // A later run on the same thread gets its own settleAfterRun fiber.
+        activeRunId = run2Id;
+        const fourth = yield* service.settleThread({
+          commandId: CommandId.make("cmd:settle-dedupe-4"),
+          threadId,
+          byOwnAgent: true,
+        });
+        expect(fourth).toEqual({ settlesWhenTurnEnds: true });
+        yield* Deferred.await(secondRunSubscribed);
+        expect(runUpdatedStreamCount).toBe(2);
+
+        run2Status = "failed";
+        yield* Queue.offer(run2Queue, {
+          event: { type: "run.updated", payload: { id: run2Id, status: "failed" } },
+        });
+      }).pipe(Effect.provide(layerTest));
+    }),
+);
+
 it.effect.each([
   "live",
   "no-match",

@@ -1,6 +1,15 @@
-import { describe, expect, it } from "vite-plus/test";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { describe, expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
-import { ANTIGRAVITY_EDIT_DIFF_OMITTED, antigravityEditPatch } from "./AntigravityEditLocation.ts";
+import {
+  ANTIGRAVITY_EDIT_DIFF_OMITTED,
+  antigravityEditPatch,
+  makeScopedAntigravityPreEditReader,
+} from "./AntigravityEditLocation.ts";
 
 const path = "/workspace/app.ts";
 const file = Array.from({ length: 20 }, (_, i) =>
@@ -242,4 +251,102 @@ describe("antigravityEditPatch", () => {
       /^@@ -1,300 \+1,300 @@/m,
     );
   });
+});
+
+describe("makeScopedAntigravityPreEditReader", () => {
+  it.effect("reads only regular UTF-8 text files inside canonical workspace roots", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const pathService = yield* Path.Path;
+      const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pre-edit-scope-" });
+      const workspace = pathService.join(tempRoot, "workspace");
+      const outside = pathService.join(tempRoot, "outside");
+      yield* fs.makeDirectory(workspace, { recursive: true });
+      yield* fs.makeDirectory(outside, { recursive: true });
+
+      const insideFile = pathService.join(workspace, "app.ts");
+      yield* fs.writeFileString(insideFile, "line 1\nconst target = 10;\nline 3\n");
+      const outsideFile = pathService.join(outside, "secret.env");
+      yield* fs.writeFileString(outsideFile, "SECRET=alpha\n");
+      const escapingSymlink = pathService.join(workspace, "escape.env");
+      yield* fs.symlink(outsideFile, escapingSymlink);
+      const insideSymlink = pathService.join(workspace, "inside-link.ts");
+      yield* fs.symlink(insideFile, insideSymlink);
+      const binaryFile = pathService.join(workspace, "binary.bin");
+      yield* fs.writeFile(binaryFile, new Uint8Array([0x61, 0x00, 0x62]));
+      const invalidUtf8File = pathService.join(workspace, "invalid-utf8.bin");
+      yield* fs.writeFile(invalidUtf8File, new Uint8Array([0xff, 0xfe, 0xfd]));
+      const emptyFile = pathService.join(workspace, "empty.txt");
+      yield* fs.writeFileString(emptyFile, "");
+      const oversizedFile = pathService.join(workspace, "oversized.txt");
+      yield* fs.writeFileString(oversizedFile, "a".repeat(1024 * 1024 + 1));
+      const subDir = pathService.join(workspace, "subdir");
+      yield* fs.makeDirectory(subDir, { recursive: true });
+
+      const reader = makeScopedAntigravityPreEditReader([workspace]);
+
+      // In-workspace regular file succeeds and places hunk accurately.
+      expect(reader(insideFile)).toBe("line 1\nconst target = 10;\nline 3\n");
+      expect(reader(insideSymlink)).toBe("line 1\nconst target = 10;\nline 3\n");
+      expect(
+        antigravityEditPatch({
+          path: insideFile,
+          rawInput: {
+            TargetContent: "const target = 10;",
+            ReplacementContent: "const target = 20;",
+          },
+          readPreEditFile: reader,
+        }),
+      ).toBe(
+        `--- ${insideFile}\n+++ ${insideFile}\n@@ -2,1 +2,1 @@\n-const target = 10;\n+const target = 20;\n`,
+      );
+
+      // Out-of-workspace files, traversal, escaping symlinks, relative paths, directories,
+      // UNC paths, empty, oversized, binary, FIFO, and /proc fail closed.
+      const blockedPaths = [
+        "",
+        "app.ts",
+        workspace,
+        subDir,
+        outsideFile,
+        pathService.join(workspace, "..", "outside", "secret.env"),
+        escapingSymlink,
+        "\\\\server\\share\\file.txt",
+        "//server/share/file.txt",
+        binaryFile,
+        invalidUtf8File,
+        emptyFile,
+        oversizedFile,
+      ];
+      const fifoPath = pathService.join(workspace, "blocking.fifo");
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const mkfifoExit = yield* spawner
+        .exitCode(ChildProcess.make("mkfifo", [fifoPath]))
+        .pipe(Effect.orElseSucceed(() => -1));
+      if (mkfifoExit === 0) {
+        blockedPaths.push(fifoPath);
+      }
+      const hasProcStatus = yield* fs.exists("/proc/self/status");
+      if (hasProcStatus) {
+        blockedPaths.push("/proc/self/status", "/proc/self/environ");
+      }
+      for (const blocked of blockedPaths) {
+        expect(reader(blocked)).toBeUndefined();
+      }
+      expect(
+        antigravityEditPatch({
+          path: outsideFile,
+          rawInput: { TargetContent: "SECRET=alpha", ReplacementContent: "SECRET=beta" },
+          readPreEditFile: reader,
+        }),
+      ).toMatch(/ snippet, line unknown$/m);
+
+      // Even if /proc were passed as an allowed root, 0-byte virtual files are rejected via fstatSync.
+      if (hasProcStatus) {
+        const procReader = makeScopedAntigravityPreEditReader(["/proc/self"]);
+        expect(procReader("/proc/self/status")).toBeUndefined();
+        expect(procReader("/proc/self/environ")).toBeUndefined();
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });

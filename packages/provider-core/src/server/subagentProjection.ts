@@ -62,8 +62,12 @@ export function makeSubagentChildThread(input: {
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
 }): OrchestrationV2AppThread {
-  // The remote parent delegated the parent thread, not its subagents.
-  const { delegatedFrom: _delegatedFrom, ...inherited } = input.parentThread;
+  // The remote parent delegated the parent thread, not its subagents, and explicit failover pinning belongs to the parent thread only.
+  const {
+    delegatedFrom: _delegatedFrom,
+    antigravityFailoverPinned: _antigravityFailoverPinned,
+    ...inherited
+  } = input.parentThread;
   return {
     ...inherited,
     createdBy: input.createdBy,

@@ -63,11 +63,40 @@ export type ServerProviderAuthStatus = typeof ServerProviderAuthStatus.Type;
 
 const GOOGLE_ACCOUNT_VERIFICATION_ORIGIN = "https://accounts.google.com";
 const GOOGLE_ACCOUNT_VERIFICATION_PATH = /^\/(?:v\d+\/)?signin\/continue$/;
-const FORBIDDEN_VERIFICATION_QUERY_KEYS = new Set([
-  "client_id",
+const ALLOWED_VERIFICATION_QUERY_KEYS = new Set([
+  "plt",
+  "continue",
+  "continueurl",
+  "sarp",
+  "scc",
+  "hl",
+  "osid",
+  "dsh",
+  "flowname",
+  "flowentry",
+  "service",
+]);
+const ALLOWED_GOOGLE_CONTINUE_HOSTS = new Set([
+  "antigravity.google",
+  "codeassist.google.com",
+  "developers.google.com",
+  "console.cloud.google.com",
+  "aistudio.google.com",
+  "gemini.google.com",
+]);
+const FORBIDDEN_CONTINUE_TARGET_QUERY_KEYS = new Set([
+  "continue",
+  "continueurl",
+  "followup",
   "redirect_uri",
+  "client_id",
   "response_type",
   "scope",
+  "url",
+  "q",
+  "dest",
+  "next",
+  "return_to",
 ]);
 
 function hasUnsafeVerificationUrlCharacter(value: string): boolean {
@@ -88,18 +117,31 @@ function hasAuthorityUserinfo(value: string): boolean {
 }
 
 function isGoogleContinueTargetUrl(value: string): boolean {
-  if (hasUnsafeVerificationUrlCharacter(value) || hasAuthorityUserinfo(value)) return false;
+  if (
+    hasUnsafeVerificationUrlCharacter(value) ||
+    hasAuthorityUserinfo(value) ||
+    value.includes("#")
+  ) {
+    return false;
+  }
   try {
     const url = new URL(value);
-    return (
-      url.protocol === "https:" &&
-      url.username === "" &&
-      url.password === "" &&
-      !url.hostname.startsWith(".") &&
-      (url.hostname === "google.com" ||
-        url.hostname.endsWith(".google.com") ||
-        url.hostname.endsWith(".google"))
-    );
+    if (
+      url.protocol !== "https:" ||
+      url.port !== "" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.hash !== "" ||
+      !ALLOWED_GOOGLE_CONTINUE_HOSTS.has(url.hostname)
+    ) {
+      return false;
+    }
+    for (const [rawKey] of url.searchParams) {
+      if (FORBIDDEN_CONTINUE_TARGET_QUERY_KEYS.has(rawKey.toLowerCase())) {
+        return false;
+      }
+    }
+    return true;
   } catch {
     return false;
   }
@@ -117,6 +159,7 @@ function isGoogleAccountVerificationUrl(value: string): boolean {
     const url = new URL(value);
     if (
       url.protocol !== "https:" ||
+      url.port !== "" ||
       url.hostname !== "accounts.google.com" ||
       url.origin !== GOOGLE_ACCOUNT_VERIFICATION_ORIGIN ||
       url.username !== "" ||
@@ -126,16 +169,48 @@ function isGoogleAccountVerificationUrl(value: string): boolean {
     ) {
       return false;
     }
+    let hasPlt = false;
     for (const [rawKey, paramValue] of url.searchParams) {
       const key = rawKey.toLowerCase();
-      if (FORBIDDEN_VERIFICATION_QUERY_KEYS.has(key)) return false;
+      if (!ALLOWED_VERIFICATION_QUERY_KEYS.has(key)) return false;
+      if (key === "plt") {
+        if (paramValue.trim().length === 0) return false;
+        hasPlt = true;
+      }
       if ((key === "continue" || key === "continueurl") && !isGoogleContinueTargetUrl(paramValue)) {
         return false;
       }
     }
-    return true;
+    return hasPlt;
   } catch {
     return false;
+  }
+}
+
+export function formatVerificationUrlDisplay(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const base = `${parsed.origin}${parsed.pathname}`;
+    const continueTargets: Array<string> = [];
+    const seenTargets = new Set<string>();
+    for (const [rawKey, paramValue] of parsed.searchParams) {
+      const key = rawKey.toLowerCase();
+      if (key !== "continue" && key !== "continueurl") continue;
+      try {
+        const target = new URL(paramValue);
+        if (target.protocol !== "https:" && target.protocol !== "http:") continue;
+        const formatted = `${target.origin}${target.pathname}`;
+        if (!seenTargets.has(formatted)) {
+          seenTargets.add(formatted);
+          continueTargets.push(formatted);
+        }
+      } catch {
+        continue;
+      }
+    }
+    return continueTargets.length > 0 ? `${base} → ${continueTargets.join(", ")}` : base;
+  } catch {
+    return url;
   }
 }
 

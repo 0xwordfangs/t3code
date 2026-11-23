@@ -828,6 +828,19 @@ function metadataUpdateContinuation(
       };
 }
 
+function withAntigravityFailoverPinned<
+  T extends { readonly antigravityFailoverPinned?: boolean | undefined },
+>(record: T, pinned: boolean): T {
+  if (pinned) {
+    return { ...record, antigravityFailoverPinned: true };
+  }
+  if (record.antigravityFailoverPinned === undefined) {
+    return record;
+  }
+  const { antigravityFailoverPinned: _cleared, ...rest } = record;
+  return rest as T;
+}
+
 // A later command for the first message would leave the new thread committed with no run,
 // and every client would show it idle until that command landed.
 function threadCreateInitialMessage(
@@ -841,6 +854,9 @@ function threadCreateInitialMessage(
     commandId: command.commandId,
     threadId: command.threadId,
     modelSelection: command.modelSelection,
+    ...(command.antigravityFailoverPinned === undefined
+      ? {}
+      : { antigravityFailoverPinned: command.antigravityFailoverPinned }),
     dispatchMode:
       workspaceStrategy === undefined
         ? { type: "start_immediately" }
@@ -871,6 +887,16 @@ function mayStartSubagentFollowup(
 /** Waiting runs only drain post-terminal output; their agent turn is over and still needs a wake. */
 function isLiveRun(run: OrchestrationV2Run): boolean {
   return run.status === "preparing" || run.status === "starting" || run.status === "running";
+}
+
+function isTerminalRunStatus(status: OrchestrationV2Run["status"]): boolean {
+  return (
+    status === "completed" ||
+    status === "interrupted" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "rolled_back"
+  );
 }
 
 function hasLiveRun(projection: Pick<OrchestrationV2ThreadProjection, "runs">): boolean {
@@ -1037,17 +1063,15 @@ function queuedRunModelSelection(
     : run.modelSelection;
 }
 
-/** The selection the thread will be on once every queued run has started. */
-function queueTailModelSelection(
+/** The last queued run whose selection applies to the thread once every queued run has started. */
+function queueTailRun(
   projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
-): ModelSelection {
-  return (
-    queuedRunsInDeliveryOrder(projection).findLast(
-      (run) =>
-        !followsCurrentConversation(
-          projection.messages.find((message) => message.id === run.userMessageId),
-        ),
-    )?.modelSelection ?? projection.thread.modelSelection
+): OrchestrationV2Run | undefined {
+  return queuedRunsInDeliveryOrder(projection).findLast(
+    (run) =>
+      !followsCurrentConversation(
+        projection.messages.find((message) => message.id === run.userMessageId),
+      ),
   );
 }
 
@@ -2461,7 +2485,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         failureClass !== "usage_limit" &&
         failedRun?.providerInstanceId === originalModelSelection.instanceId;
       let modelSelection = originalModelSelection;
+      const queuedRunPinned = followsCurrentConversation(queuedMessage)
+        ? projection.thread.antigravityFailoverPinned === true
+        : storedQueuedRun.antigravityFailoverPinned === true;
       const queuedPreflightAllowed =
+        !queuedRunPinned &&
         !worktreeMissing &&
         !originalProviderNonQuotaFailed &&
         storedQueuedRun.usageLimitContinuationOfRunId === undefined &&
@@ -2498,11 +2526,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }
         }
       }
-      const queuedRun = {
-        ...storedQueuedRun,
-        modelSelection,
-        providerInstanceId: modelSelection.instanceId,
-      };
+      const queuedRun = withAntigravityFailoverPinned(
+        {
+          ...storedQueuedRun,
+          modelSelection,
+          providerInstanceId: modelSelection.instanceId,
+        },
+        queuedRunPinned,
+      );
       // A limited provider would fail and consume every waiting message.
       if (
         usageLimitHoldsQueue(
@@ -3143,9 +3174,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const detachReason = freshContext
         ? FRESH_CONTEXT_DETACH_REASON
         : "Provider or model selection changed.";
+      const threadPinnedChanged =
+        (projection.thread.antigravityFailoverPinned === true) !== queuedRunPinned;
       yield* writeSystemEvents(
         [
-          ...(selectionChanged
+          ...(selectionChanged || threadPinnedChanged
             ? [
                 {
                   type:
@@ -3155,12 +3188,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   threadId,
                   providerInstanceId: queuedRun.providerInstanceId,
                   occurredAt: now,
-                  payload: {
-                    ...projection.thread,
-                    providerInstanceId: queuedRun.providerInstanceId,
-                    modelSelection: queuedRun.modelSelection,
-                    updatedAt: now,
-                  },
+                  payload: withAntigravityFailoverPinned(
+                    {
+                      ...projection.thread,
+                      providerInstanceId: queuedRun.providerInstanceId,
+                      modelSelection: queuedRun.modelSelection,
+                      updatedAt: now,
+                    },
+                    queuedRunPinned,
+                  ),
                 },
               ]
             : []),
@@ -3517,6 +3553,40 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // existing task row so the second dispatch is a successful idempotent
     // no-op rather than "already acknowledged/disposed" or empty-events.
     if (
+      command.type === "delegated_task.completion-delivery.acknowledge" &&
+      !isTerminalDelegatedTaskStatus(task.status) &&
+      task.result === null
+    ) {
+      const stillPending =
+        task.childThreadId === null
+          ? true
+          : yield* projectionStore.getThread(task.childThreadId).pipe(
+              Effect.flatMap((childThread) =>
+                delegatedTaskResultPending(
+                  task.childThreadId!,
+                  childThread.forkedFrom?.type === "node" &&
+                    childThread.forkedFrom.nodeId === task.id
+                    ? undefined
+                    : task.id,
+                ),
+              ),
+              Effect.orElseSucceed(() => true),
+            );
+      if (stillPending) {
+        yield* emitEvent({
+          type: "subagent.updated",
+          threadId: command.parentThreadId,
+          ...(task.runId === null ? {} : { runId: task.runId }),
+          nodeId: task.id,
+          driver: task.driver,
+          providerInstanceId: task.providerInstanceId,
+          occurredAt: now,
+          payload: task,
+        });
+        return;
+      }
+    }
+    if (
       task.completionDelivery?.state === state ||
       (command.type === "delegated_task.completion-delivery.acknowledge" &&
         task.completionDelivery?.state === "disposed")
@@ -3822,6 +3892,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       title: command.title,
       providerInstanceId: command.modelSelection.instanceId,
       modelSelection: command.modelSelection,
+      ...(command.antigravityFailoverPinned === true ? { antigravityFailoverPinned: true } : {}),
       runtimeMode: command.runtimeMode,
       interactionMode: command.interactionMode,
       branch: command.branch,
@@ -5251,12 +5322,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return { ...thread, interactionMode: command.interactionMode, updatedAt: now };
         case "thread.model-selection.set":
         case "provider.switch":
-          return {
-            ...thread,
-            providerInstanceId: command.modelSelection.instanceId,
-            modelSelection: command.modelSelection,
-            updatedAt: now,
-          };
+          return withAntigravityFailoverPinned(
+            {
+              ...thread,
+              providerInstanceId: command.modelSelection.instanceId,
+              modelSelection: command.modelSelection,
+              updatedAt: now,
+            },
+            command.antigravityFailoverPinned === true,
+          );
       }
     })();
     if (command.type === "thread.pull-request-watch.checks-reopen") {
@@ -6090,6 +6164,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       | "turnItems"
     >;
     readonly modelSelection: ModelSelection;
+    readonly antigravityFailoverPinned: boolean;
     readonly targetRunId: OrchestrationV2Run["id"];
     readonly messageId: OrchestrationV2ConversationMessage["id"];
     readonly text: string;
@@ -6345,22 +6420,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // Only a user's steer carries the picker's selection; the adapter applies it to the live turn.
       const steerCarriesSelection =
         input.delegatedCompletion === undefined && input.notification === undefined;
+      const threadPinnedChanged =
+        (input.projection.thread.antigravityFailoverPinned === true) !==
+        input.antigravityFailoverPinned;
       if (
         steerCarriesSelection &&
         (instanceChanged ||
-          !modelSelectionsEqual(input.projection.thread.modelSelection, input.modelSelection))
+          !modelSelectionsEqual(input.projection.thread.modelSelection, input.modelSelection) ||
+          threadPinnedChanged)
       ) {
         yield* emitEvent({
           type: instanceChanged ? "thread.provider-switched" : "thread.model-selection-updated",
           threadId: input.command.threadId,
           providerInstanceId: input.modelSelection.instanceId,
           occurredAt: now,
-          payload: {
-            ...input.projection.thread,
-            providerInstanceId: input.modelSelection.instanceId,
-            modelSelection: input.modelSelection,
-            updatedAt: now,
-          },
+          payload: withAntigravityFailoverPinned(
+            {
+              ...input.projection.thread,
+              providerInstanceId: input.modelSelection.instanceId,
+              modelSelection: input.modelSelection,
+              updatedAt: now,
+            },
+            input.antigravityFailoverPinned,
+          ),
+        });
+      }
+      if (
+        steerCarriesSelection &&
+        (targetRun.antigravityFailoverPinned === true) !== input.antigravityFailoverPinned
+      ) {
+        yield* emitEvent({
+          type: "run.updated",
+          threadId: input.command.threadId,
+          runId: targetRun.id,
+          nodeId: rootNodeId,
+          providerInstanceId: targetRun.providerInstanceId,
+          occurredAt: now,
+          payload: withAntigravityFailoverPinned(targetRun, input.antigravityFailoverPinned),
         });
       }
       yield* appendSteeringMessage({
@@ -6622,17 +6718,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
-    const restartedRun: OrchestrationV2Run = {
-      ...targetRun,
-      providerInstanceId: input.modelSelection.instanceId,
-      modelSelection: input.modelSelection,
-      providerThreadId: restartProviderThread.id,
-      rootNodeId: nextRootNodeId,
-      activeAttemptId: nextAttemptId,
-      userMessageId: input.messageId,
-      status: "starting",
-      contextHandoffId: restartHandoff?.id ?? targetRun.contextHandoffId,
-    };
+    const restartedRun: OrchestrationV2Run = withAntigravityFailoverPinned(
+      {
+        ...targetRun,
+        providerInstanceId: input.modelSelection.instanceId,
+        modelSelection: input.modelSelection,
+        providerThreadId: restartProviderThread.id,
+        rootNodeId: nextRootNodeId,
+        activeAttemptId: nextAttemptId,
+        userMessageId: input.messageId,
+        status: "starting",
+        contextHandoffId: restartHandoff?.id ?? targetRun.contextHandoffId,
+      },
+      input.antigravityFailoverPinned,
+    );
     const nextAttempt: OrchestrationV2RunAttempt = {
       id: nextAttemptId,
       runId: targetRun.id,
@@ -6685,7 +6784,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: { ...currentRootNode, status: "interrupted", completedAt: now },
       });
     }
-    if (selectionChanged) {
+    const steerCarriesSelection =
+      input.delegatedCompletion === undefined && input.notification === undefined;
+    const threadPinnedChanged =
+      (input.projection.thread.antigravityFailoverPinned === true) !==
+      input.antigravityFailoverPinned;
+    if (selectionChanged || (steerCarriesSelection && threadPinnedChanged)) {
       yield* emitEvent({
         type: providerInstanceChanged
           ? "thread.provider-switched"
@@ -6693,12 +6797,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         threadId: input.command.threadId,
         providerInstanceId: input.modelSelection.instanceId,
         occurredAt: now,
-        payload: {
-          ...input.projection.thread,
-          providerInstanceId: input.modelSelection.instanceId,
-          modelSelection: input.modelSelection,
-          updatedAt: now,
-        },
+        payload: withAntigravityFailoverPinned(
+          {
+            ...input.projection.thread,
+            providerInstanceId: input.modelSelection.instanceId,
+            modelSelection: input.modelSelection,
+            updatedAt: now,
+          },
+          input.antigravityFailoverPinned,
+        ),
       });
     }
     if (requiresProviderThreadHandoff || requiresProviderSessionRestart) {
@@ -7599,16 +7706,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active") {
       yield* ensureGoalCommandSupported(command, command, modelSelection.instanceId);
       const { targetRunId } = dispatchMode;
+      const steerCarriesSelection = delegatedCompletion === undefined && notification === undefined;
+      const targetRun = projection.runs.find((run) => run.id === targetRunId);
+      const steerAntigravityFailoverPinned = steerCarriesSelection
+        ? (command.antigravityFailoverPinned ??
+            (command.modelSelection === undefined ||
+            modelSelectionsEqual(projection.thread.modelSelection, command.modelSelection)
+              ? projection.thread.antigravityFailoverPinned
+              : false)) === true
+        : targetRun?.antigravityFailoverPinned === true ||
+          (targetRun !== undefined &&
+            modelSelectionsEqual(projection.thread.modelSelection, targetRun.modelSelection) &&
+            projection.thread.antigravityFailoverPinned === true);
       yield* dispatchSteerIntoRun({
         command,
         events,
         effects,
         projection,
-        modelSelection:
-          delegatedCompletion === undefined && notification === undefined
-            ? modelSelection
-            : (projection.runs.find((run) => run.id === targetRunId)?.modelSelection ??
-              modelSelection),
+        modelSelection: steerCarriesSelection
+          ? modelSelection
+          : (targetRun?.modelSelection ?? modelSelection),
+        antigravityFailoverPinned: steerAntigravityFailoverPinned,
         delegatedCompletion,
         ...(notification === undefined ? {} : { notification }),
         targetRunId,
@@ -7669,17 +7787,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // restart command that stops the active run goes first, so nothing queued applies before it.
     // Buffered provider wakes drain output their own provider already produced.
     const incomingMessage = { ...command, delegatedCompletion };
-    if (
+    const inheritedQueueTail =
       shouldQueue &&
       steerWhenReadyRunId === undefined &&
-      command.modelSelection === undefined &&
       queuedRunStop === undefined &&
       !followsCurrentConversation(incomingMessage) &&
       !isBufferedProviderNotification(incomingMessage)
-    ) {
-      modelSelection = queueTailModelSelection(projection);
+        ? queueTailRun(projection)
+        : undefined;
+    if (inheritedQueueTail !== undefined && command.modelSelection === undefined) {
+      modelSelection = inheritedQueueTail.modelSelection;
     }
+    const baseSelection = inheritedQueueTail?.modelSelection ?? projection.thread.modelSelection;
+    const basePinned =
+      inheritedQueueTail !== undefined
+        ? inheritedQueueTail.antigravityFailoverPinned
+        : projection.thread.antigravityFailoverPinned;
+    const antigravityFailoverPinned =
+      command.antigravityFailoverPinned ??
+      (command.modelSelection === undefined ||
+      modelSelectionsEqual(baseSelection, command.modelSelection)
+        ? basePinned
+        : false);
     const shouldPreflightAntigravity =
+      antigravityFailoverPinned !== true &&
       !shouldQueue &&
       command.usageLimitContinuationOfRunId === undefined &&
       command.restartContinuationOfRunId === undefined &&
@@ -7938,6 +8069,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : { usageLimitContinuationOfRunId: command.usageLimitContinuationOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
         ...(freshContext ? { freshContext: true } : {}),
+        ...(antigravityFailoverPinned === true ? { antigravityFailoverPinned: true } : {}),
       };
       const attempt: OrchestrationV2RunAttempt = {
         id: attemptId,
@@ -8125,9 +8257,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (transfer) => transfer.id !== pendingMergeBackTransfer?.id,
     );
     const now = yield* DateTime.now;
+    const nextThreadPinned = antigravityFailoverPinned === true;
+    const threadPinnedChanged =
+      (projection.thread.antigravityFailoverPinned === true) !== nextThreadPinned;
     if (
       !modelSelectionsEqual(projection.thread.modelSelection, modelSelection) ||
-      projection.thread.providerInstanceId !== modelSelection.instanceId
+      projection.thread.providerInstanceId !== modelSelection.instanceId ||
+      threadPinnedChanged
     ) {
       yield* emit(
         events,
@@ -8140,12 +8276,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         threadId: command.threadId,
         providerInstanceId: modelSelection.instanceId,
         occurredAt: now,
-        payload: {
-          ...projection.thread,
-          providerInstanceId: modelSelection.instanceId,
-          modelSelection,
-          updatedAt: now,
-        },
+        payload: withAntigravityFailoverPinned(
+          {
+            ...projection.thread,
+            providerInstanceId: modelSelection.instanceId,
+            modelSelection,
+            updatedAt: now,
+          },
+          nextThreadPinned,
+        ),
       });
     }
     if (
@@ -8355,6 +8494,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
         ...wakeWorkStartedAt(projection, command),
         ...(freshContext ? { freshContext: true } : {}),
+        ...(antigravityFailoverPinned === true ? { antigravityFailoverPinned: true } : {}),
       };
       const attempt: OrchestrationV2RunAttempt = {
         id: attemptId,
@@ -9162,6 +9302,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : { usageLimitContinuationOfRunId: command.usageLimitContinuationOfRunId }),
       ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
       ...wakeWorkStartedAt(projection, command),
+      ...(antigravityFailoverPinned === true ? { antigravityFailoverPinned: true } : {}),
     };
     const attempt: OrchestrationV2RunAttempt = {
       id: attemptId,
@@ -9712,23 +9853,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.title === undefined ? {} : { title: command.title }),
         ordinal: (yield* subagentCount(command.parentThreadId)) + 1,
       });
-      const childThread: OrchestrationV2AppThread = {
-        ...makeSubagentChildThread({
-          parentThread: parentProjection.thread,
-          childThreadId,
-          parentNodeId: taskNodeId,
-          activeProviderThreadId: null,
-          providerInstanceId: command.modelSelection.instanceId,
-          modelSelection: command.modelSelection,
-          title: taskTitle,
-          now,
-          createdBy: command.createdBy,
-          creationSource: command.creationSource,
-        }),
-        runtimeMode: command.runtimeMode,
-        interactionMode: command.interactionMode,
-        ...(command.workspaceStrategy === undefined ? {} : { branch: null, worktreePath: null }),
-      };
+      const childThread: OrchestrationV2AppThread = withAntigravityFailoverPinned(
+        {
+          ...makeSubagentChildThread({
+            parentThread: parentProjection.thread,
+            childThreadId,
+            parentNodeId: taskNodeId,
+            activeProviderThreadId: null,
+            providerInstanceId: command.modelSelection.instanceId,
+            modelSelection: command.modelSelection,
+            title: taskTitle,
+            now,
+            createdBy: command.createdBy,
+            creationSource: command.creationSource,
+          }),
+          runtimeMode: command.runtimeMode,
+          interactionMode: command.interactionMode,
+          ...(command.workspaceStrategy === undefined ? {} : { branch: null, worktreePath: null }),
+        },
+        command.antigravityFailoverPinned === true,
+      );
       const task: OrchestrationV2Subagent = {
         id: taskNodeId,
         threadId: command.parentThreadId,
@@ -9846,6 +9990,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         text: command.task,
         attachments: [],
         modelSelection: command.modelSelection,
+        ...(command.antigravityFailoverPinned === true ? { antigravityFailoverPinned: true } : {}),
         dispatchMode:
           command.workspaceStrategy === undefined
             ? { type: "start_immediately" }
@@ -11751,6 +11896,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       effects,
       projection,
       modelSelection,
+      antigravityFailoverPinned: queuedRun.antigravityFailoverPinned === true,
       targetRunId: command.targetRunId,
       messageId: queuedMessage.id,
       text: queuedMessage.text,
@@ -12981,7 +13127,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (run.status === "failed" && run.restartContinuationOfRunId !== undefined)) &&
           (yield* awaitsRestartContinuation(run).pipe(mapDispatchError(input.command)))) ||
         (run.status === "failed" &&
-          (yield* runAwaitsAntigravityFailover(thread.id, run, { ignorePendingStop: true })))
+          (yield* inspectAntigravityFailoverState(thread.id, run, { ignorePendingStop: true })) ===
+            "pending")
       ) {
         yield* markStoppedRun({ ...input, thread, run });
       }
@@ -14562,7 +14709,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           if (
             progress.state !== "result_available" ||
             (progress.resultRun !== undefined &&
-              (yield* runAwaitsAntigravityFailover(childThreadId, progress.resultRun))) ||
+              (yield* inspectAntigravityFailoverState(childThreadId, progress.resultRun)) !==
+                "settled") ||
             child.providerThreads.some((thread) => (thread.pendingBackgroundTasks ?? []).length > 0)
           )
             return;
@@ -14703,11 +14851,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ) {
         return;
       }
-      if (
-        options.task.cancelledRunId !== childRun.id &&
-        (yield* runAwaitsAntigravityFailover(childThreadId, childRun))
-      ) {
-        return;
+      if (options.task.cancelledRunId !== childRun.id) {
+        const failoverState = yield* inspectAntigravityFailoverState(childThreadId, childRun);
+        if (failoverState === "pending" || failoverState === "superseded") {
+          return;
+        }
       }
 
       // A run queued behind the report can end the task without saying anything.
@@ -14981,7 +15129,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       )
     )
       return;
-    if (!taskCancelled && (yield* runAwaitsAntigravityFailover(childThreadId, resultRun))) return;
+    if (
+      !taskCancelled &&
+      (yield* inspectAntigravityFailoverState(childThreadId, resultRun)) !== "settled"
+    )
+      return;
     // Callers hold the parent lock; dismiss takes the child lock, as follow-up intake does.
     const { runtimeRequests } = yield* projectionStore.getThreadRecords(childThreadId, [
       "runtimeRequests",
@@ -16124,18 +16276,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         Effect.orElseSucceed(() => false),
       );
 
-  const runAwaitsAntigravityFailover = Effect.fn("Orchestrator.runAwaitsAntigravityFailover")(
+  const MAX_ANTIGRAVITY_FAILOVER_SUPERSEDED_RETRIES = 3;
+
+  const inspectAntigravityFailoverState = Effect.fn("Orchestrator.inspectAntigravityFailoverState")(
     function* (
       threadId: ThreadId,
       run: OrchestrationV2Run,
       options?: { readonly ignorePendingStop?: boolean },
-    ) {
-      if (run.status !== "failed") return false;
+    ): Effect.fn.Return<"pending" | "superseded" | "settled"> {
+      if (run.status !== "failed") return "settled";
+      if (run.antigravityFailoverPinned === true) return "settled";
       const requestedKey = failoverAttemptKey(run);
       const committing = committingAntigravityFailoverAttempts.has(requestedKey);
-      if (!committing && options?.ignorePendingStop !== true && pendingStopThreads.has(threadId)) {
-        return false;
-      }
       const projection = yield* projectionStore
         .getThreadRecords(
           threadId,
@@ -16153,42 +16305,50 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         )
         .pipe(Effect.orElseSucceed(() => null));
-      if (projection === null) return false;
+      if (projection === null) return "settled";
       const liveRun = projection.runs.find((candidate) => candidate.id === run.id);
+      if (liveRun === undefined) return "settled";
+      if (liveRun.status !== "failed" || liveRun.activeAttemptId !== run.activeAttemptId) {
+        return "superseded";
+      }
+      if (!committing && options?.ignorePendingStop !== true && pendingStopThreads.has(threadId)) {
+        return "settled";
+      }
       if (
-        liveRun === undefined ||
-        liveRun.status !== "failed" ||
-        liveRun.activeAttemptId !== run.activeAttemptId ||
+        projection.thread.antigravityFailoverPinned === true ||
+        liveRun.antigravityFailoverPinned === true ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
         projection.thread.settledOverride === "settled" ||
         latestExecutedRun(projection.runs)?.id !== run.id ||
         projection.runtimeRequests.some((request) => request.status === "pending")
       ) {
-        return false;
+        return "settled";
       }
-      if (projection.turnItems.some((item) => item.type === "run_interrupt_request")) return false;
+      if (projection.turnItems.some((item) => item.type === "run_interrupt_request")) {
+        return "settled";
+      }
       const key = failoverAttemptKey(liveRun);
       if (committingAntigravityFailoverAttempts.has(key)) {
-        return true;
+        return "pending";
       }
       if (
         options?.ignorePendingStop === true &&
         pendingStopThreads.get(threadId)?.abortedFailoverRunIds.has(liveRun.id)
       ) {
-        return true;
+        return "pending";
       }
       const inFlight =
         activeAntigravityFailoverAttempts.has(key) ||
         (pendingAntigravityFailoverAttempts.get(key) ?? 0) > 0;
       if (!inFlight && !(yield* hasUnconsumedFailedRunUpdate(threadId, liveRun))) {
-        return false;
+        return "settled";
       }
       if (!(yield* antigravityFailover.isAntigravityInstance(liveRun.providerInstanceId))) {
-        return false;
+        return "settled";
       }
       const failure = latestRootProviderFailure(liveRun, projection.turnItems);
-      if (failure?.class !== "usage_limit") return false;
+      if (failure?.class !== "usage_limit") return "settled";
       const currentSessions = projection.providerSessions.filter(
         (session) =>
           session.providerInstanceId === liveRun.providerInstanceId &&
@@ -16197,7 +16357,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       for (const session of currentSessions) {
         if (yield* sessionHasBackgroundWork(session, projection.providerThreads)) {
-          return false;
+          return "settled";
         }
       }
       const excluded = new Set<ProviderInstanceId>([
@@ -16212,12 +16372,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           selection: liveRun.modelSelection,
           triedInstanceIds: excluded,
         });
-        if (candidate === null) return false;
+        if (candidate === null) return "settled";
         const adapterExit = yield* Effect.exit(
           providerAdapters.get(candidate.modelSelection.instanceId),
         );
         if (Exit.isSuccess(adapterExit)) {
-          return true;
+          return "pending";
         }
         excluded.add(candidate.modelSelection.instanceId);
       }
@@ -16239,6 +16399,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         );
         if (
           projection === null ||
+          projection.thread.antigravityFailoverPinned === true ||
           projection.thread.archivedAt !== null ||
           projection.thread.deletedAt !== null ||
           projection.thread.settledOverride === "settled"
@@ -16252,6 +16413,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         if (
           run === undefined ||
           run.status !== "failed" ||
+          run.antigravityFailoverPinned === true ||
           latestExecutedRun(projection.runs)?.id !== failedRunId ||
           projection.runtimeRequests.some((request) => request.status === "pending")
         ) {
@@ -17305,28 +17467,40 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   const delegatedTaskResultPending = Effect.fn("Orchestrator.delegatedTaskResultPending")(
     function* (childThreadId: ThreadId, taskId?: NodeId) {
-      const child = yield* projectionStore.getThreadRecords(
-        childThreadId,
-        ["runs", "messages", "subagents", "providerThreads", "providerTurns", "attempts"],
-        { messageRoles: ["user"] },
-      );
-      if (taskId !== undefined) {
-        const runs = delegatedTaskRuns(child, taskId);
-        const run = delegatedTaskResultRun(runs);
-        if (
-          run === undefined ||
-          delegatedTaskTerminalStatus(run.status) === null ||
-          delegatedTaskAwaitsWork(runs, child)
-        )
-          return true;
-        if (yield* childAwaitsRestartContinuation(runs, run)) return true;
-        return yield* runAwaitsAntigravityFailover(childThreadId, run);
+      for (let attempt = 0; attempt < MAX_ANTIGRAVITY_FAILOVER_SUPERSEDED_RETRIES; attempt += 1) {
+        const child = yield* projectionStore.getThreadRecords(
+          childThreadId,
+          ["runs", "messages", "subagents", "providerThreads", "providerTurns", "attempts"],
+          { messageRoles: ["user"] },
+        );
+        if (taskId !== undefined) {
+          const runs = delegatedTaskRuns(child, taskId);
+          const run = delegatedTaskResultRun(runs);
+          if (
+            run === undefined ||
+            delegatedTaskTerminalStatus(run.status) === null ||
+            delegatedTaskAwaitsWork(runs, child)
+          )
+            return true;
+          if (yield* childAwaitsRestartContinuation(runs, run)) return true;
+          const failoverState = yield* inspectAntigravityFailoverState(childThreadId, run);
+          if (failoverState === "pending") return true;
+          if (failoverState === "superseded") continue;
+          return false;
+        }
+        const progress = delegatedTaskProgress(child);
+        if (progress.state !== "result_available") return true;
+        if (progress.resultRun === undefined) return false;
+        if (yield* childAwaitsRestartContinuation(child.runs, progress.resultRun)) return true;
+        const failoverState = yield* inspectAntigravityFailoverState(
+          childThreadId,
+          progress.resultRun,
+        );
+        if (failoverState === "pending") return true;
+        if (failoverState === "superseded") continue;
+        return false;
       }
-      const progress = delegatedTaskProgress(child);
-      if (progress.state !== "result_available") return true;
-      if (progress.resultRun === undefined) return false;
-      if (yield* childAwaitsRestartContinuation(child.runs, progress.resultRun)) return true;
-      return yield* runAwaitsAntigravityFailover(childThreadId, progress.resultRun);
+      return true;
     },
     (effect, childThreadId, _taskId?) =>
       effect.pipe(
@@ -17423,9 +17597,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ) {
               return true;
             }
-            return yield* runAwaitsAntigravityFailover(command.threadId, targetRun, {
-              ignorePendingStop: true,
-            });
+            return (
+              (yield* inspectAntigravityFailoverState(command.threadId, targetRun, {
+                ignorePendingStop: true,
+              })) !== "settled"
+            );
           });
           yield* threadDispatch.withLock(
             command.threadId,
@@ -17524,17 +17700,45 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         if (yield* awaitsRestartContinuation(run).pipe(Effect.orElseSucceed(() => false))) {
           return true;
         }
-        return yield* runAwaitsAntigravityFailover(run.threadId, run).pipe(
-          Effect.orElseSucceed(() => false),
-        );
+        let currentRun = run;
+        for (let attempt = 0; attempt < MAX_ANTIGRAVITY_FAILOVER_SUPERSEDED_RETRIES; attempt += 1) {
+          const failoverState = yield* inspectAntigravityFailoverState(
+            currentRun.threadId,
+            currentRun,
+          ).pipe(Effect.orElseSucceed(() => "settled" as const));
+          if (failoverState === "pending") return true;
+          if (failoverState === "settled") return false;
+          const refreshed = yield* projectionStore
+            .getThreadRecords(currentRun.threadId, ["runs"])
+            .pipe(Effect.orElseSucceed(() => null));
+          const liveRun = refreshed?.runs.find((candidate) => candidate.id === currentRun.id);
+          if (liveRun === undefined) return false;
+          if (!isTerminalRunStatus(liveRun.status)) return true;
+          if (yield* awaitsRestartContinuation(liveRun).pipe(Effect.orElseSucceed(() => false))) {
+            return true;
+          }
+          currentRun = liveRun;
+        }
+        return true;
       },
     ),
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function* (run) {
       yield* effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
-      const awaitsFailover = yield* runAwaitsAntigravityFailover(run.threadId, run).pipe(
-        Effect.orElseSucceed(() => false),
+      const laterRuns = yield* projectionStore.getThreadRecords(run.threadId, ["runs"]).pipe(
+        Effect.map((records) => records.runs.filter((candidate) => runRanAfter(candidate, run))),
+        Effect.orElseSucceed(() => [] as ReadonlyArray<OrchestrationV2Run>),
       );
-      if (!awaitsFailover) {
+      for (const laterRun of laterRuns) {
+        if (yield* awaitsRestartContinuation(laterRun).pipe(Effect.orElseSucceed(() => false))) {
+          yield* effectOutbox
+            .awaitSettled(`effect:restart-continuation:${laterRun.id}`)
+            .pipe(Effect.ignore);
+        }
+      }
+      const initialState = yield* inspectAntigravityFailoverState(run.threadId, run).pipe(
+        Effect.orElseSucceed(() => "settled" as const),
+      );
+      if (initialState !== "pending") {
         return;
       }
       const key = failoverAttemptKey(run);
@@ -17551,10 +17755,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         () =>
           Effect.gen(function* () {
             // Re-check after registration so a failover settling concurrently cannot be missed.
-            const stillAwaitsFailover = yield* runAwaitsAntigravityFailover(run.threadId, run).pipe(
-              Effect.orElseSucceed(() => false),
+            const currentState = yield* inspectAntigravityFailoverState(run.threadId, run).pipe(
+              Effect.orElseSucceed(() => "settled" as const),
             );
-            if (!stillAwaitsFailover) {
+            if (currentState !== "pending") {
               return;
             }
             yield* Deferred.await(waiter).pipe(Effect.timeoutOption("10 seconds"));
@@ -17593,7 +17797,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           if (
             targetRun !== undefined &&
             (targetRun.status !== "failed" ||
-              (yield* runAwaitsAntigravityFailover(input.threadId, targetRun)))
+              (yield* inspectAntigravityFailoverState(input.threadId, targetRun)) !== "settled")
           ) {
             return;
           }

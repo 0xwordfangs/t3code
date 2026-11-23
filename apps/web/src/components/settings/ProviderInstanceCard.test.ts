@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
-import { SecretProviderId, type ServerProviderModel } from "@t3tools/contracts";
+import {
+  formatVerificationUrlDisplay,
+  SecretProviderId,
+  type ServerProviderModel,
+} from "@t3tools/contracts";
 
 import {
   deriveProviderModelsForDisplay,
-  formatVerificationUrlDisplay,
   nextProviderEnvironmentWithFieldSecret,
   nextProviderEnvironmentWithFieldValue,
 } from "./ProviderInstanceCard";
@@ -106,12 +109,17 @@ describe("provider environment helpers", () => {
 });
 
 describe("formatVerificationUrlDisplay", () => {
-  it("strips query tokens and fragments while keeping origin and pathname", () => {
+  it("strips query tokens and fragments while keeping origin, pathname, and continue destination", () => {
     expect(
       formatVerificationUrlDisplay(
         "https://accounts.google.com/v3/signin/continue?plt=secret-token&flow=1#step",
       ),
     ).toBe("https://accounts.google.com/v3/signin/continue");
+    expect(
+      formatVerificationUrlDisplay(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-token&continue=https%3A%2F%2Fantigravity.google%2F%3Fsecret%3D1",
+      ),
+    ).toBe("https://accounts.google.com/v3/signin/continue → https://antigravity.google/");
   });
 
   it("falls back to the input when URL parsing fails", () => {

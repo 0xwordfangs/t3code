@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - the tool-call normalizer is synchronous
 import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 
 import { PositiveInt } from "@t3tools/contracts";
 import { FILE_HEADERS_ONLY, formatPatch, structuredPatch, type StructuredPatchHunk } from "diff";
@@ -61,16 +62,69 @@ const pascalKeys = (value: unknown): unknown => {
   return result;
 };
 
-/** Reads a small file for snippet matching; edits to large or unreadable files stay unlocated. */
-export function readAntigravityPreEditFile(path: string): string | undefined {
-  try {
-    const stat = NodeFS.statSync(path);
-    return stat.isFile() && stat.size <= PRE_EDIT_FILE_LIMIT
-      ? NodeFS.readFileSync(path, "utf8")
-      : undefined;
-  } catch {
-    return undefined;
-  }
+/**
+ * Creates a workspace-confined pre-edit reader for snippet matching. Rejects empty paths, UNC
+ * paths, symlinks escaping `allowedRoots`, non-regular or zero-size virtual files (e.g. Linux
+ * `/proc`), oversized files, invalid UTF-8, and binary files containing NUL bytes.
+ */
+export function makeScopedAntigravityPreEditReader(
+  allowedRoots: ReadonlyArray<string>,
+): (path: string) => string | undefined {
+  const canonicalRoots = allowedRoots.flatMap((root) => {
+    try {
+      return [NodeFS.realpathSync.native(root)];
+    } catch {
+      return [];
+    }
+  });
+  return (targetPath: string): string | undefined => {
+    if (
+      canonicalRoots.length === 0 ||
+      targetPath.length === 0 ||
+      !NodePath.isAbsolute(targetPath) ||
+      targetPath.startsWith("\\\\") ||
+      targetPath.startsWith("//")
+    ) {
+      return undefined;
+    }
+    try {
+      const canonical = NodeFS.realpathSync.native(targetPath);
+      const inside = canonicalRoots.some((root) => {
+        const rel = NodePath.relative(root, canonical);
+        return (
+          rel !== "" &&
+          rel !== ".." &&
+          !rel.startsWith(`..${NodePath.sep}`) &&
+          !NodePath.isAbsolute(rel)
+        );
+      });
+      if (!inside) return undefined;
+      const fd = NodeFS.openSync(
+        canonical,
+        NodeFS.constants.O_RDONLY |
+          (NodeFS.constants.O_NOFOLLOW ?? 0) |
+          (NodeFS.constants.O_NONBLOCK ?? 0),
+      );
+      try {
+        const stat = NodeFS.fstatSync(fd);
+        if (!stat.isFile() || stat.size <= 0 || stat.size > PRE_EDIT_FILE_LIMIT) return undefined;
+        const buf = Buffer.allocUnsafe(PRE_EDIT_FILE_LIMIT + 1);
+        let total = 0;
+        while (total < buf.length) {
+          const n = NodeFS.readSync(fd, buf, total, buf.length - total, null);
+          if (n === 0) break;
+          total += n;
+        }
+        if (total > PRE_EDIT_FILE_LIMIT) return undefined;
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(buf.subarray(0, total));
+        return decoded.includes("\0") ? undefined : decoded;
+      } finally {
+        NodeFS.closeSync(fd);
+      }
+    } catch {
+      return undefined;
+    }
+  };
 }
 
 /** The line of the snippet's only match starting within `from`..`to`, if it spans whole lines. */

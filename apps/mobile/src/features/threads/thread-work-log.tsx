@@ -46,6 +46,7 @@ import {
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
 import {
   AuthProvidersManageScope,
+  formatVerificationUrlDisplay,
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type EnvironmentId,
   type RunId,
@@ -770,15 +771,6 @@ function EdgeFade(props: { readonly color: string; readonly direction: "up" | "d
 
 function workLogRowKey(row: ThreadFeedActivity): string {
   return row.id;
-}
-
-function formatVerificationUrlDisplay(url: string): string {
-  try {
-    const parsed = new URL(url);
-    return `${parsed.origin}${parsed.pathname}`;
-  } catch {
-    return url;
-  }
 }
 
 function WorkspacePreparationRetryButton(props: {

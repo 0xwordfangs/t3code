@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   applyServerProviderDeltas,
+  formatVerificationUrlDisplay,
   GoogleAccountVerificationUrl,
   OtlpEndpointCheckInput,
   resolveEnvironmentMachineKind,
@@ -173,13 +174,17 @@ describe("OtlpEndpointCheckInput", () => {
 describe("GoogleAccountVerificationUrl", () => {
   const decode = Schema.decodeUnknownSync(GoogleAccountVerificationUrl);
 
-  it("accepts only Google Accounts signin/continue URLs with Google continue targets", () => {
+  it("accepts only Google Accounts signin/continue URLs with allowlisted query keys, non-empty plt, and allowlisted continue targets", () => {
     for (const validUrl of [
       "https://accounts.google.com/v3/signin/continue?plt=abc",
       "https://accounts.google.com/signin/continue?plt=abc",
+      "https://accounts.google.com/v3/signin/continue?sarp=1&scc=1&plt=abc&hl=en&osid=1&dsh=S-1&flowName=GlifWebSignIn&flowEntry=ServiceLogin&service=cloudcode",
       "https://accounts.google.com/v3/signin/continue?plt=abc&continue=https%3A%2F%2Fantigravity.google%2F",
       "https://accounts.google.com/v3/signin/continue?plt=abc&continue=https%3A%2F%2Fdevelopers.google.com%2Fprofile",
-      "https://accounts.google.com/v3/signin/continue?plt=abc&continueUrl=https%3A%2F%2Fgoogle.com%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=abc&continueUrl=https%3A%2F%2Fcodeassist.google.com%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=abc&continue=https%3A%2F%2Fconsole.cloud.google.com%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=abc&continue=https%3A%2F%2Faistudio.google.com%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=abc&continue=https%3A%2F%2Fgemini.google.com%2F",
     ]) {
       expect(decode(validUrl)).toBe(validUrl);
     }
@@ -189,20 +194,77 @@ describe("GoogleAccountVerificationUrl", () => {
       "https://accounts.google.com/Logout",
       "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgoogle.com",
       "https://@accounts.google.com/v3/signin/continue?plt=1",
+      "https://accounts.google.com/v3/signin/continue",
+      "https://accounts.google.com/v3/signin/continue?sarp=1&scc=1",
+      "https://accounts.google.com/v3/signin/continue?plt=",
+      "https://accounts.google.com/v3/signin/continue?plt=%20",
       "https://accounts.google.com/v3/signin/continue?plt=1#foo",
       "https://accounts.google.com/v3/signin/continue?plt=1#",
       "https://accounts.google.com/v3/signin/continue?plt=1&client_id=abc",
       "https://accounts.google.com/v3/signin/continue?plt=1&redirect_uri=https%3A%2F%2Fgoogle.com",
       "https://accounts.google.com/v3/signin/continue?plt=1&response_type=code",
       "https://accounts.google.com/v3/signin/continue?plt=1&scope=openid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&followup=https%3A%2F%2Fattacker.invalid%2Fphish",
+      "https://accounts.google.com/v3/signin/continue?plt=1&unknown_param=1",
       "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fattacker.invalid",
       "https://accounts.google.com/v3/signin/continue?plt=1&continueUrl=https%3A%2F%2Fevilgoogle.com",
-      "https://accounts.google.com/v3/signin/continue?plt=1&continue=http%3A%2F%2Fgoogle.com",
-      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2F%40google.com",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=http%3A%2F%2Fantigravity.google%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2F%40antigravity.google%2F",
       "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2F.google%2F",
       "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F&continue=https%3A%2F%2Fattacker.invalid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Faccounts.google.com%2Fo%2Foauth2%2Fv2%2Fauth%3Fclient_id%3Dattacker",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continueUrl=https%3A%2F%2Faccounts.google.com%2FLogout",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Faccounts.google.com%2FServiceLogin%3Fcontinue%3Dhttps%253A%252F%252Fattacker.invalid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fwww.google.com%2Furl%3Fq%3Dhttps%253A%252F%252Fattacker.invalid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fgoogle.com%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fsites.google.com%2Fview%2Fattacker",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fscript.google.com%2Fmacros%2Fs%2Fdummy%2Fexec",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fdocs.google.com%2Fdocument%2Fd%2F1",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd%2F1",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%3A8443%2F",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%23frag",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%23",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%3Fcontinue%3Dhttps%253A%252F%252Fattacker.invalid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%3Fredirect_uri%3Dhttps%253A%252F%252Fattacker.invalid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%3Ffollowup%3Dhttps%253A%252F%252Fattacker.invalid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%3Fq%3Dhttps%253A%252F%252Fattacker.invalid",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%3Freturn_to%3D%2Fadmin",
     ]) {
       expect(() => decode(invalidUrl)).toThrow();
     }
+  });
+});
+
+describe("formatVerificationUrlDisplay", () => {
+  it("strips query tokens and fragments while surfacing continue target origin and pathname", () => {
+    expect(
+      formatVerificationUrlDisplay(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-token&sarp=1#step",
+      ),
+    ).toBe("https://accounts.google.com/v3/signin/continue");
+
+    expect(
+      formatVerificationUrlDisplay(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-token&continue=https%3A%2F%2Fantigravity.google%2F%3Ftoken%3Dhidden%23frag",
+      ),
+    ).toBe("https://accounts.google.com/v3/signin/continue → https://antigravity.google/");
+
+    expect(
+      formatVerificationUrlDisplay(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-token&continueUrl=https%3A%2F%2Fdevelopers.google.com%2Fprofile%3Fsecret%3D1",
+      ),
+    ).toBe(
+      "https://accounts.google.com/v3/signin/continue → https://developers.google.com/profile",
+    );
+
+    expect(
+      formatVerificationUrlDisplay(
+        "https://accounts.google.com/v3/signin/continue?plt=secret-token&continue=javascript%3Aalert(1)",
+      ),
+    ).toBe("https://accounts.google.com/v3/signin/continue");
+  });
+
+  it("falls back to the raw input when URL parsing fails", () => {
+    expect(formatVerificationUrlDisplay("not-a-valid-url")).toBe("not-a-valid-url");
   });
 });

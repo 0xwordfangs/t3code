@@ -16,7 +16,6 @@ import {
   ANTIGRAVITY_EDIT_DIFF_OMITTED,
   antigravityEditPatch,
   isAntigravitySnippetPatch,
-  readAntigravityPreEditFile,
 } from "./AntigravityEditLocation.ts";
 
 const TOOL_TEXT_LIMIT = 8_000;
@@ -413,7 +412,7 @@ function withAntigravityEditPatches(
 
 export function normalizeAntigravityToolCall(
   toolCall: AcpToolCallState,
-  readPreEditFile = readAntigravityPreEditFile,
+  readPreEditFile?: ((path: string) => string | undefined) | undefined,
 ): AcpToolCallState {
   const input = Option.getOrUndefined(decodeNativeToolFields(toolCall.data.rawInput));
   const output = Option.getOrUndefined(decodeNativeToolFields(toolCall.data.rawOutput));

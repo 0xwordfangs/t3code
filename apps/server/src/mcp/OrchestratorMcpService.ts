@@ -1770,43 +1770,85 @@ const make = Effect.gen(function* () {
     if (task.childThreadId === null) {
       return yield* readRemoteTask(scope, task, waitTimedOut, acknowledgeTerminal);
     }
-    const childControls = yield* threadManagement
-      .getThreadRecords(
-        task.childThreadId,
-        [
-          "runs",
-          "messages",
-          "contextTransfers",
-          "subagents",
-          "providerThreads",
-          "providerTurns",
-          "runtimeRequests",
-          "nodes",
-        ],
-        // Progress reads only active or undelivered tasks under the child.
-        { messageRoles: ["user"], omitSettledLeafNodes: true, omitSettledSubagents: true },
-      )
-      .pipe(Effect.mapError(threadManagementFailure));
-    const childRun = delegatedTaskRun(childControls, task);
-    const progress = delegatedTaskProgress(childControls);
-    const followupRuns =
-      childRun?.delegatedTaskId === task.id ? delegatedTaskRuns(childControls, task.id) : undefined;
-    const taskResultRun =
-      followupRuns === undefined ? progress.resultRun : delegatedTaskResultRun(followupRuns);
-    const taskWorkState =
-      followupRuns === undefined
-        ? progress.state
-        : !isTerminalTaskStatus(taskStatusForRun(taskResultRun))
-          ? "working"
-          : delegatedTaskAwaitsWork(followupRuns, childControls)
-            ? "waiting_for_children"
-            : "result_available";
-    const heldForRestart =
-      task.result === null &&
-      taskWorkState === "result_available" &&
-      (yield* threadManagement
-        .delegatedTaskResultPending(task.childThreadId, childRun?.delegatedTaskId)
-        .pipe(Effect.mapError(threadManagementFailure)));
+    const readChildSnapshot = Effect.fn("OrchestratorMcpService.readChildSnapshot")(function* () {
+      const childControls = yield* threadManagement
+        .getThreadRecords(
+          task.childThreadId!,
+          [
+            "runs",
+            "messages",
+            "contextTransfers",
+            "subagents",
+            "providerThreads",
+            "providerTurns",
+            "runtimeRequests",
+            "nodes",
+          ],
+          // Progress reads only active or undelivered tasks under the child.
+          { messageRoles: ["user"], omitSettledLeafNodes: true, omitSettledSubagents: true },
+        )
+        .pipe(Effect.mapError(threadManagementFailure));
+      const childRun = delegatedTaskRun(childControls, task);
+      const progress = delegatedTaskProgress(childControls);
+      const followupRuns =
+        childRun?.delegatedTaskId === task.id
+          ? delegatedTaskRuns(childControls, task.id)
+          : undefined;
+      const taskResultRun =
+        followupRuns === undefined ? progress.resultRun : delegatedTaskResultRun(followupRuns);
+      const taskWorkState: "working" | "waiting_for_children" | "result_available" =
+        followupRuns === undefined
+          ? progress.state
+          : !isTerminalTaskStatus(taskStatusForRun(taskResultRun))
+            ? "working"
+            : delegatedTaskAwaitsWork(followupRuns, childControls)
+              ? "waiting_for_children"
+              : "result_available";
+      return { childControls, childRun, taskResultRun, taskWorkState };
+    });
+
+    let snapshot = yield* readChildSnapshot();
+    let heldForRestart = false;
+    if (task.result === null && snapshot.taskWorkState === "result_available") {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const pending = yield* threadManagement
+          .delegatedTaskResultPending(task.childThreadId, snapshot.childRun?.delegatedTaskId)
+          .pipe(Effect.mapError(threadManagementFailure));
+        if (pending) {
+          heldForRestart = true;
+          break;
+        }
+        // Re-check runs after delegatedTaskResultPending returns false so an Attempt 2 that
+        // committed and completed during the check does not leave stale Attempt 1 results.
+        const latestRuns = yield* threadManagement
+          .getThreadRecords(task.childThreadId, ["runs"])
+          .pipe(Effect.mapError(threadManagementFailure));
+        const previousRun = snapshot.taskResultRun;
+        const currentRun =
+          previousRun === undefined
+            ? undefined
+            : latestRuns.runs.find((candidate) => candidate.id === previousRun.id);
+        const unchanged =
+          latestRuns.runs.length === snapshot.childControls.runs.length &&
+          (previousRun === undefined ||
+            (currentRun !== undefined &&
+              currentRun.status === previousRun.status &&
+              currentRun.activeAttemptId === previousRun.activeAttemptId));
+        if (unchanged) {
+          heldForRestart = false;
+          break;
+        }
+        snapshot = yield* readChildSnapshot();
+        if (snapshot.taskWorkState !== "result_available") {
+          heldForRestart = false;
+          break;
+        }
+        if (attempt === 2) {
+          heldForRestart = true;
+        }
+      }
+    }
+    const { childControls, childRun, taskResultRun, taskWorkState } = snapshot;
     const terminalRun = latestTerminalResultRun(
       childControls,
       childRun,
@@ -2982,6 +3024,7 @@ const make = Effect.gen(function* () {
           ),
           ...(input.title === undefined ? {} : { title: input.title }),
           modelSelection: target.modelSelection,
+          ...(explicitProviderInstanceId ? { antigravityFailoverPinned: true } : {}),
           runtimeMode,
           interactionMode,
           ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
@@ -3356,6 +3399,7 @@ const make = Effect.gen(function* () {
                   projectId: parent.thread.projectId,
                   title,
                   modelSelection: target.modelSelection,
+                  ...(explicitProviderInstanceId ? { antigravityFailoverPinned: true } : {}),
                   runtimeMode,
                   interactionMode,
                   branch: parent.thread.branch,
@@ -3402,6 +3446,7 @@ const make = Effect.gen(function* () {
                     }),
                     threadId,
                     modelSelection: resolvedModelSelection,
+                    ...(explicitProviderInstanceId ? { antigravityFailoverPinned: true } : {}),
                     dispatchMode: { type: "start_immediately" },
                   })
                   .pipe(

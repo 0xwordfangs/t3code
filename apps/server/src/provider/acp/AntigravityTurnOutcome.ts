@@ -18,6 +18,7 @@ import {
   extractAntigravityVerificationFromText,
   extractAntigravityVerificationRequired,
   hasConflictingNon403ApiError,
+  hasOuterAntigravityVerificationFraming,
   type AntigravityVerificationRequired,
 } from "../antigravityVerification.ts";
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
@@ -34,7 +35,7 @@ const MAX_SERIALIZE_DEPTH = 16;
 const API_ERROR = /Error (\d{3}), Message: (.{1,4096}?), Status: ([A-Z_]+)/s;
 const QUOTA_EXHAUSTED = /\breason:QUOTA_EXHAUSTED\b/;
 const RESOURCE_EXHAUSTED = /\bRESOURCE_EXHAUSTED\b/;
-const HTTP_429 = /\bHTTP\s*429\b|\bstatus(?:\s*code)?\s*[:=]?\s*429\b/i;
+const HTTP_429 = /\bHTTP\s*429\b|\bstatus(?:\s*code)?(?:\s*[:=]\s*|\s+)429\b/i;
 const QUOTA_MESSAGE =
   /\b(?:individual quota reached|quota exhausted|usage limit reached|quota limit reached)\b/i;
 // Permanent account/auth/policy blocks must never be classified as quota limits.
@@ -324,15 +325,21 @@ function extractVerificationFromAcpError(
   if (cause.code === -32602 || hasConflictingNon403ApiError(boundedErrorMessage)) {
     return undefined;
   }
+  const fromMessage = extractAntigravityVerificationFromText(boundedErrorMessage, {
+    skipConflictCheck: true,
+  });
+  const canInspectData =
+    fromMessage !== undefined ||
+    boundedErrorMessage.trim().length === 0 ||
+    hasOuterAntigravityVerificationFraming(boundedErrorMessage);
+  if (!canInspectData) {
+    return fromMessage;
+  }
+
   const fromData = extractAntigravityVerificationRequired(cause.data);
   if (fromData?.verificationUrl !== undefined) return fromData;
-  let fallback = fromData;
-
-  const fromMessage = extractAntigravityVerificationFromText(boundedErrorMessage);
-  if (fromMessage !== undefined) {
-    if (fromMessage.verificationUrl !== undefined) return fromMessage;
-    fallback ??= fromMessage;
-  }
+  if (fromMessage?.verificationUrl !== undefined) return fromMessage;
+  let fallback = fromData ?? fromMessage;
 
   if (typeof cause.data === "string") {
     const parsed = extractAntigravityVerificationFromText(boundScanText(cause.data));

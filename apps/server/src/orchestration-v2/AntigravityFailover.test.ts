@@ -792,38 +792,50 @@ function makeFakeAntigravityAdapter(input: {
                 return;
               }
               if (outcome.behavior === "usage_limit") {
-                yield* Queue.offer(events, {
-                  type: "provider_turn.updated",
-                  driver: ANTIGRAVITY_DRIVER,
-                  providerTurn: {
-                    id: turnId,
+                const emitUsageLimit = Effect.gen(function* () {
+                  yield* Queue.offer(events, {
+                    type: "provider_turn.updated",
+                    driver: ANTIGRAVITY_DRIVER,
+                    providerTurn: {
+                      id: turnId,
+                      providerThreadId: turn.providerThread.id,
+                      nodeId: turn.rootNodeId,
+                      runAttemptId: turn.attemptId,
+                      nativeTurnRef: null,
+                      ordinal: turn.providerTurnOrdinal,
+                      status: "failed",
+                      startedAt: now,
+                      completedAt: now,
+                    },
+                  });
+                  yield* Queue.offer(events, {
+                    type: "turn.terminal",
+                    driver: ANTIGRAVITY_DRIVER,
                     providerThreadId: turn.providerThread.id,
-                    nodeId: turn.rootNodeId,
-                    runAttemptId: turn.attemptId,
-                    nativeTurnRef: null,
-                    ordinal: turn.providerTurnOrdinal,
+                    providerTurnId: turnId,
+                    runOrdinal: turn.runOrdinal,
                     status: "failed",
-                    startedAt: now,
-                    completedAt: now,
-                  },
+                    threadDisposition: "reusable",
+                    failureItemOrdinal: turn.runOrdinal * 100 + 5,
+                    failure: makeProviderFailure({
+                      class: "usage_limit",
+                      message: "Individual quota reached",
+                      code: "QUOTA_EXHAUSTED",
+                      retryable: true,
+                      resetAt: FUTURE_RESET,
+                    }),
+                  });
                 });
-                yield* Queue.offer(events, {
-                  type: "turn.terminal",
-                  driver: ANTIGRAVITY_DRIVER,
-                  providerThreadId: turn.providerThread.id,
-                  providerTurnId: turnId,
-                  runOrdinal: turn.runOrdinal,
-                  status: "failed",
-                  threadDisposition: "reusable",
-                  failureItemOrdinal: turn.runOrdinal * 100 + 5,
-                  failure: makeProviderFailure({
-                    class: "usage_limit",
-                    message: "Individual quota reached",
-                    code: "QUOTA_EXHAUSTED",
-                    retryable: true,
-                    resetAt: FUTURE_RESET,
-                  }),
-                });
+                if (outcome.pause !== undefined) {
+                  const { onStarted, release } = outcome.pause;
+                  yield* Deferred.succeed(onStarted, undefined);
+                  yield* Deferred.await(release).pipe(
+                    Effect.andThen(emitUsageLimit),
+                    Effect.forkIn(sessionScope),
+                  );
+                } else {
+                  yield* emitUsageLimit;
+                }
                 return;
               }
               yield* Queue.offer(events, {
@@ -898,6 +910,7 @@ function makeIntegrationLayer(input: {
   readonly wrapProjectionStore?: (
     store: ProjectionStore.ProjectionStoreV2Shape,
   ) => ProjectionStore.ProjectionStoreV2Shape;
+  readonly runContinuationWorker?: boolean;
   readonly sweeps?: Map<string, Effect.Effect<void>>;
 }) {
   const providersRef =
@@ -950,6 +963,9 @@ function makeIntegrationLayer(input: {
     layerAdapters,
     {
       runEffectWorker: true,
+      ...(input.runContinuationWorker === undefined
+        ? {}
+        : { runContinuationWorker: input.runContinuationWorker }),
       ...(input.databaseLayer === undefined ? {} : { databaseLayer: input.databaseLayer }),
       ...(input.wrapProjectionStore === undefined
         ? {}
@@ -2596,6 +2612,1427 @@ describe("Antigravity auto-failover integration", () => {
           assert.equal(subagent?.completionDelivery?.state, "disposed");
         }).pipe(
           Effect.ensuring(Deferred.succeed(releaseGate, undefined).pipe(Effect.ignore)),
+          Effect.provide(layer),
+        );
+      }),
+  );
+
+  it.effect(
+    "R2-CF-06: suppresses reactive usage_limit failover for pinned delegate_task (async and wait) while unpinned control still fails over",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-r2-cf06-delegate");
+        const recordedTurns: Array<{
+          readonly instanceId: ProviderInstanceId;
+          readonly threadId: ThreadId;
+          readonly text: string;
+          readonly model: string;
+        }> = [];
+        const providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([{ id: "3p-5h", usedPercent: 100 }]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "3p-5h", usedPercent: 15 }]),
+          }),
+        ];
+        const parentThreadId = ThreadId.make("thread:parent-r2-cf06-delegate");
+        const releaseParent = yield* Deferred.make<void>();
+        const parentStarted = yield* Deferred.make<void>();
+        const layer = makeIntegrationLayer({
+          name: "antigravity-r2-cf06-delegate",
+          cwd,
+          providers,
+          recordedTurns,
+          outcomeFor: (instanceId, turn) => {
+            if (turn.threadId === parentThreadId) {
+              return {
+                behavior: "succeed",
+                assistantText: "Parent done.",
+                pause: { onStarted: parentStarted, release: releaseParent },
+              };
+            }
+            return instanceId === ProviderInstanceId.make("antigravity")
+              ? { behavior: "usage_limit" }
+              : { behavior: "succeed", assistantText: "BACKUP_AGY2_RESULT" };
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-parent-r2-cf06-delegate"),
+            threadId: parentThreadId,
+            projectId: PROJECT_ID,
+            title: "Parent R2-CF-06 delegate",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-parent-r2-cf06-delegate"),
+            threadId: parentThreadId,
+            messageId: MessageId.make("message:parent-r2-cf06-delegate"),
+            text: "Keep parent active.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(parentStarted);
+
+          const scope: McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:r2-cf06-delegate"),
+            requestNamespace: "provider-session:r2-cf06-delegate",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "provider-session:r2-cf06-delegate",
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+
+          // 1A: Pinned async delegate_task stays on antigravity and fails cleanly on usage_limit.
+          const waitAsyncFailed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "subagent.updated" &&
+                event.threadId === parentThreadId &&
+                (event.payload.status === "failed" || event.payload.status === "completed"),
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          const asyncPinned = yield* mcp.delegateTask(scope, {
+            target: {
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+            task: "PINNED_ASYNC_TASK",
+            mode: "async",
+            clientRequestId: "r2-cf06-async",
+          });
+          assert.equal(asyncPinned.providerInstanceId, ProviderInstanceId.make("antigravity"));
+          yield* Fiber.join(waitAsyncFailed);
+          yield* worker.drain();
+
+          const asyncChild = yield* orchestrator.getThreadProjection(asyncPinned.childThreadId!);
+          assert.isTrue(asyncChild.thread.antigravityFailoverPinned);
+          assert.isTrue(asyncChild.runs[0]?.antigravityFailoverPinned);
+          assert.equal(
+            asyncChild.thread.providerInstanceId,
+            ProviderInstanceId.make("antigravity"),
+          );
+          assert.equal(asyncChild.runs[0]?.status, "failed");
+          assert.equal(asyncChild.attempts.length, 1);
+          assert.deepEqual(
+            recordedTurns
+              .filter((turn) => turn.threadId === asyncPinned.childThreadId)
+              .map((turn) => turn.instanceId),
+            [ProviderInstanceId.make("antigravity")],
+          );
+
+          // 1B: Pinned wait delegate_task also stays on antigravity and returns failure without failover.
+          const waitPinned = yield* mcp.delegateTask(scope, {
+            target: {
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+            task: "PINNED_WAIT_TASK",
+            mode: "wait",
+            timeoutMs: 10_000,
+            clientRequestId: "r2-cf06-wait",
+          });
+          assert.equal(waitPinned.status, "failed");
+          assert.equal(waitPinned.providerInstanceId, ProviderInstanceId.make("antigravity"));
+          assert.deepEqual(
+            recordedTurns
+              .filter((turn) => turn.threadId === waitPinned.childThreadId)
+              .map((turn) => turn.instanceId),
+            [ProviderInstanceId.make("antigravity")],
+          );
+
+          // Unpinned control (omits providerInstanceId): still fails over to antigravity_2.
+          const unpinnedControl = yield* mcp.delegateTask(scope, {
+            target: { model: "claude-opus-5-5" },
+            task: "UNPINNED_CONTROL_TASK",
+            mode: "wait",
+            timeoutMs: 10_000,
+            clientRequestId: "r2-cf06-unpinned-control",
+          });
+          assert.equal(unpinnedControl.status, "completed");
+          assert.equal(
+            unpinnedControl.providerInstanceId,
+            ProviderInstanceId.make("antigravity_2"),
+          );
+          assert.include(unpinnedControl.summary ?? "", "BACKUP_AGY2_RESULT");
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(releaseParent, undefined).pipe(Effect.ignore)),
+          Effect.provide(layer),
+        );
+      }),
+  );
+
+  it.effect(
+    "R2-CF-06: preserves pinning across idle create_threads, t3_thread_launch, post-configure send, queued follow-up promotion, and clears pin on unpinned switch",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-r2-cf06-followups");
+        const recordedTurns: Array<{
+          readonly instanceId: ProviderInstanceId;
+          readonly threadId: ThreadId;
+          readonly text: string;
+          readonly model: string;
+        }> = [];
+        const providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([{ id: "3p-5h", usedPercent: 100 }]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([{ id: "3p-5h", usedPercent: 15 }]),
+          }),
+        ];
+        const parentThreadId = ThreadId.make("thread:parent-r2-cf06-followups");
+        const parentStarted = yield* Deferred.make<void>();
+        const releaseParent = yield* Deferred.make<void>();
+        const queuedRun1Started = yield* Deferred.make<void>();
+        const releaseQueuedRun1 = yield* Deferred.make<void>();
+        const layer = makeIntegrationLayer({
+          name: "antigravity-r2-cf06-followups",
+          cwd,
+          providers,
+          recordedTurns,
+          outcomeFor: (instanceId, turn) => {
+            if (turn.threadId === parentThreadId) {
+              return {
+                behavior: "succeed",
+                assistantText: "Parent running.",
+                pause: { onStarted: parentStarted, release: releaseParent },
+              };
+            }
+            if (turn.message.text === "QUEUED_RUN1_CONTEXT") {
+              return {
+                behavior: "succeed",
+                assistantText: "Run 1 context stayed on AGY-1.",
+                pause: { onStarted: queuedRun1Started, release: releaseQueuedRun1 },
+              };
+            }
+            return instanceId === ProviderInstanceId.make("antigravity")
+              ? { behavior: "usage_limit" }
+              : { behavior: "succeed", assistantText: "Executed on AGY-2." };
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-parent-r2-cf06-followups"),
+            threadId: parentThreadId,
+            projectId: PROJECT_ID,
+            title: "Parent R2-CF-06 followups",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-parent-r2-cf06-followups"),
+            threadId: parentThreadId,
+            messageId: MessageId.make("message:parent-r2-cf06-followups"),
+            text: "Keep parent active.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(parentStarted);
+
+          const scope: McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:r2-cf06-followups"),
+            requestNamespace: "provider-session:r2-cf06-followups",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "provider-session:r2-cf06-followups",
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+
+          // 1. Idle pinned create_threads + t3_thread_send stays on antigravity.
+          const idleCreated = yield* mcp.createThreads(scope, {
+            threads: [
+              {
+                title: "Idle Pinned",
+                target: {
+                  providerInstanceId: ProviderInstanceId.make("antigravity"),
+                  model: "claude-opus-5-5",
+                },
+              },
+            ],
+            clientRequestId: "r2-cf06-idle-create",
+          });
+          const idleThreadId = idleCreated.threads[0]!.threadId;
+          const waitIdleFailed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === idleThreadId &&
+                event.payload.status === "failed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* mcp.sendToThread(scope, {
+            threadId: idleThreadId,
+            message: "IDLE_PINNED_SEND",
+            clientRequestId: "r2-cf06-idle-send",
+          });
+          yield* Fiber.join(waitIdleFailed);
+          yield* worker.drain();
+          assert.deepEqual(
+            recordedTurns
+              .filter((turn) => turn.threadId === idleThreadId)
+              .map((turn) => turn.instanceId),
+            [ProviderInstanceId.make("antigravity")],
+          );
+
+          // 2. Idle thread created with antigravityFailoverPinned (matching t3_thread_launch) + sendToThread.
+          const launchedThreadId = ThreadId.make("thread:r2-cf06-launched");
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-r2-cf06-launched"),
+            threadId: launchedThreadId,
+            projectId: PROJECT_ID,
+            title: "Launched Pinned",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+            antigravityFailoverPinned: true,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "agent",
+            creationSource: "mcp",
+          });
+          const waitLaunchedFailed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === launchedThreadId &&
+                event.payload.status === "failed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* mcp.sendToThread(scope, {
+            threadId: launchedThreadId,
+            message: "LAUNCHED_PINNED_SEND",
+            clientRequestId: "r2-cf06-launched-send",
+          });
+          yield* Fiber.join(waitLaunchedFailed);
+          yield* worker.drain();
+          assert.deepEqual(
+            recordedTurns
+              .filter((turn) => turn.threadId === launchedThreadId)
+              .map((turn) => turn.instanceId),
+            [ProviderInstanceId.make("antigravity")],
+          );
+
+          // 3. Re-pin via provider.switch (matching t3_thread_configure), verify pinned send,
+          //    then unpin via thread.model-selection.set without antigravityFailoverPinned and verify failover resumes.
+          yield* orchestrator.dispatch({
+            type: "provider.switch",
+            commandId: CommandId.make("configure-pin-r2-cf06"),
+            threadId: idleThreadId,
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+            antigravityFailoverPinned: true,
+          });
+          const waitPostConfigureFailed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === idleThreadId &&
+                event.payload.ordinal === 2 &&
+                event.payload.status === "failed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* mcp.sendToThread(scope, {
+            threadId: idleThreadId,
+            message: "POST_CONFIGURE_PINNED_SEND",
+            clientRequestId: "r2-cf06-post-configure-send",
+          });
+          yield* Fiber.join(waitPostConfigureFailed);
+          yield* worker.drain();
+          assert.deepEqual(
+            recordedTurns
+              .filter((turn) => turn.threadId === idleThreadId)
+              .map((turn) => turn.instanceId),
+            [ProviderInstanceId.make("antigravity"), ProviderInstanceId.make("antigravity")],
+          );
+
+          // Unpin cleanly via thread.model-selection.set without antigravityFailoverPinned.
+          yield* orchestrator.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("unpin-r2-cf06"),
+            threadId: idleThreadId,
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+          });
+          const afterUnpin = yield* orchestrator.getThreadProjection(idleThreadId);
+          assert.notEqual(afterUnpin.thread.antigravityFailoverPinned, true);
+          const waitUnpinnedCompleted = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === idleThreadId &&
+                event.payload.ordinal === 3 &&
+                event.payload.status === "completed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* mcp.sendToThread(scope, {
+            threadId: idleThreadId,
+            message: "POST_UNPIN_SEND",
+            clientRequestId: "r2-cf06-post-unpin-send",
+          });
+          yield* Fiber.join(waitUnpinnedCompleted);
+          const afterUnpinnedSend = yield* orchestrator.getThreadProjection(idleThreadId);
+          assert.equal(
+            afterUnpinnedSend.runs[2]?.providerInstanceId,
+            ProviderInstanceId.make("antigravity_2"),
+          );
+
+          // 4. Queued follow-up promotion on a pinned thread stays on antigravity with no ContextHandoff to AGY-2.
+          const queuedCreated = yield* mcp.createThreads(scope, {
+            threads: [
+              {
+                title: "Queued Pinned",
+                prompt: "QUEUED_RUN1_CONTEXT",
+                target: {
+                  providerInstanceId: ProviderInstanceId.make("antigravity"),
+                  model: "claude-opus-5-5",
+                },
+              },
+            ],
+            clientRequestId: "r2-cf06-queued-create",
+          });
+          const queuedThreadId = queuedCreated.threads[0]!.threadId;
+          yield* Deferred.await(queuedRun1Started);
+          yield* mcp.sendToThread(scope, {
+            threadId: queuedThreadId,
+            message: "QUEUED_FOLLOWUP_RUN2",
+            mode: "queue",
+            clientRequestId: "r2-cf06-queued-run2",
+          });
+          const waitQueuedRun2Failed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === queuedThreadId &&
+                event.payload.ordinal === 2 &&
+                event.payload.status === "failed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* Deferred.succeed(releaseQueuedRun1, undefined);
+          yield* Fiber.join(waitQueuedRun2Failed);
+          yield* worker.drain();
+
+          const queuedProjection = yield* orchestrator.getThreadProjection(queuedThreadId);
+          assert.equal(
+            queuedProjection.thread.providerInstanceId,
+            ProviderInstanceId.make("antigravity"),
+          );
+          assert.equal(
+            queuedProjection.runs[1]?.providerInstanceId,
+            ProviderInstanceId.make("antigravity"),
+          );
+          assert.equal(queuedProjection.contextHandoffs.length, 0);
+          assert.deepEqual(
+            recordedTurns
+              .filter((turn) => turn.threadId === queuedThreadId)
+              .map((turn) => turn.instanceId),
+            [ProviderInstanceId.make("antigravity"), ProviderInstanceId.make("antigravity")],
+          );
+        }).pipe(
+          Effect.ensuring(
+            Effect.all([
+              Deferred.succeed(releaseParent, undefined).pipe(Effect.ignore),
+              Deferred.succeed(releaseQueuedRun1, undefined).pipe(Effect.ignore),
+            ]),
+          ),
+          Effect.provide(layer),
+        );
+      }),
+  );
+
+  it.effect(
+    "R2-CF-07: preserves Attempt 2 authoritative result and parent wake across TOCTOU races in recoverDelegatedTask, taskStatus, and delegateTask(mode=wait)",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-r2-cf07-toctou");
+        const isInspectFailoverRead = (fields: ReadonlyArray<string>) =>
+          fields.length === 6 &&
+          fields.includes("runs") &&
+          fields.includes("attempts") &&
+          fields.includes("providerSessions") &&
+          fields.includes("providerThreads") &&
+          fields.includes("runtimeRequests") &&
+          fields.includes("turnItems");
+
+        const runToctouScenario = <E, R>(
+          name: string,
+          scenario: (ctx: {
+            readonly orchestrator: Orchestrator.OrchestratorV2["Service"];
+            readonly mcp: OrchestratorMcpService.OrchestratorMcpService["Service"];
+            readonly worker: EffectWorker.OrchestrationEffectWorkerV2["Service"];
+            readonly parentThreadId: ThreadId;
+            readonly scope: McpInvocationScope;
+            readonly releaseParent: Deferred.Deferred<void>;
+            readonly failoverEntered: Deferred.Deferred<void>;
+            readonly releaseFailover: Deferred.Deferred<void>;
+            readonly attempt2Started: Deferred.Deferred<void>;
+            readonly releaseAttempt2: Deferred.Deferred<void>;
+            readonly arm: (childThreadId: ThreadId | "*") => void;
+            readonly wasTriggered: () => boolean;
+          }) => Effect.Effect<void, E, R>,
+        ) =>
+          Effect.gen(function* () {
+            const providers = [
+              makeAntigravityProvider("antigravity", {
+                displayName: "AGY-1",
+                usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 10 }]),
+              }),
+              makeAntigravityProvider("antigravity_2", {
+                displayName: "AGY-2",
+                usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 15 }]),
+              }),
+            ];
+            const parentThreadId = ThreadId.make(`thread:parent-${name}`);
+            const parentStarted = yield* Deferred.make<void>();
+            const releaseParent = yield* Deferred.make<void>();
+            const failoverEntered = yield* Deferred.make<void>();
+            const releaseFailover = yield* Deferred.make<void>();
+            const attempt2Started = yield* Deferred.make<void>();
+            const releaseAttempt2 = yield* Deferred.make<void>();
+            let armedChildThreadId: ThreadId | "*" | null = null;
+            let triggered = false;
+            let failoverGated = false;
+
+            const layer = makeIntegrationLayer({
+              name,
+              cwd,
+              providers,
+              recordedTurns: [],
+              runContinuationWorker: true,
+              outcomeFor: (instanceId, turn) => {
+                if (turn.threadId === parentThreadId) {
+                  if (turn.runOrdinal === 1) {
+                    return {
+                      behavior: "succeed",
+                      assistantText: "Parent turn 1 done.",
+                      pause: { onStarted: parentStarted, release: releaseParent },
+                    };
+                  }
+                  return { behavior: "succeed", assistantText: "Parent woke on Attempt 2." };
+                }
+                if (instanceId === ProviderInstanceId.make("antigravity")) {
+                  return { behavior: "usage_limit" };
+                }
+                return {
+                  behavior: "succeed",
+                  assistantText: "AUTHORITATIVE_RESULT_FROM_AGY2",
+                  pause: { onStarted: attempt2Started, release: releaseAttempt2 },
+                };
+              },
+              wrapFailover: (inner) => ({
+                ...inner,
+                recordQuotaExhausted: (input) =>
+                  Effect.gen(function* () {
+                    if (
+                      !failoverGated &&
+                      input.instanceId === ProviderInstanceId.make("antigravity")
+                    ) {
+                      failoverGated = true;
+                      yield* Deferred.succeed(failoverEntered, undefined);
+                      yield* Deferred.await(releaseFailover);
+                    }
+                    yield* inner.recordQuotaExhausted(input);
+                  }),
+              }),
+              wrapProjectionStore: (store) => ({
+                ...store,
+                getThreadRecords: ((
+                  threadId: ThreadId,
+                  fields: ReadonlyArray<string>,
+                  filter?: unknown,
+                ) =>
+                  Effect.gen(function* () {
+                    const matchesTarget =
+                      armedChildThreadId === "*"
+                        ? threadId !== parentThreadId
+                        : armedChildThreadId !== null && threadId === armedChildThreadId;
+                    if (matchesTarget && !triggered && isInspectFailoverRead(fields)) {
+                      triggered = true;
+                      yield* Deferred.await(failoverEntered);
+                      yield* Deferred.succeed(releaseFailover, undefined);
+                      yield* Deferred.await(attempt2Started);
+                    }
+                    return yield* store.getThreadRecords(
+                      threadId,
+                      fields as never,
+                      filter as never,
+                    );
+                  })) as typeof store.getThreadRecords,
+              }),
+            });
+
+            yield* Effect.gen(function* () {
+              const orchestrator = yield* Orchestrator.OrchestratorV2;
+              const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+              const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+
+              yield* orchestrator.dispatch({
+                type: "thread.create",
+                commandId: CommandId.make(`create-${name}`),
+                threadId: parentThreadId,
+                projectId: PROJECT_ID,
+                title: name,
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("antigravity"),
+                  model: "gemini-4-neon",
+                },
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: null,
+                worktreePath: cwd,
+                createdBy: "user",
+                creationSource: "web",
+              });
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(`start-${name}`),
+                threadId: parentThreadId,
+                messageId: MessageId.make(`message:${name}`),
+                text: "Run TOCTOU check.",
+                attachments: [],
+                dispatchMode: { type: "start_immediately" },
+                createdBy: "user",
+                creationSource: "web",
+              });
+              yield* Deferred.await(parentStarted);
+
+              const scope: McpInvocationScope = {
+                environmentId: EnvironmentId.make(`environment:${name}`),
+                requestNamespace: `provider-session:${name}`,
+                thread: {
+                  threadId: parentThreadId,
+                  providerSessionId: `provider-session:${name}`,
+                  providerInstanceId: ProviderInstanceId.make("antigravity"),
+                },
+                client: undefined,
+                capabilities: new Set(["orchestration"]),
+                issuedAt: 1,
+              };
+
+              yield* scenario({
+                orchestrator,
+                mcp,
+                worker,
+                parentThreadId,
+                scope,
+                releaseParent,
+                failoverEntered,
+                releaseFailover,
+                attempt2Started,
+                releaseAttempt2,
+                arm: (childThreadId) => {
+                  armedChildThreadId = childThreadId;
+                },
+                wasTriggered: () => triggered,
+              });
+            }).pipe(
+              Effect.ensuring(
+                Effect.all([
+                  Deferred.succeed(releaseParent, undefined).pipe(Effect.ignore),
+                  Deferred.succeed(releaseFailover, undefined).pipe(Effect.ignore),
+                  Deferred.succeed(releaseAttempt2, undefined).pipe(Effect.ignore),
+                ]),
+              ),
+              Effect.provide(layer),
+            );
+          });
+
+        // Path 1A: recoverDelegatedTask -> finalizeAppOwnedSubagent racing Attempt 2 commit.
+        yield* runToctouScenario("r2-cf07-1a", (ctx) =>
+          Effect.gen(function* () {
+            const task1A = yield* ctx.mcp.delegateTask(ctx.scope, {
+              task: "Check 1A recoverDelegatedTask TOCTOU.",
+              mode: "async",
+              clientRequestId: "r2-cf07-1a",
+            });
+            yield* Deferred.await(ctx.failoverEntered);
+            ctx.arm(task1A.childThreadId!);
+            yield* ctx.orchestrator.recoverDelegatedTask(task1A.childThreadId!);
+            assert.isTrue(ctx.wasTriggered());
+
+            const parentMid1A = yield* ctx.orchestrator.getThreadProjection(ctx.parentThreadId);
+            const subagentMid1A = parentMid1A.subagents.find((task) => task.id === task1A.taskId);
+            assert.equal(subagentMid1A?.status, "running");
+            assert.isNull(subagentMid1A?.result ?? null);
+
+            const wait1ADone = yield* ctx.orchestrator.streamDomainEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.type === "subagent.updated" &&
+                  event.threadId === ctx.parentThreadId &&
+                  event.payload.id === task1A.taskId &&
+                  (event.payload.status === "completed" || event.payload.status === "failed"),
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped({ startImmediately: true }),
+            );
+            yield* Effect.yieldNow;
+            yield* Deferred.succeed(ctx.releaseAttempt2, undefined);
+            yield* Fiber.join(wait1ADone);
+            yield* ctx.orchestrator.recoverDelegatedTask(task1A.childThreadId!);
+
+            const parentFinal1A = yield* ctx.orchestrator.getThreadProjection(ctx.parentThreadId);
+            const subagentFinal1A = parentFinal1A.subagents.find(
+              (task) => task.id === task1A.taskId,
+            );
+            assert.equal(subagentFinal1A?.status, "completed");
+            assert.include(subagentFinal1A?.result ?? "", "AUTHORITATIVE_RESULT_FROM_AGY2");
+          }),
+        );
+
+        // Path 1B: mcp.taskStatus + defense-in-depth acknowledge guard racing Attempt 2 commit,
+        // then verify parent wakes when Attempt 2 completes.
+        yield* runToctouScenario("r2-cf07-1b", (ctx) =>
+          Effect.gen(function* () {
+            const task1B = yield* ctx.mcp.delegateTask(ctx.scope, {
+              task: "Check 1B taskStatus TOCTOU and parent wake.",
+              mode: "async",
+              clientRequestId: "r2-cf07-1b",
+            });
+            yield* Deferred.await(ctx.failoverEntered);
+            ctx.arm(task1B.childThreadId!);
+            const statusDuringRace = yield* ctx.mcp.taskStatus(ctx.scope, task1B.taskId);
+            assert.isTrue(ctx.wasTriggered());
+            assert.notEqual(statusDuringRace.status, "failed");
+            assert.equal(statusDuringRace.workState, "working");
+
+            // Defense-in-depth: even a direct acknowledge command while Attempt 2 runs must not write acknowledged.
+            const parentRun1 = (yield* ctx.orchestrator.getThreadProjection(ctx.parentThreadId))
+              .runs[0]!;
+            yield* ctx.orchestrator.dispatch({
+              type: "delegated_task.completion-delivery.acknowledge",
+              commandId: CommandId.make("ack-r2-cf07-1b-premature"),
+              parentThreadId: ctx.parentThreadId,
+              taskId: task1B.taskId,
+              observedByRunId: parentRun1.id,
+            });
+            const parentMid1B = yield* ctx.orchestrator.getThreadProjection(ctx.parentThreadId);
+            const subagentMid1B = parentMid1B.subagents.find((task) => task.id === task1B.taskId);
+            assert.notEqual(subagentMid1B?.completionDelivery?.state, "acknowledged");
+
+            const waitParentRun1Done = yield* ctx.orchestrator.streamDomainEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.type === "run.updated" &&
+                  event.threadId === ctx.parentThreadId &&
+                  event.payload.id === parentRun1.id &&
+                  event.payload.status === "completed",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped({ startImmediately: true }),
+            );
+            yield* Effect.yieldNow;
+            yield* Deferred.succeed(ctx.releaseParent, undefined);
+            yield* Fiber.join(waitParentRun1Done);
+
+            const waitParentWake = yield* ctx.orchestrator.streamDomainEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.type === "run.updated" &&
+                  event.threadId === ctx.parentThreadId &&
+                  event.payload.ordinal === 2 &&
+                  event.payload.status === "completed",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped({ startImmediately: true }),
+            );
+            yield* Effect.yieldNow;
+            yield* Deferred.succeed(ctx.releaseAttempt2, undefined);
+            yield* Fiber.join(waitParentWake);
+            yield* ctx.worker.drain();
+
+            const parentAfterWake = yield* ctx.orchestrator.getThreadProjection(ctx.parentThreadId);
+            assert.isAtLeast(parentAfterWake.runs.length, 2);
+            const final1B = parentAfterWake.subagents.find((task) => task.id === task1B.taskId);
+            assert.equal(final1B?.status, "completed");
+            assert.include(final1B?.result ?? "", "AUTHORITATIVE_RESULT_FROM_AGY2");
+          }),
+        );
+
+        // Path 1C: delegateTask(mode="wait") racing Attempt 2 commit on waitForTask's automatic readTask.
+        yield* runToctouScenario("r2-cf07-1c", (ctx) =>
+          Effect.gen(function* () {
+            ctx.arm("*");
+            const waitTaskFiber = yield* ctx.mcp
+              .delegateTask(ctx.scope, {
+                task: "Check 1C delegate_task(mode=wait) TOCTOU.",
+                mode: "wait",
+                timeoutMs: 10_000,
+                clientRequestId: "r2-cf07-1c",
+              })
+              .pipe(Effect.forkChild({ startImmediately: true }));
+            yield* Deferred.await(ctx.attempt2Started);
+            yield* Effect.yieldNow;
+            assert.isTrue(ctx.wasTriggered());
+            assert.isUndefined(waitTaskFiber.pollUnsafe());
+            yield* Deferred.succeed(ctx.releaseAttempt2, undefined);
+            const result1C = yield* Fiber.join(waitTaskFiber);
+            assert.equal(result1C.status, "completed");
+            assert.equal(result1C.providerInstanceId, ProviderInstanceId.make("antigravity_2"));
+            assert.include(result1C.summary ?? "", "AUTHORITATIVE_RESULT_FROM_AGY2");
+          }),
+        );
+      }),
+  );
+
+  it.effect(
+    "R2-CF-08: waitForThread started during a running turn wakes promptly on mid-wait declined failover (backup exhaustion, >10s failover, and mid-failover thread.stop)",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-r2-cf08-midwait");
+        const runMidWaitScenario = <E, R>(
+          name: string,
+          decline: (ctx: {
+            readonly orchestrator: Orchestrator.OrchestratorV2["Service"];
+            readonly providersRef: Ref.Ref<ReadonlyArray<ServerProvider>>;
+            readonly threadId: ThreadId;
+            readonly waitFiber: Fiber.Fiber<
+              ThreadManagementService.ThreadManagementWaitResult,
+              ThreadManagementService.ThreadManagementError
+            >;
+            readonly releaseFailover: Deferred.Deferred<void>;
+          }) => Effect.Effect<void, E, R>,
+        ) =>
+          Effect.gen(function* () {
+            const initialProviders = [
+              makeAntigravityProvider("antigravity", {
+                displayName: "AGY-1",
+                usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 10 }]),
+              }),
+              makeAntigravityProvider("antigravity_2", {
+                displayName: "AGY-2",
+                usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 10 }]),
+              }),
+            ];
+            const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(initialProviders);
+            const threadId = ThreadId.make(`thread:${name}`);
+            const runStarted = yield* Deferred.make<void>();
+            const releaseRun = yield* Deferred.make<void>();
+            const failoverEntered = yield* Deferred.make<void>();
+            const releaseFailover = yield* Deferred.make<void>();
+            let gated = false;
+
+            const layer = makeIntegrationLayer({
+              name,
+              cwd,
+              providers: initialProviders,
+              providersRef,
+              recordedTurns: [],
+              outcomeFor: () => ({
+                behavior: "usage_limit",
+                pause: { onStarted: runStarted, release: releaseRun },
+              }),
+              wrapFailover: (inner) => ({
+                ...inner,
+                recordQuotaExhausted: (input) =>
+                  Effect.gen(function* () {
+                    if (!gated) {
+                      gated = true;
+                      yield* Deferred.succeed(failoverEntered, undefined);
+                      yield* Deferred.await(releaseFailover);
+                    }
+                    yield* inner.recordQuotaExhausted(input);
+                  }),
+              }),
+            });
+
+            yield* Effect.gen(function* () {
+              const orchestrator = yield* Orchestrator.OrchestratorV2;
+              const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+
+              yield* orchestrator.dispatch({
+                type: "thread.create",
+                commandId: CommandId.make(`${name}-create`),
+                threadId,
+                projectId: PROJECT_ID,
+                title: name,
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("antigravity"),
+                  model: "gemini-4-neon",
+                },
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: null,
+                worktreePath: cwd,
+                createdBy: "user",
+                creationSource: "web",
+              });
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(`${name}-msg`),
+                threadId,
+                messageId: MessageId.make(`message:${name}`),
+                text: "Start running then fail with usage_limit.",
+                attachments: [],
+                dispatchMode: { type: "start_immediately" },
+                createdBy: "user",
+                creationSource: "web",
+              });
+              yield* Deferred.await(runStarted);
+              const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+
+              // Start waitForThread while the run is actively running (initial.pending === false).
+              const waitFiber = yield* threadManagement
+                .waitForThread({
+                  projectId: PROJECT_ID,
+                  threadId,
+                  runId: run.id,
+                  timeoutMs: 24 * 60 * 60 * 1_000,
+                })
+                .pipe(Effect.forkChild({ startImmediately: true }));
+              yield* Effect.yieldNow;
+              yield* Deferred.succeed(releaseRun, undefined);
+              yield* Deferred.await(failoverEntered);
+              // Give waitForThread a turn to observe run.updated(failed) and register on awaitRestartContinuation.
+              yield* Effect.yieldNow;
+              yield* Effect.yieldNow;
+
+              yield* decline({
+                orchestrator,
+                providersRef,
+                threadId,
+                waitFiber,
+                releaseFailover,
+              });
+
+              const result = yield* Fiber.join(waitFiber);
+              assert.isFalse(result.timedOut);
+              assert.equal(result.run?.id, run.id);
+              assert.equal(result.run?.status, "failed");
+            }).pipe(
+              Effect.ensuring(
+                Effect.all([
+                  Deferred.succeed(releaseRun, undefined).pipe(Effect.ignore),
+                  Deferred.succeed(releaseFailover, undefined).pipe(Effect.ignore),
+                ]),
+              ),
+              Effect.provide(layer),
+            );
+          });
+
+        // Scenario 1: Mid-wait backup exhaustion declines failover without run.updated.
+        yield* runMidWaitScenario("r2-cf08-exhaust", (ctx) =>
+          Effect.gen(function* () {
+            yield* Ref.set(ctx.providersRef, [
+              makeAntigravityProvider("antigravity", {
+                displayName: "AGY-1",
+                usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+              }),
+              makeAntigravityProvider("antigravity_2", {
+                displayName: "AGY-2",
+                usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+              }),
+            ]);
+            yield* Deferred.succeed(ctx.releaseFailover, undefined);
+          }),
+        );
+
+        // Scenario 2: Mid-wait failover takes >10s (past awaitRestartContinuation's 10s cap) before declining.
+        yield* runMidWaitScenario("r2-cf08-slow", (ctx) =>
+          Effect.gen(function* () {
+            yield* TestClock.adjust("15 seconds");
+            yield* Effect.yieldNow;
+            assert.isUndefined(ctx.waitFiber.pollUnsafe());
+            yield* Ref.set(ctx.providersRef, [
+              makeAntigravityProvider("antigravity", {
+                displayName: "AGY-1",
+                usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+              }),
+              makeAntigravityProvider("antigravity_2", {
+                displayName: "AGY-2",
+                usageLimits: makeLimits([{ id: "gemini-5h", usedPercent: 100 }]),
+              }),
+            ]);
+            yield* Deferred.succeed(ctx.releaseFailover, undefined);
+          }),
+        );
+
+        // Scenario 3: Mid-failover thread.stop aborts failover without run.updated.
+        yield* runMidWaitScenario("r2-cf08-stop", (ctx) =>
+          Effect.gen(function* () {
+            const stopFiber = yield* ctx.orchestrator
+              .dispatch({
+                type: "thread.stop",
+                commandId: CommandId.make("r2-cf08-stop-cmd"),
+                threadId: ctx.threadId,
+                reason: "User stopped during failover",
+              })
+              .pipe(Effect.forkChild({ startImmediately: true }));
+            yield* Effect.yieldNow;
+            yield* Deferred.succeed(ctx.releaseFailover, undefined);
+            yield* Fiber.join(stopFiber);
+          }),
+        );
+      }),
+  );
+
+  it.effect(
+    "R2-CF-06 review regressions: thread shell pin visibility, unpinned delegate_task from pinned parent, steering pin sync, and queued pin handoff",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const cwd = yield* checkpointWorkspace("antigravity-r2-cf06-review");
+        const recordedTurns: Array<{
+          readonly instanceId: ProviderInstanceId;
+          readonly threadId: ThreadId;
+          readonly text: string;
+          readonly model: string;
+        }> = [];
+        const providers = [
+          makeAntigravityProvider("antigravity", {
+            displayName: "AGY-1",
+            usageLimits: makeLimits([
+              { id: "gemini-5h", usedPercent: 90 },
+              { id: "3p-5h", usedPercent: 90 },
+            ]),
+          }),
+          makeAntigravityProvider("antigravity_2", {
+            displayName: "AGY-2",
+            usageLimits: makeLimits([
+              { id: "gemini-5h", usedPercent: 10 },
+              { id: "3p-5h", usedPercent: 10 },
+            ]),
+          }),
+        ];
+        const parentThreadId = ThreadId.make("thread:r2-cf06-review-parent");
+        const steerThreadId = ThreadId.make("thread:r2-cf06-review-steer");
+        const queueSwitchThreadId = ThreadId.make("thread:r2-cf06-review-queue");
+        const parentStarted = yield* Deferred.make<void>();
+        const releaseParent = yield* Deferred.make<void>();
+        const steerRun1Started = yield* Deferred.make<void>();
+        const releaseSteerRun1 = yield* Deferred.make<void>();
+        const steerPinnedStarted = yield* Deferred.make<void>();
+        const releaseSteerPinned = yield* Deferred.make<void>();
+        const queueRun1Started = yield* Deferred.make<void>();
+        const releaseQueueRun1 = yield* Deferred.make<void>();
+
+        const layer = makeIntegrationLayer({
+          name: "antigravity-r2-cf06-review",
+          cwd,
+          providers,
+          recordedTurns,
+          runContinuationWorker: true,
+          outcomeFor: (instanceId, turn) => {
+            if (turn.threadId === parentThreadId) {
+              return {
+                behavior: "succeed",
+                assistantText: "Pinned parent active.",
+                pause: { onStarted: parentStarted, release: releaseParent },
+              };
+            }
+            if (turn.message.text === "STEER_INITIAL_UNPINNED") {
+              return {
+                behavior: "succeed",
+                assistantText: "Steer initial running.",
+                pause: { onStarted: steerRun1Started, release: releaseSteerRun1 },
+              };
+            }
+            if (turn.message.text === "STEER_PINNED_ACTIVE") {
+              return {
+                behavior: "succeed",
+                assistantText: "Steer pinned active.",
+                pause: { onStarted: steerPinnedStarted, release: releaseSteerPinned },
+              };
+            }
+            if (turn.message.text === "QUEUE_RUN1_PINNED") {
+              return {
+                behavior: "succeed",
+                assistantText: "Queue run 1 pinned.",
+                pause: { onStarted: queueRun1Started, release: releaseQueueRun1 },
+              };
+            }
+            return instanceId === ProviderInstanceId.make("antigravity")
+              ? { behavior: "usage_limit" }
+              : { behavior: "succeed", assistantText: "SUCCEEDED_ON_AGY2" };
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+
+          // 1. Pinned parent exposes antigravityFailoverPinned in getThreadShell, while an
+          //    unpinned delegate_task from it does NOT inherit the pin and fails over to AGY-2.
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-r2-cf06-review-parent"),
+            threadId: parentThreadId,
+            projectId: PROJECT_ID,
+            title: "Pinned Parent",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+            antigravityFailoverPinned: true,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const parentShell = yield* orchestrator.getThreadShell(parentThreadId);
+          assert.equal(parentShell?.antigravityFailoverPinned, true);
+
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-r2-cf06-review-parent"),
+            threadId: parentThreadId,
+            messageId: MessageId.make("message:r2-cf06-review-parent"),
+            text: "Keep pinned parent active.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(parentStarted);
+
+          const scope: McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:r2-cf06-review"),
+            requestNamespace: "provider-session:r2-cf06-review",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "provider-session:r2-cf06-review",
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+
+          const unpinnedChild = yield* mcp.delegateTask(scope, {
+            task: "Unpinned child from pinned parent.",
+            mode: "wait",
+            timeoutMs: 10_000,
+            clientRequestId: "r2-cf06-review-unpinned-child",
+          });
+          assert.equal(unpinnedChild.status, "completed");
+          assert.equal(unpinnedChild.providerInstanceId, ProviderInstanceId.make("antigravity_2"));
+          assert.include(unpinnedChild.summary ?? "", "SUCCEEDED_ON_AGY2");
+          const childProjection = yield* orchestrator.getThreadProjection(
+            unpinnedChild.childThreadId!,
+          );
+          assert.notEqual(childProjection.thread.antigravityFailoverPinned, true);
+          assert.notEqual(childProjection.runs[0]?.antigravityFailoverPinned, true);
+
+          // 2. Steering/restarting an active unpinned run on AGY-2 with an explicit pinned
+          //    selection sets antigravityFailoverPinned on both thread and restartedRun, keeping
+          //    it on AGY-1 without failover.
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-r2-cf06-review-steer"),
+            threadId: steerThreadId,
+            projectId: PROJECT_ID,
+            title: "Steer Pin Thread",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity_2"),
+              model: "claude-opus-5-5",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const waitSteerRun1Running = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "provider-turn.updated" &&
+                event.threadId === steerThreadId &&
+                event.payload.status === "running",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-r2-cf06-review-steer-1"),
+            threadId: steerThreadId,
+            messageId: MessageId.make("message:r2-cf06-review-steer-1"),
+            text: "STEER_INITIAL_UNPINNED",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(steerRun1Started);
+          yield* Fiber.join(waitSteerRun1Running);
+
+          const steerTargetRun1Id = (yield* orchestrator.getThreadProjection(steerThreadId))
+            .runs[0]!.id;
+          const waitSteerFailed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === steerThreadId &&
+                event.payload.id === steerTargetRun1Id &&
+                event.payload.status === "failed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("pin-steer-r2-cf06-review-steer"),
+            threadId: steerThreadId,
+            messageId: MessageId.make("message:r2-cf06-review-steer-pin"),
+            text: "STEER_WITH_EXPLICIT_PIN",
+            attachments: [],
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+            antigravityFailoverPinned: true,
+            dispatchMode: { type: "restart_active", targetRunId: steerTargetRun1Id },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.succeed(releaseSteerRun1, undefined);
+          yield* Fiber.join(waitSteerFailed);
+          yield* worker.drain();
+          const afterPinnedSteer = yield* orchestrator.getThreadProjection(steerThreadId);
+          assert.equal(afterPinnedSteer.thread.antigravityFailoverPinned, true);
+          assert.equal(afterPinnedSteer.runs[0]?.antigravityFailoverPinned, true);
+          assert.equal(
+            afterPinnedSteer.runs[0]?.providerInstanceId,
+            ProviderInstanceId.make("antigravity"),
+          );
+
+          // Steering a pinned active run without modelSelection preserves the pin, while steering
+          // with a new unpinned modelSelection clears the pin on both thread and restartedRun.
+          const waitSteerPinnedRunning = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "provider-turn.updated" &&
+                event.threadId === steerThreadId &&
+                event.payload.status === "running",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-r2-cf06-review-steer-pinned"),
+            threadId: steerThreadId,
+            messageId: MessageId.make("message:r2-cf06-review-steer-pinned"),
+            text: "STEER_PINNED_ACTIVE",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(steerPinnedStarted);
+          yield* Fiber.join(waitSteerPinnedRunning);
+          const pinnedSteerTargetRunId = (yield* orchestrator.getThreadProjection(steerThreadId))
+            .runs[1]!.id;
+          const waitUnpinnedSteerCompleted = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === steerThreadId &&
+                event.payload.id === pinnedSteerTargetRunId &&
+                event.payload.status === "completed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("unpin-steer-r2-cf06-review"),
+            threadId: steerThreadId,
+            messageId: MessageId.make("message:r2-cf06-review-unpin-steer"),
+            text: "STEER_UNPIN_SWITCH",
+            attachments: [],
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            dispatchMode: { type: "restart_active", targetRunId: pinnedSteerTargetRunId },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.succeed(releaseSteerPinned, undefined);
+          yield* Fiber.join(waitUnpinnedSteerCompleted);
+          const afterUnpinnedSteer = yield* orchestrator.getThreadProjection(steerThreadId);
+          assert.notEqual(afterUnpinnedSteer.thread.antigravityFailoverPinned, true);
+          assert.notEqual(afterUnpinnedSteer.runs[1]?.antigravityFailoverPinned, true);
+          assert.equal(
+            afterUnpinnedSteer.runs[1]?.providerInstanceId,
+            ProviderInstanceId.make("antigravity_2"),
+          );
+
+          // 3. Queuing an unpinned switch behind a pinned active run clears the thread pin when
+          //    the queued run starts so preflight/reactive failover applies cleanly to Run 2.
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-r2-cf06-review-queue"),
+            threadId: queueSwitchThreadId,
+            projectId: PROJECT_ID,
+            title: "Queue Unpin Switch",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "claude-opus-5-5",
+            },
+            antigravityFailoverPinned: true,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("start-r2-cf06-review-queue-1"),
+            threadId: queueSwitchThreadId,
+            messageId: MessageId.make("message:r2-cf06-review-queue-1"),
+            text: "QUEUE_RUN1_PINNED",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(queueRun1Started);
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("queue-r2-cf06-review-unpin-2"),
+            threadId: queueSwitchThreadId,
+            messageId: MessageId.make("message:r2-cf06-review-queue-2"),
+            text: "QUEUE_RUN2_UNPINNED",
+            attachments: [],
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("antigravity"),
+              model: "gemini-4-neon",
+            },
+            antigravityFailoverPinned: false,
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const waitQueuedRun2Completed = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.threadId === queueSwitchThreadId &&
+                event.payload.ordinal === 2 &&
+                event.payload.status === "completed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          yield* Deferred.succeed(releaseQueueRun1, undefined);
+          yield* Fiber.join(waitQueuedRun2Completed);
+          const afterQueueSwitch = yield* orchestrator.getThreadProjection(queueSwitchThreadId);
+          assert.notEqual(afterQueueSwitch.thread.antigravityFailoverPinned, true);
+          assert.notEqual(afterQueueSwitch.runs[1]?.antigravityFailoverPinned, true);
+          assert.equal(
+            afterQueueSwitch.runs[1]?.providerInstanceId,
+            ProviderInstanceId.make("antigravity_2"),
+          );
+          const queueShell = yield* orchestrator.getThreadShell(queueSwitchThreadId);
+          assert.notEqual(queueShell?.antigravityFailoverPinned, true);
+        }).pipe(
+          Effect.ensuring(
+            Effect.all([
+              Deferred.succeed(releaseParent, undefined).pipe(Effect.ignore),
+              Deferred.succeed(releaseSteerRun1, undefined).pipe(Effect.ignore),
+              Deferred.succeed(releaseSteerPinned, undefined).pipe(Effect.ignore),
+              Deferred.succeed(releaseQueueRun1, undefined).pipe(Effect.ignore),
+            ]),
+          ),
           Effect.provide(layer),
         );
       }),

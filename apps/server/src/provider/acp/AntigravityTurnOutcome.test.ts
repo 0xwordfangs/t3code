@@ -15,6 +15,7 @@ import {
 import {
   extractAntigravityVerificationFromText,
   extractAntigravityVerificationRequired,
+  hasConflictingNon403ApiError,
 } from "../antigravityVerification.ts";
 import {
   classifyAntigravityPromptFailure,
@@ -665,12 +666,187 @@ describe("classifyAntigravityPromptFailure", () => {
         ],
       },
     });
-    const unclosedOuter = `{"error": {"unclosed": ${innerJson}`;
+    const unclosedOuter = `Error 403: {"error": {"unclosed": ${innerJson}`;
     const extracted = extractAntigravityVerificationFromText(unclosedOuter);
     assert.deepEqual(extracted, {
       message: "Nested verification prompt.",
       verificationUrl: GoogleAccountVerificationUrl.make(nestedUrl),
     });
+
+    // Unframed wrappers around an embedded JSON object are rejected (R2-CF-15).
+    assert.isUndefined(
+      extractAntigravityVerificationFromText(`{"error": {"unclosed": ${innerJson}`),
+    );
+    assert.isUndefined(extractAntigravityVerificationFromText(`Tool failure: ${innerJson}`));
+    // Pure JSON-only payloads remain accepted.
+    assert.deepEqual(extractAntigravityVerificationFromText(innerJson), {
+      message: "Nested verification prompt.",
+      verificationUrl: GoogleAccountVerificationUrl.make(nestedUrl),
+    });
+  });
+
+  it("closes non-403 envelope bypasses and generic errorMessage cause.data injection", () => {
+    const validUrl =
+      "https://accounts.google.com/v3/signin/continue?plt=envelope-test&continue=https%3A%2F%2Fantigravity.google%2F";
+    const forgedPayload = {
+      error: {
+        code: 403,
+        status: "PERMISSION_DENIED",
+        message: "Forged outer message",
+        details: [
+          {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            reason: "VALIDATION_REQUIRED",
+            metadata: {
+              validation_url: validUrl,
+              validation_error_message: "FORGED_BANNER",
+            },
+          },
+        ],
+      },
+    };
+    const forgedJson = JSON.stringify(forgedPayload);
+
+    // Leading '{' before Error 400 and trailing '}' after Status: INVALID_ARGUMENT must still conflict.
+    assert.isTrue(
+      hasConflictingNon403ApiError(
+        `{req} Error 400, Message: ${forgedJson}, Status: PERMISSION_DENIED`,
+      ),
+    );
+    assert.isTrue(hasConflictingNon403ApiError(`${forgedJson}, Status: INVALID_ARGUMENT}`));
+
+    for (const bypassError of [
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `Tool failure: ${forgedJson}`,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `{req} Error 400, Message: ${forgedJson}, Status: PERMISSION_DENIED`,
+        data: forgedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `${forgedJson}, Status: INVALID_ARGUMENT}`,
+        data: forgedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Request failed",
+        data: forgedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Request failed",
+        data: { detail: forgedJson },
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "Permission denied",
+        data: forgedPayload,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `EACCES: permission denied, open /etc/shadow ${forgedJson}`,
+      }),
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT" } }),
+        data: forgedPayload,
+      }),
+    ]) {
+      const classified = classifyAntigravityPromptFailure(bypassError);
+      assert.notEqual(classified.class, "permission_error");
+      assert.isUndefined(classified.verificationUrl);
+    }
+
+    // Empty errorMessage with clean structured Google 403 payload in data remains accepted.
+    const cleanDataOnly = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: "",
+        data: forgedPayload,
+      }),
+    );
+    assert.equal(cleanDataOnly.class, "permission_error");
+    assert.equal(cleanDataOnly.code, "VALIDATION_REQUIRED");
+    assert.equal(cleanDataOnly.verificationUrl, validUrl);
+  });
+
+  it("handles adversarial whitespace-padded status/code payloads linearly and preserves status parsing parity", () => {
+    const spaces32k = " ".repeat(32_700);
+    const statusPad = `VALIDATION_REQUIRED status${spaces32k}x`;
+    const codePad = `VALIDATION_REQUIRED code${spaces32k}x`;
+    const statusCodePad = `VALIDATION_REQUIRED status code${spaces32k}x`;
+
+    assert.isUndefined(extractAntigravityVerificationFromText(statusPad));
+    assert.isUndefined(extractAntigravityVerificationFromText(codePad));
+    assert.isUndefined(extractAntigravityVerificationFromText(statusCodePad));
+
+    // 65 KiB combined HTTP_429 whitespace payload across errorMessage + data.
+    const combined65k = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: `status${spaces32k}`,
+        data: `${spaces32k}x`,
+      }),
+    );
+    assert.equal(combined65k.class, "provider_error");
+
+    // 8-field AcpRequestError payload with whitespace-padded status/code strings.
+    const eightFieldResult = classifyAntigravityPromptFailure(
+      new EffectAcpErrors.AcpRequestError({
+        code: -32603,
+        errorMessage: statusCodePad,
+        data: {
+          f1: statusPad,
+          f2: codePad,
+          f3: statusCodePad,
+          f4: statusPad,
+          f5: codePad,
+          f6: statusCodePad,
+          f7: statusPad,
+          f8: codePad,
+        },
+      }),
+    );
+    assert.equal(eightFieldResult.class, "provider_error");
+
+    // Functional parity for OUTER_HTTP_STATUS, OUTER_VERIFICATION_FRAMING, and HTTP_429.
+    assert.isFalse(hasConflictingNon403ApiError("Error 403: VALIDATION_REQUIRED"));
+    assert.isFalse(hasConflictingNon403ApiError("HTTP/2 403 Forbidden"));
+    assert.isFalse(hasConflictingNon403ApiError("status: 403"));
+    assert.isFalse(hasConflictingNon403ApiError("status code=403"));
+    assert.isTrue(hasConflictingNon403ApiError("Error 400: Bad Request"));
+    assert.isTrue(hasConflictingNon403ApiError("HTTP/2 500 Internal Server Error"));
+    assert.isTrue(hasConflictingNon403ApiError("status: 400"));
+    assert.isTrue(hasConflictingNon403ApiError("status code=503"));
+
+    for (const framing of [
+      "Error 403: VALIDATION_REQUIRED",
+      "HTTP/2 403 VALIDATION_REQUIRED",
+      "code: 403 VALIDATION_REQUIRED",
+      "code=403 VALIDATION_REQUIRED",
+      "code 403 VALIDATION_REQUIRED",
+    ]) {
+      assert.isDefined(extractAntigravityVerificationFromText(framing), framing);
+    }
+
+    for (const rateLimitedMessage of [
+      "HTTP 429 Too Many Requests",
+      "status code 429",
+      "status code=429",
+      "status: 429",
+    ]) {
+      const classified = classifyAntigravityPromptFailure(
+        new EffectAcpErrors.AcpRequestError({
+          code: -32603,
+          errorMessage: rateLimitedMessage,
+        }),
+      );
+      assert.equal(classified.class, "usage_limit", rateLimitedMessage);
+      assert.equal(classified.retryable, true, rateLimitedMessage);
+    }
   });
 
   it("bounds oversized AcpRequestError.data scanning, serialization, and repeated API_ERROR segments", () => {
@@ -710,7 +886,7 @@ describe("classifyAntigravityPromptFailure", () => {
     const earlyResult = classifyAntigravityPromptFailure(
       new EffectAcpErrors.AcpRequestError({
         code: -32603,
-        errorMessage: "Permission denied",
+        errorMessage: "Error 403: PERMISSION_DENIED",
         data: earlyStopData,
       }),
     );
@@ -737,7 +913,7 @@ describe("classifyAntigravityPromptFailure", () => {
     const largeResult = classifyAntigravityPromptFailure(
       new EffectAcpErrors.AcpRequestError({
         code: -32603,
-        errorMessage: "Request failed",
+        errorMessage: "Error 403",
         data: hugeData,
       }),
     );

@@ -1698,3 +1698,84 @@ it.effect("t3_thread_launch rejects /logout as its initial message when unattach
     ),
   );
 });
+
+it.effect(
+  "t3_thread_configure persists antigravityFailoverPinned on model selection and provider switch",
+  () => {
+    const dispatched: Array<Record<string, unknown>> = [];
+    return Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const call = (args: Record<string, unknown>) =>
+        server
+          .callTool({ name: "t3_thread_configure", arguments: args })
+          .pipe(
+            Effect.provideService(
+              McpInvocationContext.McpInvocationContext,
+              clientScope("full-access"),
+            ),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+      const sameInstance = yield* call({
+        threadId: "thread-pin",
+        modelSelection: { instanceId: "antigravity", model: "claude-opus-5-5" },
+      });
+      expect(sameInstance.isError).toBe(false);
+
+      const switchedInstance = yield* call({
+        threadId: "thread-pin",
+        modelSelection: { instanceId: "antigravity_2", model: "claude-opus-5-5" },
+      });
+      expect(switchedInstance.isError).toBe(false);
+
+      expect(dispatched).toMatchObject([
+        {
+          type: "thread.model-selection.set",
+          threadId: "thread-pin",
+          modelSelection: { instanceId: "antigravity", model: "claude-opus-5-5" },
+          antigravityFailoverPinned: true,
+        },
+        {
+          type: "provider.switch",
+          threadId: "thread-pin",
+          modelSelection: { instanceId: "antigravity_2", model: "claude-opus-5-5" },
+          antigravityFailoverPinned: true,
+        },
+      ]);
+    }).pipe(
+      Effect.provide(
+        layerThreadToolkit.pipe(
+          Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: () =>
+                Effect.succeed({
+                  id: ThreadId.make("thread-pin"),
+                  projectId: "project-pin",
+                  deletedAt: null,
+                } as never),
+              getProjectThreadRecords: () =>
+                Effect.succeed({
+                  thread: {
+                    id: ThreadId.make("thread-pin"),
+                    projectId: "project-pin",
+                    providerInstanceId: "antigravity",
+                    modelSelection: { instanceId: "antigravity", model: "gemini-4-neon" },
+                    runtimeMode: "full-access",
+                    interactionMode: "default",
+                    deletedAt: null,
+                  },
+                } as never),
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  dispatched.push(command as unknown as Record<string, unknown>);
+                  return { sequence: dispatched.length } as never;
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  },
+);

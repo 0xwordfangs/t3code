@@ -36,6 +36,7 @@ import * as ProviderContinuationRequests from "@t3tools/provider-core/server/Pro
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
+import { acpToolCallDiffPatch } from "@t3tools/provider-acp/server/adapter";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
@@ -144,6 +145,69 @@ describe("AntigravityAdapterV2 flavor", () => {
   it("disables in-session runtime mode switching so mode changes detach the session", () => {
     assert.isFalse(flavor.capabilities.sessions.supportsRuntimeModeSwitchInSession);
   });
+
+  it.effect(
+    "confines pending pre-edit diff previews to context.cwd and fails closed outside workspace",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const tempRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-adapter-edit-" });
+        const workspace = pathService.join(tempRoot, "workspace");
+        const outside = pathService.join(tempRoot, "outside");
+        yield* fs.makeDirectory(workspace, { recursive: true });
+        yield* fs.makeDirectory(outside, { recursive: true });
+        const insideFile = pathService.join(workspace, "app.ts");
+        const outsideFile = pathService.join(outside, "secret.env");
+        const escapingLink = pathService.join(workspace, "escape.env");
+        yield* fs.writeFileString(insideFile, "line 1\nconst target = 10;\nline 3\n");
+        yield* fs.writeFileString(outsideFile, "HEADER=1\nSECRET=alpha\n");
+        yield* fs.symlink(outsideFile, escapingLink);
+
+        const pendingEdit = (targetPath: string, oldText: string, newText: string) => ({
+          toolCallId: `edit:${targetPath}`,
+          kind: "edit",
+          status: "pending" as const,
+          data: {
+            content: [{ type: "diff", path: targetPath, oldText, newText }],
+            rawInput: {
+              TargetContent: oldText,
+              ReplacementContent: newText,
+              TargetFile: targetPath,
+            },
+          },
+        });
+
+        const inWorkspace = flavor.normalizeToolCall?.(
+          pendingEdit(insideFile, "const target = 10;", "const target = 20;"),
+          { cwd: workspace },
+        );
+        assert.equal(
+          acpToolCallDiffPatch(inWorkspace?.data.content),
+          `--- ${insideFile}\n+++ ${insideFile}\n@@ -2,1 +2,1 @@\n-const target = 10;\n+const target = 20;\n`,
+        );
+
+        for (const [label, targetPath, ctx] of [
+          ["outside workspace", outsideFile, { cwd: workspace }],
+          ["escaping symlink", escapingLink, { cwd: workspace }],
+          ["null cwd", insideFile, { cwd: null }],
+          ["omitted context", insideFile, undefined],
+        ] as const) {
+          const normalized = flavor.normalizeToolCall?.(
+            pendingEdit(
+              targetPath,
+              targetPath === insideFile ? "const target = 10;" : "SECRET=alpha",
+              "REPLACED",
+            ),
+            ctx,
+          );
+          assert.isUndefined(
+            acpToolCallDiffPatch(normalized?.data.content),
+            `${label} must not place a diff hunk from disk`,
+          );
+        }
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });
 
 const layerSession = Layer.mergeAll(

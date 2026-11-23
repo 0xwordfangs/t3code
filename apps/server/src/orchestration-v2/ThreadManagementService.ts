@@ -615,6 +615,7 @@ const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
   const worktreeRestore = yield* ThreadWorktreeRestore;
+  const activeSettleAfterRunKeys = new Set<string>();
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -1020,48 +1021,123 @@ const make = Effect.gen(function* () {
     // so a cut run is not the answer while its continuation is pending.
     // Runs per matching event and is already covered by the waitForThread span.
     const outcome = Effect.fnUntraced(function* (runs: ReadonlyArray<OrchestrationV2Run>) {
-      const current = runs.find((candidate) => candidate.id === selectedRun.id);
-      if (current === undefined) {
+      let currentRuns = runs;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const current = currentRuns.find((candidate) => candidate.id === selectedRun.id);
+        if (current === undefined) {
+          return yield* new ThreadManagementRunNotFoundError({
+            threadId: input.threadId,
+            runId: selectedRun.id,
+          });
+        }
+        const run = latestRestartContinuation(currentRuns, current);
+        if (!isTerminalRunStatus(run.status)) {
+          return { run, pending: false, settled: false };
+        }
+        const pending = yield* orchestrator.restartContinuationPending(run);
+        if (pending) {
+          return { run, pending: true, settled: false };
+        }
+        // Re-check runs after restartContinuationPending returns false so an Attempt 2 or
+        // continuation that committed and completed mid-check never returns stale Attempt 1 state.
+        const refreshed = yield* getProjectThreadRecords(input, ["runs"]);
+        const refreshedCurrent = refreshed.runs.find(
+          (candidate) => candidate.id === selectedRun.id,
+        );
+        if (refreshedCurrent === undefined) {
+          return yield* new ThreadManagementRunNotFoundError({
+            threadId: input.threadId,
+            runId: selectedRun.id,
+          });
+        }
+        const refreshedRun = latestRestartContinuation(refreshed.runs, refreshedCurrent);
+        if (
+          refreshedRun.id === run.id &&
+          refreshedRun.status === run.status &&
+          refreshedRun.activeAttemptId === run.activeAttemptId
+        ) {
+          return { run, pending: false, settled: true };
+        }
+        currentRuns = refreshed.runs;
+      }
+      const fallbackCurrent = currentRuns.find((candidate) => candidate.id === selectedRun.id);
+      if (fallbackCurrent === undefined) {
         return yield* new ThreadManagementRunNotFoundError({
           threadId: input.threadId,
           runId: selectedRun.id,
         });
       }
-      const run = latestRestartContinuation(runs, current);
-      const pending =
-        isTerminalRunStatus(run.status) && (yield* orchestrator.restartContinuationPending(run));
-      return { run, pending, settled: isTerminalRunStatus(run.status) && !pending };
+      return {
+        run: latestRestartContinuation(currentRuns, fallbackCurrent),
+        pending: true,
+        settled: false,
+      };
     });
     const untilDelegatedWorkSettled = input.untilDelegatedWorkSettled === true;
     const delegatedWorkResult = Effect.gen(function* () {
-      const records = yield* getProjectThreadRecords(
-        input,
-        ["runs", "messages", "subagents", "providerThreads"],
-        { messageRoles: ["user"], monitorNotificationsOnly: true },
-      );
-      const progress = delegatedTaskProgress(records);
-      // A thread rolled back past all its work, with nothing left running, has no answer to wait for.
-      if (
-        progress.resultRun === undefined &&
-        records.runs.every((run) => isTerminalRunStatus(run.status))
-      ) {
-        return latestRun(records);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const records = yield* getProjectThreadRecords(
+          input,
+          ["runs", "messages", "subagents", "providerThreads"],
+          { messageRoles: ["user"], monitorNotificationsOnly: true },
+        );
+        const progress = delegatedTaskProgress(records);
+        // A thread rolled back past all its work, with nothing left running, has no answer to wait for.
+        if (
+          progress.resultRun === undefined &&
+          records.runs.every((run) => isTerminalRunStatus(run.status))
+        ) {
+          return { resultRun: latestRun(records), pendingRun: undefined };
+        }
+        if (progress.state !== "result_available") {
+          return { resultRun: undefined, pendingRun: undefined };
+        }
+        const pending = yield* orchestrator
+          .delegatedTaskResultPending(input.threadId)
+          .pipe(Effect.mapError(loadError));
+        if (pending) {
+          return { resultRun: undefined, pendingRun: progress.resultRun };
+        }
+        if (progress.resultRun === undefined) {
+          return { resultRun: undefined, pendingRun: undefined };
+        }
+        const refreshed = yield* getProjectThreadRecords(input, ["runs"]);
+        const refreshedResultRun = refreshed.runs.find(
+          (candidate) => candidate.id === progress.resultRun?.id,
+        );
+        if (
+          refreshed.runs.length === records.runs.length &&
+          refreshedResultRun !== undefined &&
+          refreshedResultRun.status === progress.resultRun.status &&
+          refreshedResultRun.activeAttemptId === progress.resultRun.activeAttemptId
+        ) {
+          return { resultRun: progress.resultRun, pendingRun: undefined };
+        }
+        if (attempt === 2) {
+          return { resultRun: undefined, pendingRun: progress.resultRun };
+        }
       }
-      if (progress.state !== "result_available") return undefined;
-      const pending = yield* orchestrator
-        .delegatedTaskResultPending(input.threadId)
-        .pipe(Effect.mapError(loadError));
-      return pending ? undefined : progress.resultRun;
+      return { resultRun: undefined, pendingRun: undefined };
     });
     const evaluate = Effect.fn("orchestrationV2.threadManagement.evaluate")(function* (
       runs: ReadonlyArray<OrchestrationV2Run>,
     ) {
       const current = yield* outcome(runs);
       if (!current.settled || !untilDelegatedWorkSettled) {
-        return { ...current, resultRun: undefined };
+        return {
+          ...current,
+          pendingRun: current.pending ? current.run : undefined,
+          resultRun: undefined,
+        };
       }
-      const resultRun = yield* delegatedWorkResult;
-      return { ...current, settled: resultRun !== undefined, resultRun };
+      const delegated = yield* delegatedWorkResult;
+      return {
+        ...current,
+        pending: delegated.pendingRun !== undefined,
+        pendingRun: delegated.pendingRun,
+        settled: delegated.resultRun !== undefined,
+        resultRun: delegated.resultRun,
+      };
     });
     const settledResult = (current: Effect.Success<ReturnType<typeof evaluate>>) => ({
       threadId: input.threadId,
@@ -1072,46 +1148,74 @@ const make = Effect.gen(function* () {
     const initial = yield* evaluate(target.runs);
     if (initial.settled) return settledResult(initial);
 
-    // A declined continuation records no event, so its effect settling wakes
-    // the wait too.
-    const wait = Stream.merge(
-      Stream.mergeAll(
-        (
-          [
-            "run.updated",
-            "thread.deleted",
-            // What delegated work reads besides runs: tasks and their
-            // deliveries, and a provider thread's background tasks.
-            ...(untilDelegatedWorkSettled
-              ? (["subagent.updated", "provider-thread.updated"] as const)
-              : []),
-          ] as const
-        ).map((eventType) =>
-          orchestrator.streamStoredEventsFrom({
-            threadId: input.threadId,
-            afterSequence,
-            eventType,
-          }),
-        ),
-        { concurrency: "unbounded" },
-      ).pipe(
-        Stream.mapError(loadError),
-        Stream.filter(
-          (stored) =>
-            untilDelegatedWorkSettled ||
-            stored.event.type !== "run.updated" ||
-            stored.event.payload.id === selectedRun.id ||
-            stored.event.payload.restartContinuationOfRunId !== undefined,
-        ),
+    // A declined continuation or failover records no run.updated event, so await its
+    // settlement reactively both at entry and on any mid-wait transition to pending.
+    const events = Stream.mergeAll(
+      (
+        [
+          "run.updated",
+          "thread.deleted",
+          // What delegated work reads besides runs: tasks and their
+          // deliveries, and a provider thread's background tasks.
+          ...(untilDelegatedWorkSettled
+            ? (["subagent.updated", "provider-thread.updated"] as const)
+            : []),
+        ] as const
+      ).map((eventType) =>
+        orchestrator.streamStoredEventsFrom({
+          threadId: input.threadId,
+          afterSequence,
+          eventType,
+        }),
       ),
-      initial.pending
-        ? Stream.fromEffect(orchestrator.awaitRestartContinuation(initial.run))
-        : Stream.empty,
+      { concurrency: "unbounded" },
     ).pipe(
-      Stream.mapEffect(() =>
-        getProjectThreadRecords(input, ["runs"]).pipe(
-          Effect.flatMap((current) => evaluate(current.runs)),
-        ),
+      Stream.mapError(loadError),
+      Stream.filter(
+        (stored) =>
+          untilDelegatedWorkSettled ||
+          stored.event.type !== "run.updated" ||
+          stored.event.payload.id === selectedRun.id ||
+          stored.event.payload.restartContinuationOfRunId !== undefined,
+      ),
+    );
+    const readAndEvaluate = getProjectThreadRecords(input, ["runs"]).pipe(
+      Effect.flatMap((records) => evaluate(records.runs)),
+    );
+    const activePendingWaitKeys = new Set<string>();
+    const pendingWaitKey = (run: OrchestrationV2Run) => `${run.id}:${run.activeAttemptId ?? ""}`;
+    // Runs per matching pending transition and is already covered by the waitForThread span.
+    const awaitPendingLoop = Effect.fnUntraced(function* (
+      initialPending: Effect.Success<ReturnType<typeof evaluate>>,
+    ) {
+      let current = initialPending;
+      while (!current.settled && current.pending && current.pendingRun !== undefined) {
+        const waitKey = pendingWaitKey(current.pendingRun);
+        if (activePendingWaitKeys.has(waitKey)) {
+          return current;
+        }
+        activePendingWaitKeys.add(waitKey);
+        current = yield* orchestrator.awaitRestartContinuation(current.pendingRun).pipe(
+          Effect.andThen(Effect.yieldNow),
+          Effect.andThen(readAndEvaluate),
+          Effect.ensuring(
+            Effect.sync(() => {
+              activePendingWaitKeys.delete(waitKey);
+            }),
+          ),
+        );
+      }
+      return current;
+    });
+    const wait = Stream.merge(
+      events,
+      initial.pending ? Stream.succeed(undefined) : Stream.empty,
+    ).pipe(
+      Stream.flatMap(
+        () => Stream.fromEffect(readAndEvaluate.pipe(Effect.flatMap(awaitPendingLoop))),
+        {
+          concurrency: "unbounded",
+        },
       ),
       Stream.filter((current) => current.settled),
       Stream.runHead,
@@ -1233,11 +1337,23 @@ const make = Effect.gen(function* () {
   )(function* (input) {
     const shell = input.byOwnAgent ? yield* orchestrator.getThreadShell(input.threadId) : null;
     if (shell != null && shell.activeRunId !== null) {
-      yield* settleAfterRun({
-        projectId: shell.projectId,
-        threadId: shell.id,
-        runId: shell.activeRunId,
-      }).pipe(Effect.ignoreCause({ log: true }), Effect.forkIn(layerScope));
+      const dedupeKey = `${shell.id}:${shell.activeRunId}`;
+      if (!activeSettleAfterRunKeys.has(dedupeKey)) {
+        activeSettleAfterRunKeys.add(dedupeKey);
+        yield* settleAfterRun({
+          projectId: shell.projectId,
+          threadId: shell.id,
+          runId: shell.activeRunId,
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              activeSettleAfterRunKeys.delete(dedupeKey);
+            }),
+          ),
+          Effect.ignoreCause({ log: true }),
+          Effect.forkIn(layerScope),
+        );
+      }
       return { settlesWhenTurnEnds: true } as const;
     }
     const result = yield* dispatch({

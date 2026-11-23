@@ -1854,6 +1854,9 @@ export function threadShellFromProjection(
     title: projection.thread.title,
     providerInstanceId: projection.thread.providerInstanceId,
     modelSelection: projection.thread.modelSelection,
+    ...(projection.thread.antigravityFailoverPinned === undefined
+      ? {}
+      : { antigravityFailoverPinned: projection.thread.antigravityFailoverPinned }),
     runtimeMode: projection.thread.runtimeMode,
     interactionMode: projection.thread.interactionMode,
     branch: projection.thread.branch,
@@ -2168,6 +2171,9 @@ function shellFromState(input: {
     title: input.state.thread.title,
     providerInstanceId: input.state.thread.providerInstanceId,
     modelSelection: input.state.thread.modelSelection,
+    ...(input.state.thread.antigravityFailoverPinned === undefined
+      ? {}
+      : { antigravityFailoverPinned: input.state.thread.antigravityFailoverPinned }),
     runtimeMode: input.state.thread.runtimeMode,
     interactionMode: input.state.thread.interactionMode,
     branch: input.state.thread.branch,

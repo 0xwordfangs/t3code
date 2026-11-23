@@ -37,6 +37,7 @@ import {
   resolveAntigravityBackgroundTaskToolCallIds,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
+import { makeScopedAntigravityPreEditReader } from "../../provider/acp/AntigravityEditLocation.ts";
 import {
   classifyAntigravityPromptFailure,
   watchAntigravityPromptOutcome,
@@ -296,7 +297,13 @@ export function makeAntigravityAcpAdapterFlavor(
         respond: (answers) => makeAntigravityUserInputResponse(request, answers),
       };
     },
-    normalizeToolCall: normalizeAntigravityToolCall,
+    normalizeToolCall: (toolCall, context) =>
+      normalizeAntigravityToolCall(
+        toolCall,
+        toolCall.kind === "edit" && toolCall.status === "pending" && context?.cwd
+          ? makeScopedAntigravityPreEditReader([context.cwd])
+          : undefined,
+      ),
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
     isBackgroundCommandTool: isAntigravityBackgroundCommandTool,
     isPersistentBackgroundTool: isAntigravityPersistentBackgroundTool,
