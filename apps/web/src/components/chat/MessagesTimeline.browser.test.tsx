@@ -1321,7 +1321,7 @@ describe("MessagesTimeline verification action", () => {
       },
     };
     const continueVerificationUrl = GoogleAccountVerificationUrl.make(
-      "https://accounts.google.com/v3/signin/continue?plt=chat-secret&continue=https%3A%2F%2Fcodeassist.google.com%2Fauth%3Ftoken%3Dhidden",
+      "https://accounts.google.com/v3/signin/continue?plt=chat-secret&continue=https%3A%2F%2Fcodeassist.google.com%2Fauth%3Fstep%3Dhidden",
     );
     const entries = verificationFailureEntries(continueVerificationUrl);
 
@@ -1337,7 +1337,7 @@ describe("MessagesTimeline verification action", () => {
       expect(denied.text()).not.toContain("accounts.google.com");
       expect(denied.text()).not.toContain("codeassist.google.com");
       expect(denied.text()).not.toContain("plt=chat-secret");
-      expect(denied.text()).not.toContain("token=hidden");
+      expect(denied.text()).not.toContain("step=hidden");
     }
 
     sessionScopeState.grantedScopes = new Set([AuthProvidersManageScope]);
@@ -1350,7 +1350,7 @@ describe("MessagesTimeline verification action", () => {
       )
       .toBeVisible();
     expect(allowed.text()).not.toContain("plt=chat-secret");
-    expect(allowed.text()).not.toContain("token=hidden");
+    expect(allowed.text()).not.toContain("step=hidden");
     await expect
       .element(allowed.getByRole("link", { name: "Verify account" }))
       .toHaveAttribute("href", continueVerificationUrl);
