@@ -96,6 +96,7 @@ export interface AcpPatchedProtocolOptions {
     | AcpCompat.SessionNotification;
   readonly onNotification?: (
     notification: AcpIncomingNotification,
+    lineLength: number,
   ) => Effect.Effect<void, AcpError.AcpError, never>;
   readonly onExtRequest?: (
     method: string,
@@ -526,7 +527,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         // A failing or dying handler must not stop the reader, or every later
         // message on the connection goes unanswered.
         options.onNotification
-          ? isolateNotificationHandler(options.onNotification(notification))
+          ? isolateNotificationHandler(options.onNotification(notification, lineLength))
           : Effect.void,
       ),
       Effect.asVoid,

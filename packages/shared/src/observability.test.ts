@@ -10,6 +10,7 @@ import { cast } from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
+import * as Redactable from "effect/Redactable";
 import * as Ref from "effect/Ref";
 import * as References from "effect/References";
 import * as Schema from "effect/Schema";
@@ -94,12 +95,79 @@ describe("redactUrlCredentials", () => {
     );
   });
 
-  it("stays linear on long runs of backslashes without quadratic regex backtracking", () => {
-    const adversarial = `x=1 ${"\\".repeat(200_000)}x`;
-    assert.equal(redactUrlCredentials(adversarial), adversarial);
+  it("redacts percent-encoded keys, nested continue/redirect_uri params, and fully encoded URLs", () => {
+    const nestedContinue =
+      "https://accounts.google.com/v3/signin/continue?plt=DUMMY_PLT_OUTER_001&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Fplt%3DDUMMY_PLT_INNER_002%26code%3DDUMMY_CODE_003%26token%3DDUMMY_TOKEN_004%26access_token%3DDUMMY_AT_005";
+    const redactedNested = redactUrlCredentials(nestedContinue);
+    assert.equal(
+      redactedNested,
+      "https://accounts.google.com/v3/signin/continue?plt=<redacted>&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Fplt%3D<redacted>%26code%3D<redacted>%26token%3D<redacted>%26access_token%3D<redacted>",
+    );
+
+    const percentEncodedKeys =
+      "https://accounts.google.com/v3/signin/continue?%70lt=DUMMY_PCT_KEY_PLT_006&%77sTicket=DUMMY_WSTICKET_008&%64pop=DUMMY_DPOP_009";
+    const redactedKeys = redactUrlCredentials(percentEncodedKeys);
+    assert.equal(
+      redactedKeys,
+      "https://accounts.google.com/v3/signin/continue?%70lt=<redacted>&%77sTicket=<redacted>&%64pop=<redacted>",
+    );
+
+    const fullyEncoded =
+      "https%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3DDUMMY_FULL_ENC_PLT_007";
+    assert.equal(
+      redactUrlCredentials(fullyEncoded),
+      "https%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3D<redacted>",
+    );
+
+    const doubleEncoded =
+      "https://accounts.google.com/v3/signin/continue?continue=https%253A%252F%252Fantigravity.google%252Fauth%253Fplt%253DDUMMY_DOUBLE_PLT%2526code%253DDUMMY_DOUBLE_CODE";
+    const redactedDouble = redactUrlCredentials(doubleEncoded);
+    assert.notInclude(redactedDouble, "DUMMY_DOUBLE_PLT");
+    assert.notInclude(redactedDouble, "DUMMY_DOUBLE_CODE");
+    assert.include(redactedDouble, "%253Fplt%253D<redacted>%2526code%253D<redacted>");
+
+    const nestedRedirectUri =
+      "https://server.invalid/oauth/mcp/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb%3Fcode%3DDUMMY_HTTP_CODE_010%26token%3DDUMMY_HTTP_TOK_011";
+    const redactedRedirect = redactUrlCredentials(nestedRedirectUri);
+    assert.notInclude(redactedRedirect, "DUMMY_HTTP_CODE_010");
+    assert.notInclude(redactedRedirect, "DUMMY_HTTP_TOK_011");
+    assert.include(redactedRedirect, "%3Fcode%3D<redacted>%26token%3D<redacted>");
+
+    const jsonEscaped =
+      '{"url":"https://accounts.google.com/v3/signin/continue\\u003fplt\\u003dDUMMY_JSON_PLT\\u0026token\\u003dDUMMY_JSON_TOK"}';
+    const redactedJson = redactUrlCredentials(jsonEscaped);
+    assert.notInclude(redactedJson, "DUMMY_JSON_PLT");
+    assert.notInclude(redactedJson, "DUMMY_JSON_TOK");
+    assert.include(redactedJson, "\\u003fplt\\u003d<redacted>\\u0026token\\u003d<redacted>");
+
+    const doubleJsonEscaped =
+      '{"nested":"https://accounts.google.com/v3/signin/continue\\\\u003fplt\\\\u003dSECRET_DBL_JSON\\\\u0026code\\\\u003dSECRET_DBL_CODE"}';
+    const redactedDoubleJson = redactUrlCredentials(doubleJsonEscaped);
+    assert.notInclude(redactedDoubleJson, "SECRET_DBL_JSON");
+    assert.notInclude(redactedDoubleJson, "SECRET_DBL_CODE");
+    assert.include(
+      redactedDoubleJson,
+      "\\\\u003fplt\\\\u003d<redacted>\\\\u0026code\\\\u003d<redacted>",
+    );
+
+    const clean = "Command failed with exit code=1 (100% done) and status token=ok";
+    assert.strictEqual(redactUrlCredentials(clean), clean);
   });
 
-  it("redacts URL credentials inside Effect Causes while preserving non-secret causes", () => {
+  it("stays linear on long runs of backslashes and percent sequences without quadratic backtracking", () => {
+    const adversarialBackslashes = `x=1 ${"\\".repeat(200_000)}x`;
+    assert.strictEqual(redactUrlCredentials(adversarialBackslashes), adversarialBackslashes);
+
+    const adversarialPercent = `${"%25".repeat(50_000)}&${"a".repeat(50_000)}`;
+    assert.strictEqual(redactUrlCredentials(adversarialPercent), adversarialPercent);
+
+    const manyMatches = Array.from({ length: 10_000 }, (_, i) => `plt=secret${i}`).join("&");
+    const redactedMany = redactUrlCredentials(manyMatches);
+    assert.notInclude(redactedMany, "secret0");
+    assert.notInclude(redactedMany, "secret9999");
+  });
+
+  it("redacts URL credentials inside Effect Causes including Error subclass data and cause properties while preserving non-secret causes", () => {
     const secretCause = Cause.fail(
       new Error("Verify at https://accounts.google.com/v3/signin/continue?plt=SECRET_CAUSE_PLT"),
     );
@@ -110,6 +178,90 @@ describe("redactUrlCredentials", () => {
 
     const proseCause = Cause.fail(new Error("Command failed with exit code=1 and status code=403"));
     assert.strictEqual(redactCauseCredentials(proseCause), proseCause);
+
+    class SubclassError extends Schema.TaggedError<SubclassError>()("AcpRequestError", {
+      errorMessage: Schema.String,
+      data: Schema.Unknown,
+      cause: Schema.optionalKey(Schema.Defect()),
+    }) {
+      override get message() {
+        return this.errorMessage;
+      }
+    }
+
+    const hiddenSecretUrl =
+      "https://accounts.google.com/v3/signin/continue?plt=DUMMY_HIDDEN_DATA_PLT_1701";
+    const nestedHiddenUrl =
+      "https://accounts.google.com/v3/signin/continue?%70lt=DUMMY_NESTED_CAUSE_PLT_1702";
+    const errWithHiddenData = new SubclassError({
+      errorMessage: "PERMISSION_DENIED (code 403): VALIDATION_REQUIRED",
+      data: { validation_url: hiddenSecretUrl },
+      cause: {
+        code: -32603,
+        message: "VALIDATION_REQUIRED",
+        data: { validation_url: nestedHiddenUrl },
+      },
+    });
+    const hiddenCause = Cause.fail(errWithHiddenData);
+    // Cause.pretty omits `.data` and plain-object `.cause.data`
+    assert.notInclude(Cause.pretty(hiddenCause), "DUMMY_HIDDEN_DATA_PLT_1701");
+    assert.notInclude(Cause.pretty(hiddenCause), "DUMMY_NESTED_CAUSE_PLT_1702");
+
+    const redactedHidden = redactCauseCredentials(hiddenCause);
+    assert.notStrictEqual(redactedHidden, hiddenCause);
+    const reason = redactedHidden.reasons[0];
+    assert.equal(reason?._tag, "Fail");
+    if (reason?._tag === "Fail") {
+      const sanitizedErr = reason.error as Error & {
+        readonly data?: { readonly validation_url?: string };
+        readonly cause?: { readonly data?: { readonly validation_url?: string } };
+      };
+      assert.equal(sanitizedErr.name, "AcpRequestError");
+      assert.equal(
+        sanitizedErr.data?.validation_url,
+        "https://accounts.google.com/v3/signin/continue?plt=<redacted>",
+      );
+      assert.equal(
+        sanitizedErr.cause?.data?.validation_url,
+        "https://accounts.google.com/v3/signin/continue?%70lt=<redacted>",
+      );
+    }
+
+    const cyclic = new SubclassError({
+      errorMessage: "cyclic",
+      data: {
+        url: "https://accounts.google.com/v3/signin/continue?plt=CYCLIC_PLT",
+      },
+    });
+    Object.defineProperty(cyclic, "cause", {
+      value: cyclic,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    const redactedCyclic = redactCauseCredentials(Cause.die(cyclic));
+    const cyclicReason = redactedCyclic.reasons[0];
+    assert.equal(cyclicReason?._tag, "Die");
+    if (cyclicReason?._tag === "Die") {
+      const sanitizedCyclic = cyclicReason.defect as Error & {
+        readonly data?: { readonly url?: string };
+        readonly cause?: unknown;
+      };
+      assert.strictEqual(sanitizedCyclic.cause, sanitizedCyclic);
+      assert.equal(
+        sanitizedCyclic.data?.url,
+        "https://accounts.google.com/v3/signin/continue?plt=<redacted>",
+      );
+    }
+
+    const redactableValue = {
+      url: "https://accounts.google.com/v3/signin/continue?plt=REDACTABLE_SELF",
+      [Redactable.symbolRedactable]() {
+        return { url: "<custom-redacted>" };
+      },
+    };
+    const redactableCause = Cause.fail(redactableValue);
+    assert.strictEqual(redactCauseCredentials(redactableCause), redactableCause);
   });
 });
 

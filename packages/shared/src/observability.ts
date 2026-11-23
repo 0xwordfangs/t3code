@@ -7,6 +7,7 @@ import type * as Exit from "effect/Exit";
 import * as ExitRuntime from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Redactable from "effect/Redactable";
 import * as Result from "effect/Result";
 import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
@@ -410,16 +411,65 @@ function spanToTraceRecord(span: SerializableSpan): EffectTraceRecord {
 }
 
 // Auth tokens and WebSocket tickets ride in URL queries and stay valid after the request.
-const URL_CREDENTIAL_PARAMS =
-  /(^|[?&"\s]|\\u0026)(wsTicket|dpop|plt|access_token|id_token|refresh_token)=[^&#"'\\\s]*/gi;
-const URL_QUERY_CREDENTIAL_PARAMS = /([?&]|\\u0026)(code|token)=[^&#"'\\\s]*/gi;
+const SENSITIVE_URL_PARAM_NAMES = new Set([
+  "wsticket",
+  "dpop",
+  "plt",
+  "access_token",
+  "id_token",
+  "refresh_token",
+]);
+const SENSITIVE_QUERY_PARAM_NAMES = new Set([...SENSITIVE_URL_PARAM_NAMES, "code", "token"]);
+// Linear-time prefix scan over literal, JSON-escaped (\u0026/\u003f/\u003d), and
+// single/multi percent-encoded delimiters, ASCII parameter keys, and equals signs.
+const URL_CREDENTIAL_KEY_PREFIX =
+  /(^|[?&#"'\s]|\\u0026|\\u003[fF]|%(?:25){0,3}(?:3[fF]|26|23))((?:[A-Za-z0-9_-]|%(?:25){0,3}(?:2[dD]|3[0-9]|4[1-9a-fA-F]|5[0-9aAfF]|6[1-9a-fA-F]|7[0-9aA])){2,32})(=|\\{1,2}u003[dD]|%(?:25){0,3}3[dD])/g;
+const URL_CREDENTIAL_VALUE_END =
+  /[&#"'\\\s]|\\u00(?:26|23|22|27|20)|%(?:25){0,3}(?:26|23|22|27|20|0[aAdD]|5[cC])/g;
 
-export const redactUrlCredentials = (text: string): string =>
-  text.includes("=")
-    ? text
-        .replace(URL_CREDENTIAL_PARAMS, "$1$2=<redacted>")
-        .replace(URL_QUERY_CREDENTIAL_PARAMS, "$1$2=<redacted>")
-    : text;
+function decodeParamKey(rawKey: string): string {
+  let current = rawKey;
+  for (let i = 0; i < 4 && current.includes("%"); i += 1) {
+    try {
+      const next = decodeURIComponent(current);
+      if (next === current) break;
+      current = next;
+    } catch {
+      break;
+    }
+  }
+  return current.toLowerCase();
+}
+
+export const redactUrlCredentials = (text: string): string => {
+  if (!text.includes("=") && !text.includes("%") && !text.includes("\\u003")) {
+    return text;
+  }
+  URL_CREDENTIAL_KEY_PREFIX.lastIndex = 0;
+  let out = "";
+  let cursor = 0;
+  let changed = false;
+  let match: RegExpExecArray | null;
+  while ((match = URL_CREDENTIAL_KEY_PREFIX.exec(text)) !== null) {
+    const delim = match[1]!;
+    const rawKey = match[2]!;
+    const key = decodeParamKey(rawKey);
+    const isQueryDelim = delim !== "" && !/^["'\s]$/.test(delim);
+    const shouldRedact = isQueryDelim
+      ? SENSITIVE_QUERY_PARAM_NAMES.has(key)
+      : SENSITIVE_URL_PARAM_NAMES.has(key);
+    if (!shouldRedact) continue;
+    const valueStart = URL_CREDENTIAL_KEY_PREFIX.lastIndex;
+    URL_CREDENTIAL_VALUE_END.lastIndex = valueStart;
+    const endMatch = URL_CREDENTIAL_VALUE_END.exec(text);
+    const valueEnd = endMatch === null ? text.length : endMatch.index;
+    out += `${text.slice(cursor, valueStart)}<redacted>`;
+    cursor = valueEnd;
+    URL_CREDENTIAL_KEY_PREFIX.lastIndex = valueEnd;
+    changed = true;
+  }
+  return changed ? out + text.slice(cursor) : text;
+};
 
 function redactTraceValue(value: unknown, seen?: WeakSet<object>): unknown {
   if (typeof value === "string") {
@@ -605,14 +655,165 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
   } satisfies TraceSink;
 });
 
-// Effect's HTTP errors, including failed upgrades, put the request URL in their message.
-export function redactCauseCredentials(cause: Cause.Cause<unknown>): Cause.Cause<unknown> {
+type RedactCauseVisit = { readonly clone: object; referenced: boolean };
+
+function redactCauseValue(
+  value: unknown,
+  seen?: WeakMap<object, RedactCauseVisit>,
+  activeCauses?: WeakSet<object>,
+): unknown {
+  if (typeof value === "string") {
+    return redactUrlCredentials(value);
+  }
+  if (Cause.isCause(value)) {
+    const causes = activeCauses ?? new WeakSet<object>();
+    if (causes.has(value)) return value;
+    return redactCauseCredentialsInternal(value, seen, causes);
+  }
+  if (typeof value !== "object" || value === null) return value;
+  if (Redactable.isRedactable(value)) return value;
+  const visited = seen ?? new WeakMap<object, RedactCauseVisit>();
+  const existing = visited.get(value);
+  if (existing !== undefined) {
+    existing.referenced = true;
+    return existing.clone;
+  }
+  if (value instanceof Error) {
+    const redactedMessage = redactUrlCredentials(value.message);
+    const redactedStack =
+      typeof value.stack === "string" ? redactUrlCredentials(value.stack) : value.stack;
+    const sanitized = new Error(redactedMessage);
+    const visit: RedactCauseVisit = { clone: sanitized, referenced: false };
+    visited.set(value, visit);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    let changed = redactedMessage !== value.message || redactedStack !== value.stack;
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (key === "message" || key === "stack") continue;
+      const descriptor = descriptors[key as keyof typeof descriptors];
+      if (descriptor === undefined || !("value" in descriptor)) continue;
+      const next = redactCauseValue(descriptor.value, visited, activeCauses);
+      if (next !== descriptor.value) {
+        descriptor.value = next;
+        changed = true;
+      }
+    }
+    const inheritedCause = !("cause" in descriptors) ? value.cause : undefined;
+    const redactedInheritedCause =
+      inheritedCause !== undefined
+        ? redactCauseValue(inheritedCause, visited, activeCauses)
+        : undefined;
+    if (redactedInheritedCause !== inheritedCause) {
+      changed = true;
+    }
+    if (!changed && !visit.referenced) {
+      visited.set(value, { clone: value, referenced: false });
+      return value;
+    }
+    if (!("name" in descriptors)) {
+      sanitized.name = value.name;
+    }
+    if (redactedStack !== undefined) {
+      sanitized.stack = redactedStack;
+    }
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (key === "message" || key === "stack") continue;
+      const descriptor = descriptors[key as keyof typeof descriptors];
+      if (descriptor !== undefined && "value" in descriptor) {
+        Object.defineProperty(sanitized, key, descriptor);
+      }
+    }
+    if (redactedInheritedCause !== undefined) {
+      Object.defineProperty(sanitized, "cause", {
+        value: redactedInheritedCause,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    return sanitized;
+  }
+  if (Array.isArray(value)) {
+    const sanitized = new Array<unknown>(value.length);
+    const visit: RedactCauseVisit = { clone: sanitized, referenced: false };
+    visited.set(value, visit);
+    let changed = false;
+    for (let index = 0; index < value.length; index += 1) {
+      const entry = value[index];
+      const next = redactCauseValue(entry, visited, activeCauses);
+      sanitized[index] = next;
+      if (next !== entry) changed = true;
+    }
+    if (!changed && !visit.referenced) {
+      visited.set(value, { clone: value, referenced: false });
+      return value;
+    }
+    return sanitized;
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const sanitized = Object.create(prototype) as object;
+  const visit: RedactCauseVisit = { clone: sanitized, referenced: false };
+  visited.set(value, visit);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  let changed = false;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = descriptors[key as keyof typeof descriptors];
+    if (descriptor === undefined || !("value" in descriptor)) continue;
+    const next = redactCauseValue(descriptor.value, visited, activeCauses);
+    if (next !== descriptor.value) {
+      descriptor.value = next;
+      changed = true;
+    }
+  }
+  if (!changed && !visit.referenced) {
+    visited.set(value, { clone: value, referenced: false });
+    return value;
+  }
+  Object.defineProperties(sanitized, descriptors);
+  return sanitized;
+}
+
+function redactCauseCredentialsInternal(
+  cause: Cause.Cause<unknown>,
+  seen?: WeakMap<object, RedactCauseVisit>,
+  activeCauses?: WeakSet<object>,
+): Cause.Cause<unknown> {
   if (cause.reasons.length === 0 || Cause.hasInterruptsOnly(cause)) {
     return cause;
   }
-  const pretty = Cause.pretty(cause);
+  const causes = activeCauses ?? new WeakSet<object>();
+  causes.add(cause);
+  let changed = false;
+  const nextReasons = cause.reasons.map((reason) => {
+    if (reason._tag === "Fail") {
+      const next = redactCauseValue(reason.error, seen, causes);
+      if (next !== reason.error) {
+        changed = true;
+        return Cause.makeFailReason(next);
+      }
+      return reason;
+    }
+    if (reason._tag === "Die") {
+      const next = redactCauseValue(reason.defect, seen, causes);
+      if (next !== reason.defect) {
+        changed = true;
+        return Cause.makeDieReason(next);
+      }
+      return reason;
+    }
+    return reason;
+  });
+  causes.delete(cause);
+  const sanitizedCause = changed ? Cause.fromReasons(nextReasons) : cause;
+  const pretty = Cause.pretty(sanitizedCause);
   const redacted = redactUrlCredentials(pretty);
-  return redacted === pretty ? cause : Cause.die(new Error(redacted));
+  return redacted === pretty ? sanitizedCause : Cause.die(new Error(redacted));
+}
+
+// Effect's HTTP errors, including failed upgrades, put the request URL in their message,
+// while Error subclasses like AcpRequestError can carry credential URLs in `.data` / `.cause`.
+export function redactCauseCredentials(cause: Cause.Cause<unknown>): Cause.Cause<unknown> {
+  return redactCauseCredentialsInternal(cause);
 }
 
 function redactExitCredentials(exit: Exit.Exit<unknown, unknown>): Exit.Exit<unknown, unknown> {

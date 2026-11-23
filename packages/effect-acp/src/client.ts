@@ -274,6 +274,9 @@ interface AcpCoreRequestHandlers {
   >;
 }
 
+const MAX_PENDING_BUFFERED_NOTIFICATIONS = 32;
+const MAX_PENDING_BUFFERED_JSON_LENGTH = 16 * 1024 * 1024;
+
 interface AcpNotificationHandlers {
   readonly sessionUpdate: BufferedNotificationHandler<AcpSchema.SessionNotification>;
   readonly elicitationComplete: BufferedNotificationHandler<AcpSchema.CompleteElicitationNotification>;
@@ -281,7 +284,30 @@ interface AcpNotificationHandlers {
 
 interface BufferedNotificationHandler<A> {
   readonly handlers: Array<(notification: A) => Effect.Effect<void, AcpError.AcpError>>;
-  readonly pending: Array<A>;
+  readonly pending: Array<{ readonly value: A; readonly lineLength: number }>;
+  pendingJsonLength: number;
+}
+
+function pushBoundedPending<A>(
+  registration: BufferedNotificationHandler<A>,
+  value: A,
+  lineLength: number,
+): void {
+  if (lineLength > MAX_PENDING_BUFFERED_JSON_LENGTH) {
+    registration.pending.length = 0;
+    registration.pendingJsonLength = 0;
+    return;
+  }
+  registration.pending.push({ value, lineLength });
+  registration.pendingJsonLength += lineLength;
+  while (
+    registration.pending.length > MAX_PENDING_BUFFERED_NOTIFICATIONS ||
+    registration.pendingJsonLength > MAX_PENDING_BUFFERED_JSON_LENGTH
+  ) {
+    const evicted = registration.pending.shift();
+    if (evicted === undefined) break;
+    registration.pendingJsonLength -= evicted.lineLength;
+  }
 }
 
 function normalizeContentBlock(content: AcpSchemaV2.ContentBlock): AcpSchema.ContentBlock {
@@ -773,8 +799,8 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
 ): Effect.fn.Return<AcpClient["Service"], never, Scope.Scope> {
   const coreHandlers: AcpCoreRequestHandlers = {};
   const notificationHandlers: AcpNotificationHandlers = {
-    sessionUpdate: { handlers: [], pending: [] },
-    elicitationComplete: { handlers: [], pending: [] },
+    sessionUpdate: { handlers: [], pending: [], pendingJsonLength: 0 },
+    elicitationComplete: { handlers: [], pending: [], pendingJsonLength: 0 },
   };
   const promptCompletions = new Map<
     string,
@@ -815,16 +841,16 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
         return Effect.void;
       }
       const pending = registration.pending.splice(0, registration.pending.length);
-      return Effect.forEach(
-        pending,
-        (notification) => runNotificationHandlers(registration, notification),
-        {
-          discard: true,
-        },
-      );
+      registration.pendingJsonLength = 0;
+      return Effect.forEach(pending, ({ value }) => runNotificationHandlers(registration, value), {
+        discard: true,
+      });
     });
 
-  const dispatchNotification = (notification: AcpProtocol.AcpIncomingNotification) => {
+  const dispatchNotification = (
+    notification: AcpProtocol.AcpIncomingNotification,
+    lineLength: number,
+  ) => {
     switch (notification._tag) {
       case "SessionUpdate": {
         const normalized = notification.params as AcpSchema.SessionNotification;
@@ -848,7 +874,7 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
               })
             : Effect.void;
         if (notificationHandlers.sessionUpdate.handlers.length === 0) {
-          notificationHandlers.sessionUpdate.pending.push(normalized);
+          pushBoundedPending(notificationHandlers.sessionUpdate, normalized, lineLength);
           return completePrompt;
         }
         return Effect.all(
@@ -857,8 +883,18 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
         );
       }
       case "ElicitationComplete": {
+        if (
+          advertisedClientCapabilities !== undefined &&
+          advertisedClientCapabilities.elicitation?.url == null
+        ) {
+          return Effect.void;
+        }
         if (notificationHandlers.elicitationComplete.handlers.length === 0) {
-          notificationHandlers.elicitationComplete.pending.push(notification.params);
+          pushBoundedPending(
+            notificationHandlers.elicitationComplete,
+            notification.params,
+            lineLength,
+          );
           return Effect.void;
         }
         return runNotificationHandlers(
@@ -901,21 +937,23 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
     ...(options.logger ? { logger: options.logger } : {}),
     ...(options.onIncomingRequest ? { onIncomingRequest: options.onIncomingRequest } : {}),
     onTermination: (error) =>
-      Effect.all(
-        [
-          ...Array.from(promptCompletions.values(), (completion) =>
-            Deferred.fail(completion, error).pipe(Effect.asVoid),
-          ),
-          options.onTermination?.(error) ?? Effect.void,
-        ],
-        { discard: true },
-      ).pipe(
-        Effect.tap(() =>
-          Effect.sync(() => {
-            promptCompletions.clear();
-          }),
-        ),
-      ),
+      Effect.suspend(() => {
+        const pendingCompletions = Array.from(promptCompletions.values());
+        promptCompletions.clear();
+        notificationHandlers.sessionUpdate.pending.length = 0;
+        notificationHandlers.sessionUpdate.pendingJsonLength = 0;
+        notificationHandlers.elicitationComplete.pending.length = 0;
+        notificationHandlers.elicitationComplete.pendingJsonLength = 0;
+        return Effect.all(
+          [
+            ...pendingCompletions.map((completion) =>
+              Deferred.fail(completion, error).pipe(Effect.asVoid),
+            ),
+            options.onTermination?.(error) ?? Effect.void,
+          ],
+          { discard: true },
+        );
+      }),
     ...(options.onOutgoingResponseFailure
       ? { onOutgoingResponseFailure: options.onOutgoingResponseFailure }
       : {}),

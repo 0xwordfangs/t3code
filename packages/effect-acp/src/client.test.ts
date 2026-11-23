@@ -388,7 +388,7 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
           clientCapabilities: {
             fs: { readTextFile: false, writeTextFile: false },
             terminal: false,
-            elicitation: { form: {} },
+            elicitation: { form: {}, url: {} },
           },
           clientInfo: {
             name: "effect-acp-test",
@@ -669,7 +669,7 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
           clientCapabilities: {
             fs: { readTextFile: false, writeTextFile: false },
             terminal: false,
-            elicitation: { form: {} },
+            elicitation: { form: {}, url: {} },
           },
           clientInfo: {
             name: "effect-acp-test",
@@ -805,7 +805,7 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
         .initialize({
           protocolVersion: 2,
           clientInfo: { name: "effect-acp-test", version: "0.0.0" },
-          clientCapabilities: { _meta: { "terminal-auth": true } },
+          clientCapabilities: { elicitation: { url: {} }, _meta: { "terminal-auth": true } },
         })
         .pipe(Effect.forkScoped);
       const initializeRequest = yield* Queue.take(output).pipe(
@@ -1834,4 +1834,280 @@ it.effect("returns method-not-found when SDK elicitation has no question handler
     const response = yield* decodeWireError(yield* Queue.take(output));
     assert.equal(response.error.code, -32601);
   }),
+);
+
+it.effect("drops elicitation/complete notifications when elicitation.url is not advertised", () =>
+  Effect.gen(function* () {
+    const { stdio, input, output } = yield* makeInMemoryStdio();
+    const acp = yield* AcpClient.make(stdio);
+    const init = yield* acp.agent
+      .initialize({ protocolVersion: 2, clientCapabilities: { elicitation: { form: {} } } })
+      .pipe(Effect.forkChild);
+    const initialize = yield* decodeWireResponse(yield* Queue.take(output));
+    yield* Queue.offer(
+      input,
+      yield* encodeJsonl(jsonRpcResponse(Schema.Unknown), {
+        jsonrpc: "2.0",
+        id: (initialize as { id: number }).id,
+        result: { protocolVersion: 2, info: { name: "fixture", version: "1" }, capabilities: {} },
+      }),
+    );
+    yield* Fiber.join(init);
+
+    const barrier = yield* Deferred.make<void>();
+    yield* acp.handleUnknownExtNotification((method) =>
+      method === "x/barrier"
+        ? Deferred.succeed(barrier, undefined).pipe(Effect.asVoid)
+        : Effect.void,
+    );
+
+    for (const method of ["elicitation/complete", "session/elicitation/complete"] as const) {
+      yield* Queue.offer(
+        input,
+        yield* encodeJsonl(jsonRpcNotification(method, AcpSchema.CompleteElicitationNotification), {
+          jsonrpc: "2.0",
+          method,
+          params: { elicitationId: `dropped-${method}` },
+        }),
+      );
+    }
+    yield* Queue.offer(
+      input,
+      yield* encodeJsonl(jsonRpcNotification("x/barrier", Schema.Unknown), {
+        jsonrpc: "2.0",
+        method: "x/barrier",
+        params: {},
+      }),
+    );
+    yield* Deferred.await(barrier);
+
+    const flushed = yield* Ref.make<Array<AcpSchema.CompleteElicitationNotification>>([]);
+    yield* acp.handleElicitationComplete((notification) =>
+      Ref.update(flushed, (current) => [...current, notification]),
+    );
+    assert.deepEqual(yield* Ref.get(flushed), []);
+
+    // Also dropped when a handler is already registered.
+    const barrier2 = yield* Deferred.make<void>();
+    yield* acp.handleUnknownExtNotification((method) =>
+      method === "x/barrier2"
+        ? Deferred.succeed(barrier2, undefined).pipe(Effect.asVoid)
+        : Effect.void,
+    );
+    yield* Queue.offer(
+      input,
+      yield* encodeJsonl(
+        jsonRpcNotification("elicitation/complete", AcpSchema.CompleteElicitationNotification),
+        {
+          jsonrpc: "2.0",
+          method: "elicitation/complete",
+          params: { elicitationId: "dropped-after-handler" },
+        },
+      ),
+    );
+    yield* Queue.offer(
+      input,
+      yield* encodeJsonl(jsonRpcNotification("x/barrier2", Schema.Unknown), {
+        jsonrpc: "2.0",
+        method: "x/barrier2",
+        params: {},
+      }),
+    );
+    yield* Deferred.await(barrier2);
+    assert.deepEqual(yield* Ref.get(flushed), []);
+  }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "caps buffered pending notifications by entry count (32) and JSON length (16 MiB) with oldest eviction",
+  () =>
+    Effect.gen(function* () {
+      // 1. Entry count cap (32) for both elicitationComplete and sessionUpdate.
+      {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const acp = yield* AcpClient.make(stdio);
+        const barrier = yield* Deferred.make<void>();
+        yield* acp.handleUnknownExtNotification((method) =>
+          method === "x/barrier"
+            ? Deferred.succeed(barrier, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        );
+
+        for (let i = 0; i < 40; i += 1) {
+          yield* Queue.offer(
+            input,
+            yield* encodeJsonl(
+              jsonRpcNotification(
+                "elicitation/complete",
+                AcpSchema.CompleteElicitationNotification,
+              ),
+              {
+                jsonrpc: "2.0",
+                method: "elicitation/complete",
+                params: { elicitationId: `elicit-${i}` },
+              },
+            ),
+          );
+          yield* Queue.offer(
+            input,
+            yield* encodeJsonl(SessionUpdateNotification, {
+              jsonrpc: "2.0",
+              method: "session/update",
+              params: {
+                sessionId: `session-${i}`,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: `msg-${i}` },
+                },
+              },
+            }),
+          );
+        }
+        yield* Queue.offer(
+          input,
+          yield* encodeJsonl(jsonRpcNotification("x/barrier", Schema.Unknown), {
+            jsonrpc: "2.0",
+            method: "x/barrier",
+            params: {},
+          }),
+        );
+        yield* Deferred.await(barrier);
+
+        const flushedElicitations = yield* Ref.make<Array<string>>([]);
+        yield* acp.handleElicitationComplete((notification) =>
+          Ref.update(flushedElicitations, (current) => [...current, notification.elicitationId]),
+        );
+        assert.deepEqual(
+          yield* Ref.get(flushedElicitations),
+          Array.from({ length: 32 }, (_, idx) => `elicit-${idx + 8}`),
+        );
+
+        const flushedUpdates = yield* Ref.make<Array<string>>([]);
+        yield* acp.handleSessionUpdate((notification) =>
+          Ref.update(flushedUpdates, (current) => [...current, notification.sessionId]),
+        );
+        assert.deepEqual(
+          yield* Ref.get(flushedUpdates),
+          Array.from({ length: 32 }, (_, idx) => `session-${idx + 8}`),
+        );
+      }
+
+      // 2. 16 MiB cumulative JSON length cap with oldest eviction.
+      {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const acp = yield* AcpClient.make(stdio);
+        const barrier = yield* Deferred.make<void>();
+        yield* acp.handleUnknownExtNotification((method) =>
+          method === "x/barrier"
+            ? Deferred.succeed(barrier, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        );
+
+        const pad = "B".repeat(3 * 1024 * 1024);
+        for (let i = 0; i < 8; i += 1) {
+          yield* Queue.offer(
+            input,
+            yield* encodeJsonl(
+              jsonRpcNotification(
+                "elicitation/complete",
+                AcpSchema.CompleteElicitationNotification,
+              ),
+              {
+                jsonrpc: "2.0",
+                method: "elicitation/complete",
+                params: { elicitationId: `large-${i}`, _meta: { pad } },
+              },
+            ),
+          );
+        }
+        yield* Queue.offer(
+          input,
+          yield* encodeJsonl(jsonRpcNotification("x/barrier", Schema.Unknown), {
+            jsonrpc: "2.0",
+            method: "x/barrier",
+            params: {},
+          }),
+        );
+        yield* Deferred.await(barrier);
+
+        const flushedLarge = yield* Ref.make<Array<string>>([]);
+        yield* acp.handleElicitationComplete((notification) =>
+          Ref.update(flushedLarge, (current) => [...current, notification.elicitationId]),
+        );
+        // 5 * 3 MiB = 15 MiB <= 16 MiB, while 6 * 3 MiB = 18 MiB > 16 MiB.
+        assert.deepEqual(yield* Ref.get(flushedLarge), [
+          "large-3",
+          "large-4",
+          "large-5",
+          "large-6",
+          "large-7",
+        ]);
+      }
+    }).pipe(Effect.scoped),
+);
+
+it.effect("clears buffered pending notifications on termination", () =>
+  Effect.gen(function* () {
+    const { stdio, input } = yield* makeInMemoryStdio();
+    const terminated = yield* Deferred.make<void>();
+    const acp = yield* AcpClient.make(stdio, {
+      onTermination: () => Deferred.succeed(terminated, undefined).pipe(Effect.asVoid),
+    });
+    const barrier = yield* Deferred.make<void>();
+    yield* acp.handleUnknownExtNotification((method) =>
+      method === "x/barrier"
+        ? Deferred.succeed(barrier, undefined).pipe(Effect.asVoid)
+        : Effect.void,
+    );
+
+    yield* Queue.offer(
+      input,
+      yield* encodeJsonl(
+        jsonRpcNotification("elicitation/complete", AcpSchema.CompleteElicitationNotification),
+        {
+          jsonrpc: "2.0",
+          method: "elicitation/complete",
+          params: { elicitationId: "pending-before-termination" },
+        },
+      ),
+    );
+    yield* Queue.offer(
+      input,
+      yield* encodeJsonl(SessionUpdateNotification, {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "pending-session",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "before termination" },
+          },
+        },
+      }),
+    );
+    yield* Queue.offer(
+      input,
+      yield* encodeJsonl(jsonRpcNotification("x/barrier", Schema.Unknown), {
+        jsonrpc: "2.0",
+        method: "x/barrier",
+        params: {},
+      }),
+    );
+    yield* Deferred.await(barrier);
+
+    yield* Queue.end(input);
+    yield* Deferred.await(terminated);
+
+    const flushedElicitations = yield* Ref.make<Array<unknown>>([]);
+    const flushedUpdates = yield* Ref.make<Array<unknown>>([]);
+    yield* acp.handleElicitationComplete((notification) =>
+      Ref.update(flushedElicitations, (current) => [...current, notification]),
+    );
+    yield* acp.handleSessionUpdate((notification) =>
+      Ref.update(flushedUpdates, (current) => [...current, notification]),
+    );
+
+    assert.deepEqual(yield* Ref.get(flushedElicitations), []);
+    assert.deepEqual(yield* Ref.get(flushedUpdates), []);
+  }).pipe(Effect.scoped),
 );

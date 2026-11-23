@@ -282,6 +282,52 @@ describe("ServerLoggerLive", () => {
     }),
   );
 
+  it.effect(
+    "redacts AcpRequestError.data and .cause.data wrapped in Cause.fail when logged via { cause } to OtlpLogger",
+    () =>
+      Effect.gen(function* () {
+        const protocolError = {
+          code: -32603,
+          message: "PERMISSION_DENIED (code 403): VALIDATION_REQUIRED",
+          data: {
+            error: {
+              code: 403,
+              message: "Verify your account to continue.",
+              details: [
+                {
+                  "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                  reason: "VALIDATION_REQUIRED",
+                  metadata: {
+                    validation_url:
+                      "https://accounts.google.com/v3/signin/continue?plt=DUMMY_VERIFY_PLT_1701&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Fplt%3DDUMMY_NESTED_PLT_1702",
+                  },
+                },
+              ],
+            },
+          },
+        };
+        const acpError = EffectAcpErrors.AcpRequestError.fromProtocolError(protocolError, {
+          method: "session/prompt",
+        });
+        const wrappedCause = Cause.fail(acpError);
+        // Cause.pretty omits AcpRequestError.data / cause.data, so this exercises recursive Cause redaction.
+        assert.notInclude(Cause.pretty(wrappedCause), "DUMMY_VERIFY_PLT_1701");
+
+        const { requests } = yield* logInSpanThrough(
+          { otlpLogsUrl: "https://collector.example.com/v1/logs" },
+          Effect.logWarning("Thread title generation failed", {
+            threadId: "thread-1",
+            cause: wrappedCause,
+          }),
+        );
+        const body = requests.map((request) => request.body).join("\n");
+        assert.include(body, "plt=<redacted>");
+        assert.include(body, "%3Fplt%3D<redacted>");
+        assert.notInclude(body, "DUMMY_VERIFY_PLT_1701");
+        assert.notInclude(body, "DUMMY_NESTED_PLT_1702");
+      }),
+  );
+
   // regression: #16642 logs printed causes as [Object]
   it.effect("leaves getters uncalled while printing a cause field", () =>
     Effect.gen(function* () {

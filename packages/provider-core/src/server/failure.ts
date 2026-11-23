@@ -225,11 +225,54 @@ function stringField(value: unknown, key: "message" | "code"): string | undefine
   }
 }
 
+const TRAILING_URL_PUNCTUATION = new Set([")", ",", ".", ";", "!", "?"]);
+const MAX_REDACTION_INPUT_MULTIPLIER = 8;
+const MIN_REDACTION_INPUT_CAP = 32_768;
+
+function splitTrailingUrlPunctuation(match: string): {
+  readonly candidate: string;
+  readonly trailing: string;
+} {
+  let end = match.length;
+  while (end > 0 && TRAILING_URL_PUNCTUATION.has(match[end - 1]!)) {
+    end -= 1;
+  }
+  return end === match.length
+    ? { candidate: match, trailing: "" }
+    : { candidate: match.slice(0, end), trailing: match.slice(end) };
+}
+
 function redactUrl(match: string): string {
-  const trailing = /[),.;!?]+$/u.exec(match)?.[0] ?? "";
-  const candidate = trailing.length === 0 ? match : match.slice(0, -trailing.length);
+  const { candidate, trailing } = splitTrailingUrlPunctuation(match);
   try {
     const url = new URL(candidate);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return `${url.toString()}${trailing}`;
+  } catch {
+    return "[REDACTED_URL]";
+  }
+}
+
+function redactPercentEncodedUrl(match: string): string {
+  const { candidate, trailing } = splitTrailingUrlPunctuation(match);
+  let decoded = candidate;
+  for (let i = 0; i < 4 && decoded.includes("%"); i += 1) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      return "[REDACTED_URL]";
+    }
+  }
+  try {
+    const url = new URL(decoded);
+    if (/[\s<>"']/u.test(decoded) || /https?:\/\//iu.test(url.pathname)) {
+      return "[REDACTED_URL]";
+    }
     url.username = "";
     url.password = "";
     url.search = "";
@@ -259,13 +302,17 @@ function replaceUnsafeControlCharacters(value: string): string {
 function redactProviderFailureText(value: string): string {
   return replaceUnsafeControlCharacters(value)
     .replace(/\bhttps?:\/\/[^\s<>"']+/giu, redactUrl)
+    .replace(
+      /(?:(?<![A-Za-z0-9_-])|(?<=%(?:25){0,3}[0-9A-Fa-f]{2}))https?%(?:25){0,3}3A%(?:25){0,3}2F%(?:25){0,3}2F(?:[^\s<>"'%]+|%(?!(?:25){0,3}(?:20|22|27|0[aAdD]|3[cCeE])))*/giu,
+      redactPercentEncodedUrl,
+    )
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/giu, "$1 [REDACTED]")
     .replace(
-      /(["'][\w-]*(?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)["']\s*:\s*["'])[^"']*(["'])/giu,
+      /(["'][\w-]*(?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)["']\s*:\s*["'])[^"']*(["']|$)/giu,
       "$1[REDACTED]$2",
     )
     .replace(
-      /((?<![\w-])[\w-]*(?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+      /((?<![\w-])[\w-]*(?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)\b\s*[:=]\s*)(?:"[^"]*(?:"|$)|'[^']*(?:'|$)|[^\s,;]+)/giu,
       "$1[REDACTED]",
     )
     .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/gu, "[REDACTED]")
@@ -273,7 +320,20 @@ function redactProviderFailureText(value: string): string {
 }
 
 function boundedText(value: string, maxLength: number): string {
-  const redacted = redactProviderFailureText(value);
+  const preRedactionLimit = Math.max(
+    maxLength * MAX_REDACTION_INPUT_MULTIPLIER,
+    MIN_REDACTION_INPUT_CAP,
+  );
+  let capped = value;
+  if (value.length > preRedactionLimit) {
+    let cut = preRedactionLimit;
+    const lastCodeUnit = value.charCodeAt(cut - 1);
+    if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
+      cut -= 1;
+    }
+    capped = value.slice(0, cut);
+  }
+  const redacted = redactProviderFailureText(capped);
   if (redacted.length <= maxLength) return redacted;
   let end = Math.max(0, maxLength - 1);
   const finalCodeUnit = redacted.charCodeAt(end - 1);

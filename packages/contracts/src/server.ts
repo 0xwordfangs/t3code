@@ -97,6 +97,14 @@ const FORBIDDEN_CONTINUE_TARGET_QUERY_KEYS = new Set([
   "dest",
   "next",
   "return_to",
+  "plt",
+  "code",
+  "token",
+  "access_token",
+  "id_token",
+  "refresh_token",
+  "wsticket",
+  "dpop",
 ]);
 
 function hasUnsafeVerificationUrlCharacter(value: string): boolean {

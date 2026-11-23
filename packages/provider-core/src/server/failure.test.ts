@@ -20,6 +20,7 @@ import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
   MAX_PROVIDER_FAILURE_MESSAGE_LENGTH,
+  sanitizeProviderFailureMessage,
   ContextHandoffBudgetError,
   ContextHandoffBackgroundWorkError,
 } from "./failure.ts";
@@ -423,4 +424,61 @@ it("preserves only valid Google Accounts verification URLs with query params and
     occurredAt: DateTime.makeUnsafe("2026-11-21T12:00:00.000Z"),
   });
   assert.equal(regularItem.title, "Provider error");
+});
+
+it("redacts fully percent-encoded credential URLs in provider failure text", () => {
+  const failure = makeProviderFailure({
+    message:
+      "Redirect failed: https%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3DDUMMY_FULL_ENC_PLT_007 and double https%253A%252F%252Fuser%253Apass%2540example.test%252Fcb%253Fcode%253DDOUBLE_CODE and malformed https%3A%2F%2Fexample.test%2F%E0%A4%A%3Ftoken%3DBAD_ENC.",
+  });
+
+  assert.notInclude(failure.message, "DUMMY_FULL_ENC_PLT_007");
+  assert.notInclude(failure.message, "DOUBLE_CODE");
+  assert.notInclude(failure.message, "user:pass");
+  assert.notInclude(failure.message, "BAD_ENC");
+  assert.include(failure.message, "https://accounts.google.com/v3/signin/continue");
+  assert.include(failure.message, "https://example.test/cb");
+  assert.include(failure.message, "[REDACTED_URL]");
+
+  const delimited = sanitizeProviderFailureMessage(
+    [
+      "https://proxy.test/r%2Fhttps%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3DSECRET_SL",
+      "continue%3Dhttps%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3DSECRET_EQ",
+      "%22https%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3DSECRET_Q%22",
+      "prefix%20https%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3DSECRET_SP",
+      "https%3A%2F%2Fexample.test%2Fdocs%20and%20https%3A%2F%2Fuser%3Apass%40example.test%2Fcb",
+    ].join(" | "),
+  );
+  assert.notInclude(delimited, "SECRET_SL");
+  assert.notInclude(delimited, "SECRET_EQ");
+  assert.notInclude(delimited, "SECRET_Q");
+  assert.notInclude(delimited, "SECRET_SP");
+  assert.notInclude(delimited, "user:pass");
+  assert.include(delimited, "https://example.test/docs%20and%20https://example.test/cb");
+});
+
+it("redacts oversized punctuation-heavy URLs in linear time and keeps truncated trailing secrets redacted", () => {
+  // A quadratic trailing-punctuation regex stalls for >6s on 128 KiB of dots + 'x'; the project timeout catches regressions.
+  const adversarial64k = `https://a.invalid/${".".repeat(64_000)}x`;
+  const adversarial128k = `https://a.invalid/${".".repeat(128_000)}x`;
+
+  const sanitized64k = sanitizeProviderFailureMessage(adversarial64k);
+  const sanitized128k = sanitizeProviderFailureMessage(adversarial128k);
+  const codeFailure = makeProviderFailure({ message: "failed", code: adversarial64k });
+
+  assert.isAtMost(sanitized64k.length, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
+  assert.isAtMost(sanitized128k.length, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
+  assert.isAtMost(codeFailure.code?.length ?? 0, 128);
+
+  // When a long URL precedes a JSON/key-value secret that gets cut by the 32 KiB pre-redaction cap,
+  // unclosed trailing quotes must still be redacted even after URL shortening drops total length <= 4 KiB.
+  const truncatedJsonSecret = `https://a.invalid/?q=${"a".repeat(32_720)} {"token":"TRUNCATED_JSON_SECRET_VALUE_EXCEEDING_CAP"}`;
+  const redactedJson = sanitizeProviderFailureMessage(truncatedJsonSecret);
+  assert.notInclude(redactedJson, "TRUNCATED_JSON_SECRET");
+  assert.include(redactedJson, '{"token":"[REDACTED]');
+
+  const truncatedKvSecret = `https://a.invalid/?q=${"a".repeat(32_720)} api_key="TRUNCATED_KV_SECRET_VALUE_EXCEEDING_CAP"`;
+  const redactedKv = sanitizeProviderFailureMessage(truncatedKvSecret);
+  assert.notInclude(redactedKv, "TRUNCATED_KV_SECRET");
+  assert.include(redactedKv, "api_key=[REDACTED]");
 });

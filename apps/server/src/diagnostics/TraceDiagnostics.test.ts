@@ -345,4 +345,42 @@ describe("TraceDiagnostics", () => {
     assert.include(diagnostics.latestWarningAndErrorLogs[0]?.message ?? "", "plt=<redacted>");
     assert.notInclude(diagnostics.latestWarningAndErrorLogs[0]?.message ?? "", "SECRET_PLT_123");
   });
+
+  it("redacts percent-encoded URL keys, nested continue params, and fully encoded URLs", () => {
+    const nestedUrl =
+      "https://accounts.google.com/v3/signin/continue?%70lt=SECRET_PCT_KEY&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Fplt%3DSECRET_INNER_PLT%26code%3DSECRET_INNER_CODE";
+    const fullEncoded =
+      "https%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3DSECRET_FULL_ENC";
+    const diagnostics = aggregateLines([
+      record({
+        name: "acp.prompt",
+        traceId: "trace-pct-1",
+        spanId: "span-pct-1",
+        startMs: 1_000,
+        durationMs: 100,
+        exit: { _tag: "Failure", cause: `Validation required: ${nestedUrl} ${fullEncoded}` },
+        events: [
+          {
+            name: `acp warning for ${nestedUrl} ${fullEncoded}`,
+            timeUnixNano: ns(1_050),
+            attributes: { "effect.logLevel": "Warning" },
+          },
+        ],
+      }),
+    ]);
+
+    for (const text of [
+      diagnostics.latestFailures[0]?.cause ?? "",
+      diagnostics.commonFailures[0]?.cause ?? "",
+      diagnostics.latestWarningAndErrorLogs[0]?.message ?? "",
+    ]) {
+      assert.notInclude(text, "SECRET_PCT_KEY");
+      assert.notInclude(text, "SECRET_INNER_PLT");
+      assert.notInclude(text, "SECRET_INNER_CODE");
+      assert.notInclude(text, "SECRET_FULL_ENC");
+      assert.include(text, "%70lt=<redacted>");
+      assert.include(text, "%3Fplt%3D<redacted>");
+      assert.include(text, "%26code%3D<redacted>");
+    }
+  });
 });

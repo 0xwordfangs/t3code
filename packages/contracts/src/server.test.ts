@@ -229,6 +229,15 @@ describe("GoogleAccountVerificationUrl", () => {
       "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%3Ffollowup%3Dhttps%253A%252F%252Fattacker.invalid",
       "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%3Fq%3Dhttps%253A%252F%252Fattacker.invalid",
       "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2F%3Freturn_to%3D%2Fadmin",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Fplt%3Dnested-secret",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Fcode%3Dnested-code",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Ftoken%3Dnested-token",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Faccess_token%3Dnested-at",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Fid_token%3Dnested-id",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Frefresh_token%3Dnested-rt",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3FwsTicket%3Dnested-ticket",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3Fdpop%3Dnested-dpop",
+      "https://accounts.google.com/v3/signin/continue?plt=1&continue=https%3A%2F%2Fantigravity.google%2Fauth%3F%2570lt%3Dnested-pct-plt",
     ]) {
       expect(() => decode(invalidUrl)).toThrow();
     }
