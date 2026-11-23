@@ -2540,9 +2540,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         failureClass !== "usage_limit" &&
         failedRun?.providerInstanceId === originalModelSelection.instanceId;
       let modelSelection = originalModelSelection;
-      const queuedRunPinned = followsCurrentConversation(queuedMessage)
-        ? projection.thread.antigravityFailoverPinned === true
-        : storedQueuedRun.antigravityFailoverPinned === true;
+      const queuedRunPinned =
+        followsCurrentConversation(queuedMessage) ||
+        (storedQueuedRun.antigravityFailoverPinned === undefined &&
+          originalModelSelection.instanceId === projection.thread.providerInstanceId)
+          ? projection.thread.antigravityFailoverPinned === true
+          : storedQueuedRun.antigravityFailoverPinned === true;
       const queuedPreflightAllowed =
         !queuedRunPinned &&
         !worktreeMissing &&
@@ -7862,7 +7865,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const antigravityFailoverPinned =
       command.antigravityFailoverPinned ??
       (command.modelSelection === undefined ||
-      modelSelectionsEqual(baseSelection, command.modelSelection)
+      modelSelectionsEqual(baseSelection, command.modelSelection) ||
+      (command.restartContinuationOfRunId !== undefined &&
+        command.modelSelection.instanceId === baseSelection.instanceId)
         ? basePinned
         : false);
     const shouldPreflightAntigravity =
@@ -8079,6 +8084,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .map((candidate) => candidate.queuePosition ?? candidate.ordinal),
           ) + 1;
       }
+      const explicitQueuedUnpin =
+        command.antigravityFailoverPinned === false ||
+        (command.modelSelection !== undefined &&
+          !modelSelectionsEqual(baseSelection, command.modelSelection) &&
+          antigravityFailoverPinned !== true);
       const run: OrchestrationV2Run = {
         id: runId,
         threadId: command.threadId,
@@ -8125,7 +8135,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : { usageLimitContinuationOfRunId: command.usageLimitContinuationOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
         ...(freshContext ? { freshContext: true } : {}),
-        ...(antigravityFailoverPinned === true ? { antigravityFailoverPinned: true } : {}),
+        ...(antigravityFailoverPinned === true
+          ? { antigravityFailoverPinned: true }
+          : explicitQueuedUnpin
+            ? { antigravityFailoverPinned: false }
+            : {}),
       };
       const attempt: OrchestrationV2RunAttempt = {
         id: attemptId,
@@ -11954,13 +11968,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       },
     });
 
+    const promotedPin =
+      followsCurrentConversation(queuedMessage) ||
+      (queuedRun.antigravityFailoverPinned === undefined &&
+        modelSelection.instanceId === projection.thread.providerInstanceId)
+        ? projection.thread.antigravityFailoverPinned === true
+        : queuedRun.antigravityFailoverPinned === true;
+
     yield* dispatchSteerIntoRun({
       command,
       events,
       effects,
       projection,
       modelSelection,
-      antigravityFailoverPinned: queuedRun.antigravityFailoverPinned === true,
+      antigravityFailoverPinned: promotedPin,
       targetRunId: command.targetRunId,
       messageId: queuedMessage.id,
       text: queuedMessage.text,
@@ -16288,6 +16309,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const activeAntigravityFailoverAttempts = new Set<string>();
+  const selectedAntigravityFailoverAttempts = new Set<string>();
   const committingAntigravityFailoverAttempts = new Set<string>();
   const pendingAntigravityFailoverAttempts = new Map<string, number>();
   const antigravityFailoverWaiters = new Map<string, Set<Deferred.Deferred<void>>>();
@@ -16393,7 +16415,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return "settled";
       }
       const key = failoverAttemptKey(liveRun);
-      if (committingAntigravityFailoverAttempts.has(key)) {
+      if (
+        committingAntigravityFailoverAttempts.has(key) ||
+        selectedAntigravityFailoverAttempts.has(key)
+      ) {
         return "pending";
       }
       if (
@@ -16604,6 +16629,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return false;
         }
 
+        selectedAntigravityFailoverAttempts.add(attemptKey);
         const nextModelSelection = chosenDecision.modelSelection;
         const attemptOrdinal =
           Math.max(
@@ -17168,9 +17194,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         Effect.ensuring(
           Effect.sync(() => {
             activeAntigravityFailoverAttempts.delete(failedAttemptKey);
+            selectedAntigravityFailoverAttempts.delete(failedAttemptKey);
             committingAntigravityFailoverAttempts.delete(failedAttemptKey);
             if (attemptKey !== failedAttemptKey) {
               activeAntigravityFailoverAttempts.delete(attemptKey);
+              selectedAntigravityFailoverAttempts.delete(attemptKey);
               committingAntigravityFailoverAttempts.delete(attemptKey);
             }
           }),

@@ -13,6 +13,7 @@ import {
   RuntimeRequestId,
   ThreadId,
   type OrchestrationV2Command,
+  type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -1478,4 +1479,63 @@ it.effect("skips restart discovery when no project enables continuation", () =>
     yield* recovery.prepareForShutdown;
     yield* recovery.prepareForShutdown;
   }),
+);
+
+it.effect(
+  "R3-CF-17: forwards antigravityFailoverPinned on same-instance restart continuation without re-pinning unpinned threads",
+  () =>
+    Effect.gen(function* () {
+      const base = makeProjection();
+      const agy = ProviderInstanceId.make("antigravity");
+      const runWithPinState = (threadPinned: boolean | undefined) =>
+        Effect.gen(function* () {
+          const projection = {
+            ...base,
+            thread: {
+              ...base.thread,
+              providerInstanceId: agy,
+              modelSelection: { instanceId: agy, model: "claude-opus-5-5" },
+              ...(threadPinned === undefined ? {} : { antigravityFailoverPinned: threadPinned }),
+            },
+            runs: [
+              {
+                ...base.runs[0]!,
+                providerInstanceId: agy,
+                modelSelection: { instanceId: agy, model: "gemini-4-neon" },
+                status: "cancelled",
+              },
+            ],
+          } as unknown as OrchestrationV2ThreadProjection;
+          const commands: Array<OrchestrationV2ServerCommand> = [];
+          yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+            Effect.provide(
+              Layer.merge(
+                Layer.mock(ThreadManagementService.ThreadManagementService)({
+                  getThreadRecords: () => Effect.succeed(projection),
+                  recoverDelegatedTask: () => Effect.void,
+                  dispatch: (command) => {
+                    commands.push(command);
+                    return Effect.succeed({} as never);
+                  },
+                }),
+                ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+              ),
+            ),
+          );
+          assert.lengthOf(commands, 1);
+          const command = commands[0]!;
+          assert.equal(command.type, "message.dispatch");
+          return command.type === "message.dispatch" ? command : undefined;
+        });
+
+      const pinnedCommand = yield* runWithPinState(true);
+      assert.equal(pinnedCommand?.antigravityFailoverPinned, true);
+      assert.equal(pinnedCommand?.restartContinuationOfRunId, runId);
+
+      const unpinnedCommand = yield* runWithPinState(undefined);
+      assert.isUndefined(unpinnedCommand?.antigravityFailoverPinned);
+
+      const explicitlyUnpinnedCommand = yield* runWithPinState(false);
+      assert.isUndefined(explicitlyUnpinnedCommand?.antigravityFailoverPinned);
+    }),
 );

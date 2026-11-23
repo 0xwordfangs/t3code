@@ -324,6 +324,9 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         : note.settled
           ? noteText
           : `${noteText}\n\n${CONTINUE_PROMPT}`;
+    const preserveAntigravityPin =
+      projection.thread.antigravityFailoverPinned === true &&
+      source.modelSelection.instanceId === projection.thread.providerInstanceId;
     yield* threads
       .dispatch({
         type: "message.dispatch",
@@ -341,6 +344,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         },
         attachments: [],
         modelSelection: source.modelSelection,
+        ...(preserveAntigravityPin ? { antigravityFailoverPinned: true } : {}),
         dispatchMode: { type: "start_immediately" },
         createdBy: "agent",
         creationSource: "server",
