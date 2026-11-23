@@ -3625,3 +3625,354 @@ it.effect(
       ),
     ),
 );
+
+it.effect(
+  "requires providers:manage when an unheld queued /logout run is present on thread.runtime-mode.set, message.dispatch, promote-to-steer, and continuation",
+  () =>
+    Effect.gen(function* () {
+      const unheldLogoutThreadId = ThreadId.make("thread:unheld-logout");
+      const benignThreadId = ThreadId.make("thread:unheld-benign");
+      const brokenProjectionThreadId = ThreadId.make("thread:unheld-broken-projection");
+      const activeRunId = RunId.make("run:unheld-active");
+      const unheldLogoutRunId = RunId.make("run:unheld-logout-queued");
+      const benignQueuedRunId = RunId.make("run:unheld-benign-queued");
+      const activeMsgId = MessageId.make("msg:unheld-active");
+      const unheldLogoutMsgId = MessageId.make("msg:unheld-logout-queued");
+      const benignQueuedMsgId = MessageId.make("msg:unheld-benign-queued");
+      const instanceId = ProviderInstanceId.make("antigravity");
+      const alternateInstanceId = ProviderInstanceId.make("antigravity-2");
+      const at = DateTime.makeUnsafe("2026-11-23T00:00:00.000Z");
+
+      const makeRun = (
+        threadId: ThreadId,
+        id: RunId,
+        userMessageId: MessageId,
+        status: OrchestrationV2Run["status"],
+        ordinal: number,
+      ): OrchestrationV2Run => ({
+        id,
+        threadId,
+        ordinal,
+        providerInstanceId: instanceId,
+        modelSelection: { instanceId, model: "gemini-3-pro" },
+        providerThreadId: null,
+        userMessageId,
+        rootNodeId: null,
+        activeAttemptId: null,
+        status,
+        requestedAt: at,
+        startedAt: null,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+      });
+      const makeMessage = (
+        threadId: ThreadId,
+        id: MessageId,
+        runId: RunId,
+        text: string,
+      ): OrchestrationV2ConversationMessage => ({
+        id,
+        threadId,
+        runId,
+        nodeId: null,
+        role: "user",
+        text,
+        attachments: [],
+        streaming: false,
+        createdBy: "user",
+        creationSource: "web",
+        createdAt: at,
+        updatedAt: at,
+      });
+
+      const runsByThread = new Map<ThreadId, ReadonlyArray<OrchestrationV2Run>>([
+        [
+          unheldLogoutThreadId,
+          [
+            makeRun(unheldLogoutThreadId, activeRunId, activeMsgId, "failed", 1),
+            // Unheld queued /logout run (queueHeld omitted/undefined, as under usageLimitHoldsQueue or runtimeModeCeiling).
+            makeRun(unheldLogoutThreadId, unheldLogoutRunId, unheldLogoutMsgId, "queued", 2),
+          ],
+        ],
+        [
+          benignThreadId,
+          [makeRun(benignThreadId, benignQueuedRunId, benignQueuedMsgId, "queued", 1)],
+        ],
+      ]);
+      const messagesById = new Map<MessageId, OrchestrationV2ConversationMessage>([
+        [activeMsgId, makeMessage(unheldLogoutThreadId, activeMsgId, activeRunId, "setup")],
+        [
+          unheldLogoutMsgId,
+          makeMessage(unheldLogoutThreadId, unheldLogoutMsgId, unheldLogoutRunId, "/logout"),
+        ],
+        [
+          benignQueuedMsgId,
+          makeMessage(benignThreadId, benignQueuedMsgId, benignQueuedRunId, "normal prompt"),
+        ],
+      ]);
+
+      let dispatchedCount = 0;
+      let retriedCount = 0;
+
+      const services = Layer.mergeAll(
+        layerUnusedConfigRpcServices,
+        Layer.mock(AnalyticsService.AnalyticsService)({
+          record: () => Effect.void,
+        }),
+        Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+        Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+        Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),
+        Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+        Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+        Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
+          enqueueCommand: (effect) => effect,
+        }),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+          retryPreparation: () =>
+            Effect.sync(() => {
+              retriedCount += 1;
+              return { sequence: retriedCount, replayed: false } as never;
+            }),
+        }),
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          getThreadRecords: (threadId, _fields, filter) => {
+            if (threadId === brokenProjectionThreadId) {
+              return Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId,
+                  cause: new ProjectionStoreReadError({ threadId, cause: "SQLITE_BUSY" }),
+                }),
+              );
+            }
+            return Effect.sync(() => {
+              const allRuns = runsByThread.get(threadId) ?? [];
+              const filtered = allRuns.filter(
+                (run) =>
+                  (filter?.runIds === undefined || filter.runIds.includes(run.id)) &&
+                  (filter?.runStatuses === undefined || filter.runStatuses.includes(run.status)),
+              );
+              return { runs: filtered } as never;
+            });
+          },
+          getMessagesById: (_threadId, ids) =>
+            Effect.sync(() => {
+              const result = new Map<MessageId, OrchestrationV2ConversationMessage>();
+              for (const id of ids) {
+                const message = messagesById.get(id);
+                if (message !== undefined) result.set(id, message);
+              }
+              return result;
+            }),
+          dispatch: () =>
+            Effect.sync(() => {
+              dispatchedCount += 1;
+              return { sequence: dispatchedCount, replayed: false, storedEvents: [] } as never;
+            }),
+        }),
+        Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
+      );
+
+      const makeClient = (scopes: ReadonlyArray<AuthEnvironmentScope>, id: string) =>
+        Effect.gen(function* () {
+          const exits = yield* Queue.unbounded<Exit.Exit<unknown, unknown>>();
+          const server = yield* RpcServer.makeNoSerialization(WsRpcGroup, {
+            ...WS_RPC_SERVER_OPTIONS,
+            onFromServer: (response) =>
+              response._tag === "Exit" ? Queue.offer(exits, response.exit) : Effect.void,
+          }).pipe(
+            Effect.provide(
+              layerWsRpc(
+                {
+                  sessionId: AuthSessionId.make(`unheld-logout:${id}`),
+                  subject: id,
+                  method: "browser-session-cookie",
+                  scopes,
+                },
+                {},
+                yield* ServerBrowser.ServerBrowser,
+                () => Effect.void,
+                { secretReferences: true },
+              ).pipe(Layer.provide(services), Layer.merge(RpcAuthorization.layer(scopes))),
+            ),
+          );
+          let seq = 0;
+          return (payload: OrchestrationV2Command) =>
+            Effect.gen(function* () {
+              seq += 1;
+              yield* server.write(0, {
+                _tag: "Request",
+                id: RpcMessage.RequestId(`${id}:${seq}`),
+                tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+                payload,
+                headers: Headers.empty,
+              });
+              return yield* Queue.take(exits);
+            });
+        });
+
+      const operatorCall = yield* makeClient([AuthOrchestrationOperateScope], "operator");
+      const managerCall = yield* makeClient(
+        [AuthOrchestrationOperateScope, AuthProvidersManageScope],
+        "manager",
+      );
+
+      const bypassCommands: ReadonlyArray<OrchestrationV2Command> = [
+        // 1. thread.runtime-mode.set under managedPolicy.limits.maxRuntimeMode with unheld queued /logout.
+        {
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("cmd:unheld-runtime-mode"),
+          threadId: unheldLogoutThreadId,
+          runtimeMode: "approval-required",
+        },
+        // 2. Plain benign message.dispatch on an unheld queued /logout run.
+        {
+          type: "message.dispatch",
+          commandId: CommandId.make("cmd:unheld-plain-dispatch"),
+          threadId: unheldLogoutThreadId,
+          messageId: MessageId.make("msg:unheld-plain-dispatch"),
+          text: "benign hello",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "start_immediately" },
+        },
+        // 3. Benign message.dispatch with steerFollowUpOfRunId set on an unheld queued /logout run.
+        {
+          type: "message.dispatch",
+          commandId: CommandId.make("cmd:unheld-steer-followup"),
+          threadId: unheldLogoutThreadId,
+          messageId: MessageId.make("msg:unheld-steer-followup"),
+          text: "benign steer follow-up",
+          attachments: [],
+          steerFollowUpOfRunId: activeRunId,
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "start_immediately" },
+        },
+        // 4. Cross-provider benign message.dispatch while unheld queued /logout is waiting.
+        {
+          type: "message.dispatch",
+          commandId: CommandId.make("cmd:unheld-cross-provider"),
+          threadId: unheldLogoutThreadId,
+          messageId: MessageId.make("msg:unheld-cross-provider"),
+          text: "benign cross provider",
+          attachments: [],
+          modelSelection: { instanceId: alternateInstanceId, model: "gemini-3-pro" },
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "start_immediately" },
+        },
+        // Benign prepared-run.retry while unheld queued /logout is waiting.
+        {
+          type: "prepared-run.retry",
+          commandId: CommandId.make("cmd:unheld-retry-benign"),
+          threadId: unheldLogoutThreadId,
+          runId: activeRunId,
+        },
+        // queued-message.promote-to-steer targeting an unheld queued /logout run.
+        {
+          type: "queued-message.promote-to-steer",
+          commandId: CommandId.make("cmd:unheld-promote-logout"),
+          threadId: unheldLogoutThreadId,
+          queuedRunId: unheldLogoutRunId,
+          targetRunId: activeRunId,
+        },
+        // thread.metadata.update with continuation while unheld queued /logout is waiting.
+        {
+          type: "thread.metadata.update",
+          commandId: CommandId.make("cmd:unheld-metadata-continuation"),
+          threadId: unheldLogoutThreadId,
+          continuation: {
+            messageId: MessageId.make("msg:unheld-metadata-continuation"),
+            text: "benign continuation",
+          },
+        },
+      ];
+
+      for (const command of bypassCommands) {
+        const exit = yield* operatorCall(command);
+        assert.isTrue(Exit.isFailure(exit), `expected operator failure for ${command.type}`);
+        if (Exit.isFailure(exit)) {
+          assert.deepInclude(Cause.squash(exit.cause) as object, {
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthProvidersManageScope,
+          });
+        }
+      }
+
+      // Transient projection failures on newly guarded commands still fail closed.
+      const brokenRuntimeModeExit = yield* operatorCall({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("cmd:broken-runtime-mode"),
+        threadId: brokenProjectionThreadId,
+        runtimeMode: "approval-required",
+      });
+      assert.isTrue(Exit.isFailure(brokenRuntimeModeExit));
+      if (Exit.isFailure(brokenRuntimeModeExit)) {
+        assert.deepInclude(Cause.squash(brokenRuntimeModeExit.cause) as object, {
+          _tag: "OrchestrationV2DispatchCommandError",
+        });
+      }
+      assert.equal(dispatchedCount, 0);
+      assert.equal(retriedCount, 0);
+
+      // Pure metadata updates without continuation and benign-thread commands stay open to operators.
+      const allowedOperatorCommands: ReadonlyArray<OrchestrationV2Command> = [
+        {
+          type: "thread.metadata.update",
+          commandId: CommandId.make("cmd:unheld-rename-only"),
+          threadId: unheldLogoutThreadId,
+          title: "Renamed",
+        },
+        {
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("cmd:benign-runtime-mode"),
+          threadId: benignThreadId,
+          runtimeMode: "approval-required",
+        },
+        {
+          type: "message.dispatch",
+          commandId: CommandId.make("cmd:benign-steer-followup"),
+          threadId: benignThreadId,
+          messageId: MessageId.make("msg:benign-steer-followup"),
+          text: "benign",
+          attachments: [],
+          steerFollowUpOfRunId: benignQueuedRunId,
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "start_immediately" },
+        },
+        {
+          type: "queued-message.promote-to-steer",
+          commandId: CommandId.make("cmd:benign-promote"),
+          threadId: benignThreadId,
+          queuedRunId: benignQueuedRunId,
+          targetRunId: activeRunId,
+        },
+      ];
+      for (const command of allowedOperatorCommands) {
+        assert.isTrue(Exit.isSuccess(yield* operatorCall(command)));
+      }
+      assert.equal(dispatchedCount, 4);
+
+      // A providers:manage client can still dispatch every command explicitly.
+      for (const command of bypassCommands) {
+        assert.isTrue(Exit.isSuccess(yield* managerCall(command)));
+      }
+      assert.equal(retriedCount, 1);
+      assert.equal(dispatchedCount, 10);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+        ),
+      ),
+    ),
+);

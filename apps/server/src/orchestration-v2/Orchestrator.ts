@@ -1032,6 +1032,22 @@ function nextQueuedRun(
   return queuedRunsInDeliveryOrder(projection).find((run) => run.queueHeld !== true);
 }
 
+function isLogoutCommandMessage(
+  message: Pick<OrchestrationV2ConversationMessage, "text" | "attachments" | "context">,
+): boolean {
+  if (message.attachments.length > 0) return false;
+  if (message.text.trim().toLowerCase() === "/logout") return true;
+  if (message.context === undefined || message.context.records.length === 0) return false;
+  return (
+    projectComposerContextForProvider({
+      text: message.text,
+      records: message.context.records,
+    })
+      .trim()
+      .toLowerCase() === "/logout"
+  );
+}
+
 // Delegated completions, monitor notifications and unpinned scheduled deliveries never choose a
 // model, so a queued one runs on the thread's current pick rather than the one frozen at queue time.
 function followsCurrentConversation(
@@ -2462,6 +2478,45 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const queuedMessage = projection.messages.find(
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
+      // Queued /logout runs require an explicit user start/resume so indirect or reactive
+      // queue promotion cannot sign out a provider without explicit authorization.
+      // Mark the queue held so the UI exposes Resume and SQLite stops retrying auto-promotion.
+      if (
+        options?.userStarted !== true &&
+        queuedMessage !== undefined &&
+        isLogoutCommandMessage(queuedMessage)
+      ) {
+        const wakes = queuedRunsInDeliveryOrder(projection).filter((run) => {
+          const message = projection.messages.find(
+            (candidate) => candidate.id === run.userMessageId,
+          );
+          return (
+            run.queueHeld !== true &&
+            message !== undefined &&
+            isBufferedProviderNotification(message)
+          );
+        });
+        const runsToHold = projection.runs.filter(
+          (run) =>
+            run.status === "queued" &&
+            run.queueHeld !== true &&
+            !wakes.some((wake) => wake.id === run.id),
+        );
+        if (runsToHold.length > 0) {
+          const now = yield* DateTime.now;
+          yield* writeSystemEvents(
+            runsToHold.map((run) => ({
+              type: "run.updated" as const,
+              threadId,
+              runId: run.id,
+              providerInstanceId: run.providerInstanceId,
+              occurredAt: now,
+              payload: { ...run, queueHeld: true },
+            })),
+          );
+        }
+        return wakes.length > 0;
+      }
       const originalModelSelection = queuedRunModelSelection(projection, storedQueuedRun);
       // Failed worktree creation would run queued work in the project checkout; wait for the user.
       const failedRun = latestExecutedRun(projection.runs);
@@ -2496,6 +2551,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         storedQueuedRun.restartContinuationOfRunId === undefined &&
         (queuedMessage === undefined ||
           (!isNativeMaintenanceCommand(queuedMessage) &&
+            !isLogoutCommandMessage(queuedMessage) &&
             !isBufferedProviderNotification(queuedMessage)));
       if (queuedPreflightAllowed) {
         const currentSessions = projection.providerSessions.filter(
@@ -6123,7 +6179,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     >,
     message: Pick<OrchestrationV2ConversationMessage, "text" | "attachments" | "context">,
   ) {
-    if (isNativeMaintenanceCommand(message)) {
+    if (isNativeMaintenanceCommand(message) || isLogoutCommandMessage(message)) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
@@ -11729,6 +11785,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         commandId: command.commandId,
         commandType: command.type,
         cause: "Automatic completion deliveries cannot be promoted to Steer.",
+      });
+    }
+    if (isLogoutCommandMessage(queuedMessage)) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause:
+          "Signing out must run as a separate turn. Queue it or wait for the active turn to finish.",
       });
     }
 

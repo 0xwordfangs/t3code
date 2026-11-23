@@ -356,4 +356,67 @@ it.layer(layerWithCeiling)("runtime mode ceiling", (it) => {
       assert.notEqual(started?.status, "queued");
     }),
   );
+
+  it.effect(
+    "does not auto-promote a queued /logout run when lowering the mode under the ceiling until explicitly resumed",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make("thread:ceiling-queue-logout");
+        yield* createThread(threadId);
+        yield* orchestrator.dispatch(sendMessage(threadId, "running-logout"));
+        yield* orchestrator.dispatch({
+          ...sendMessage(threadId, "queued-logout"),
+          text: "/logout",
+          dispatchMode: { type: "queue_after_active" },
+        });
+        const { thread, runs } = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+        const [running, waitingLogout] = runs;
+        const occurredAt = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("event:ceiling-queue-logout:raise"),
+              type: "thread.runtime-mode-updated",
+              threadId,
+              occurredAt,
+              payload: { ...thread, runtimeMode: "full-access" },
+            },
+            {
+              id: EventId.make("event:ceiling-queue-logout:complete"),
+              type: "run.updated",
+              threadId,
+              runId: running!.id,
+              providerInstanceId: running!.providerInstanceId,
+              occurredAt,
+              payload: { ...running!, status: "completed", completedAt: occurredAt },
+            },
+          ],
+        });
+
+        // Lowering the mode must NOT indirectly promote the queued /logout run.
+        yield* orchestrator.dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("lower:ceiling-queue-logout"),
+          threadId,
+          runtimeMode: "approval-required",
+        });
+        const afterLower = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+          (run) => run.id === waitingLogout!.id,
+        );
+        assert.equal(afterLower?.status, "queued");
+
+        // An explicit queue.resume (authorized for providers:manage at the WS layer) starts it.
+        yield* orchestrator.dispatch({
+          type: "queue.resume",
+          commandId: CommandId.make("resume:ceiling-queue-logout"),
+          threadId,
+        });
+        const afterResume = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+          (run) => run.id === waitingLogout!.id,
+        );
+        assert.equal(afterResume?.status, "starting");
+      }),
+  );
 });

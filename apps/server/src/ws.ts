@@ -1650,56 +1650,34 @@ export const layerWsRpc = (
           if (canManageProviders) return;
           if (
             command.type !== "message.dispatch" &&
+            command.type !== "thread.runtime-mode.set" &&
             command.type !== "prepared-run.retry" &&
             command.type !== "prepared-run.release" &&
             command.type !== "queued-run.start" &&
-            command.type !== "queue.resume"
+            command.type !== "queue.resume" &&
+            command.type !== "queued-message.promote-to-steer" &&
+            !(command.type === "thread.metadata.update" && command.continuation !== undefined)
           ) {
             return;
           }
-          if (command.type === "message.dispatch" && command.steerFollowUpOfRunId !== undefined) {
-            return;
-          }
           const runs = yield* Effect.gen(function* () {
-            if (command.type === "message.dispatch") {
-              return (yield* threadManagement.getThreadRecords(command.threadId, ["runs"], {
-                runStatuses: ["queued"],
-              })).runs.filter((run) => run.queueHeld === true);
-            }
-            if (command.type === "prepared-run.release") {
-              return (yield* threadManagement.getThreadRecords(command.threadId, ["runs"], {
-                runIds: [command.runId],
-              })).runs;
-            }
-            if (command.type === "prepared-run.retry") {
-              const targeted = (yield* threadManagement.getThreadRecords(
-                command.threadId,
-                ["runs"],
-                {
-                  runIds: [command.runId],
-                },
-              )).runs;
-              const heldQueued = (yield* threadManagement.getThreadRecords(
-                command.threadId,
-                ["runs"],
-                {
-                  runStatuses: ["queued"],
-                },
-              )).runs.filter((run) => run.queueHeld === true);
-              return [...targeted, ...heldQueued];
-            }
             const queued = (yield* threadManagement.getThreadRecords(command.threadId, ["runs"], {
               runStatuses: ["queued"],
             })).runs;
-            if (
-              command.type === "queued-run.start" &&
-              !queued.some((run) => run.id === command.runId)
-            ) {
+            const targetedRunId =
+              command.type === "prepared-run.release" ||
+              command.type === "prepared-run.retry" ||
+              command.type === "queued-run.start"
+                ? command.runId
+                : command.type === "queued-message.promote-to-steer"
+                  ? command.queuedRunId
+                  : undefined;
+            if (targetedRunId !== undefined && !queued.some((run) => run.id === targetedRunId)) {
               const targeted = (yield* threadManagement.getThreadRecords(
                 command.threadId,
                 ["runs"],
                 {
-                  runIds: [command.runId],
+                  runIds: [targetedRunId],
                 },
               )).runs;
               return [...queued, ...targeted];

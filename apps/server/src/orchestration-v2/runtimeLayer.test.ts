@@ -12285,6 +12285,328 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     }),
   );
 
+  it.effect(
+    "does not auto-promote an unheld queued /logout run via message.dispatch, steerFollowUpOfRunId, or reactive cross-provider completion",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const alternateSelection = {
+          instanceId: alternateInstanceId,
+          model: "gpt-5.5",
+        } satisfies ModelSelection;
+
+        const seedLimitedQueuedLogout = (slug: string, resetAt: string | null) =>
+          Effect.gen(function* () {
+            const threadId = ThreadId.make(`logout-no-autopromote:${slug}`);
+            const projectId = ProjectId.make(`logout-no-autopromote:project:${slug}`);
+            const now = yield* DateTime.now;
+            yield* seedProject({
+              projectId,
+              title: `Logout no-autopromote ${slug}`,
+              workspaceRoot: process.cwd(),
+              defaultModelSelection: modelSelection,
+              createdAt: DateTime.formatIso(now),
+            });
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make(`${threadId}:create`),
+              threadId,
+              projectId,
+              title: "Logout queue thread",
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              createdBy: "user",
+              creationSource: "web",
+            });
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`${threadId}:active`),
+              threadId,
+              messageId: MessageId.make(`${threadId}:msg-active`),
+              text: "Run 1",
+              attachments: [],
+              modelSelection,
+              dispatchMode: { type: "start_immediately" },
+              createdBy: "user",
+              creationSource: "web",
+            });
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`${threadId}:logout`),
+              threadId,
+              messageId: MessageId.make(`${threadId}:msg-logout`),
+              text: "/logout",
+              attachments: [],
+              modelSelection,
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "user",
+              creationSource: "web",
+            });
+            const before = yield* orchestrator.getThreadProjection(threadId);
+            const activeRun = before.runs.find((run) => run.status === "starting")!;
+            const logoutRun = before.runs.find((run) => run.status === "queued")!;
+            assert.isDefined(activeRun);
+            assert.isDefined(logoutRun);
+            assert.isNotNull(activeRun.rootNodeId);
+
+            // Fail Run 1 with usage_limit so usageLimitHoldsQueue pauses /logout without queueHeld: true.
+            yield* eventSink.write({
+              events: [
+                {
+                  id: EventId.make(`${threadId}:limit-error`),
+                  type: "turn-item.updated",
+                  threadId,
+                  runId: activeRun.id,
+                  nodeId: activeRun.rootNodeId,
+                  providerInstanceId: activeRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: {
+                    id: TurnItemId.make(`${threadId}:limit-error`),
+                    type: "error",
+                    threadId,
+                    runId: activeRun.id,
+                    nodeId: activeRun.rootNodeId,
+                    providerThreadId: activeRun.providerThreadId,
+                    providerTurnId: null,
+                    nativeItemRef: null,
+                    parentItemId: null,
+                    ordinal: 2,
+                    status: "failed",
+                    title: "Usage limit",
+                    startedAt: now,
+                    completedAt: now,
+                    updatedAt: now,
+                    failure: {
+                      class: "usage_limit",
+                      message: "Usage limit reached.",
+                      code: "usage_limit",
+                      retryable: null,
+                      resetAt,
+                    },
+                  },
+                },
+                {
+                  id: EventId.make(`${threadId}:limit-failed`),
+                  type: "run.updated",
+                  threadId,
+                  runId: activeRun.id,
+                  nodeId: activeRun.rootNodeId,
+                  providerInstanceId: activeRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: { ...activeRun, status: "failed", completedAt: now },
+                },
+              ],
+            });
+            return { threadId, activeRun, logoutRun };
+          });
+
+        // Bypass paths 2 & 3: elapsed resetAt + plain message.dispatch / steerFollowUpOfRunId.
+        const initialNow = yield* DateTime.now;
+        const futureResetAt = DateTime.formatIso(DateTime.add(initialNow, { minutes: 5 }));
+        const elapsed = yield* seedLimitedQueuedLogout("elapsed-reset", futureResetAt);
+        // Complete a second-provider run before resetAt, then advance past resetAt.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${elapsed.threadId}:alt-before-reset`),
+          threadId: elapsed.threadId,
+          messageId: MessageId.make(`${elapsed.threadId}:msg-alt-before-reset`),
+          text: "alternate provider turn",
+          attachments: [],
+          modelSelection: alternateSelection,
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const altBefore = (yield* orchestrator.getThreadProjection(elapsed.threadId)).runs.find(
+          (run) => run.providerInstanceId === alternateInstanceId,
+        )!;
+        const altCompletedAt = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`${elapsed.threadId}:alt-completed`),
+              type: "run.updated",
+              threadId: elapsed.threadId,
+              runId: altBefore.id,
+              providerInstanceId: altBefore.providerInstanceId,
+              occurredAt: altCompletedAt,
+              payload: { ...altBefore, status: "completed", completedAt: altCompletedAt },
+            },
+          ],
+        });
+        yield* TestClock.adjust("10 minutes");
+
+        // Path 3: steerFollowUpOfRunId dispatch must not promote /logout.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${elapsed.threadId}:steer-followup`),
+          threadId: elapsed.threadId,
+          messageId: MessageId.make(`${elapsed.threadId}:msg-steer-followup`),
+          text: "benign steer followup",
+          attachments: [],
+          steerFollowUpOfRunId: elapsed.activeRun.id,
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(elapsed.threadId)).runs.find(
+            (run) => run.id === elapsed.logoutRun.id,
+          )?.status,
+          "queued",
+        );
+
+        // Path 2: plain benign message.dispatch after elapsed resetAt must not promote /logout.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${elapsed.threadId}:plain-after-reset`),
+          threadId: elapsed.threadId,
+          messageId: MessageId.make(`${elapsed.threadId}:msg-plain-after-reset`),
+          text: "benign hello",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(elapsed.threadId)).runs.find(
+            (run) => run.id === elapsed.logoutRun.id,
+          )?.status,
+          "queued",
+        );
+
+        // Path 4: cross-provider run completes with resetAt: null, flipping usageLimitHoldsQueue to false.
+        const reactive = yield* seedLimitedQueuedLogout("reactive-cross-provider", null);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${reactive.threadId}:cross-provider`),
+          threadId: reactive.threadId,
+          messageId: MessageId.make(`${reactive.threadId}:msg-cross-provider`),
+          text: "benign cross provider",
+          attachments: [],
+          modelSelection: alternateSelection,
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const crossRun = (yield* orchestrator.getThreadProjection(reactive.threadId)).runs.find(
+          (run) => run.providerInstanceId === alternateInstanceId,
+        )!;
+        assert.isDefined(crossRun);
+        const reactiveDoneAt = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`${reactive.threadId}:cross-completed`),
+              type: "run.updated",
+              threadId: reactive.threadId,
+              runId: crossRun.id,
+              providerInstanceId: crossRun.providerInstanceId,
+              occurredAt: reactiveDoneAt,
+              payload: { ...crossRun, status: "completed", completedAt: reactiveDoneAt },
+            },
+          ],
+        });
+        // Give the reactive handleRunUpdate fiber time to process the terminal run.updated event.
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("1 second");
+        yield* Effect.yieldNow;
+        const heldLogoutRun = (yield* orchestrator.getThreadProjection(
+          reactive.threadId,
+        )).runs.find((run) => run.id === reactive.logoutRun.id);
+        assert.equal(heldLogoutRun?.status, "queued");
+        assert.equal(heldLogoutRun?.queueHeld, true);
+
+        // Authorized explicit queue.resume still works for the held /logout run.
+        yield* orchestrator.dispatch({
+          type: "queue.resume",
+          commandId: CommandId.make(`${reactive.threadId}:explicit-resume`),
+          threadId: reactive.threadId,
+        });
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(reactive.threadId)).runs.find(
+            (run) => run.id === reactive.logoutRun.id,
+          )?.status,
+          "starting",
+        );
+
+        // queued-message.promote-to-steer must reject queued /logout even when target is /compact.
+        const compactThreadId = ThreadId.make("logout-no-autopromote:compact-target");
+        const compactProjectId = ProjectId.make("logout-no-autopromote:project:compact-target");
+        const compactNow = yield* DateTime.now;
+        yield* seedProject({
+          projectId: compactProjectId,
+          title: "Compact target logout project",
+          workspaceRoot: process.cwd(),
+          defaultModelSelection: modelSelection,
+          createdAt: DateTime.formatIso(compactNow),
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`${compactThreadId}:create`),
+          threadId: compactThreadId,
+          projectId: compactProjectId,
+          title: "Compact target thread",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${compactThreadId}:compact`),
+          threadId: compactThreadId,
+          messageId: MessageId.make(`${compactThreadId}:msg-compact`),
+          text: "/compact",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${compactThreadId}:logout`),
+          threadId: compactThreadId,
+          messageId: MessageId.make(`${compactThreadId}:msg-logout`),
+          text: "/logout",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const compactProjection = yield* orchestrator.getThreadProjection(compactThreadId);
+        const compactRun = compactProjection.runs.find((run) => run.status === "starting")!;
+        const queuedLogoutOnCompact = compactProjection.runs.find(
+          (run) => run.status === "queued",
+        )!;
+        const promoteError = yield* orchestrator
+          .dispatch({
+            type: "queued-message.promote-to-steer",
+            commandId: CommandId.make(`${compactThreadId}:promote-logout`),
+            threadId: compactThreadId,
+            queuedRunId: queuedLogoutOnCompact.id,
+            targetRunId: compactRun.id,
+          })
+          .pipe(Effect.flip);
+        assert.equal(promoteError._tag, "OrchestratorDispatchError");
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(compactThreadId)).runs.find(
+            (run) => run.id === queuedLogoutOnCompact.id,
+          )?.status,
+          "queued",
+        );
+      }),
+  );
+
   it.effect.each([
     "resume",
     "resume-started",
