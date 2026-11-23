@@ -27,15 +27,18 @@ import {
   type AntigravityAuthConfig,
   type AntigravityProfile,
   antigravityLoginResponse,
+  antigravityTextGenerationProfileDirectory,
   buildAntigravityAcpSpawnInput,
   isAntigravitySignInRequiredError,
   makeAntigravityStderrHandler,
   makeAntigravityStdoutTransform,
   parseAntigravityAuthorizationUrl,
   prepareAntigravityProfile,
+  prepareAntigravityTextGenerationProfile,
   readAntigravityStoredEmail,
   resolveAntigravityInstanceDirectories,
 } from "./antigravityAuthSupport.ts";
+import { removeAntigravitySessionFiles } from "./acp/AntigravitySessionFiles.ts";
 
 const authorizationUrl =
   "https://accounts.google.com/o/oauth2/v2/auth?response_type=code" +
@@ -762,6 +765,302 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
           ),
         ).toBe(false);
         expect(yield* fs.exists(path.join(profilePlugins, "profile-only"))).toBe(true);
+      }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "omits and cleans up managed plugin links when linkUserPlugins is false without deleting real content",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(temporaryDirectory, "home");
+        const profileDirectory = path.join(temporaryDirectory, "profile");
+        const userSkills = path.join(userHome, ".gemini", "config", "skills");
+        const userPlugins = path.join(userHome, ".gemini", "config", "plugins");
+        const profilePlugins = path.join(profileDirectory, "config", "plugins");
+        const hasLink = (link: string) =>
+          fs.readLink(link).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          );
+
+        yield* fs.makeDirectory(path.join(userSkills, "review"), { recursive: true });
+        yield* fs.makeDirectory(path.join(userPlugins, "rtk"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(userPlugins, "rtk", "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"rtk"}]}}',
+        );
+
+        // Fresh profile with linkUserPlugins: false still links skills but omits config/plugins.
+        yield* prepareAntigravityProfile({
+          profileDirectory,
+          userHome,
+          linkUserPlugins: false,
+        });
+        expect(yield* fs.readLink(path.join(profileDirectory, "config", "skills"))).toBe(
+          userSkills,
+        );
+        expect(yield* hasLink(profilePlugins)).toBe(false);
+        expect(yield* fs.exists(profilePlugins)).toBe(false);
+
+        // Pre-existing whole-dir symlink is removed when linkUserPlugins: false.
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* fs.readLink(profilePlugins)).toBe(userPlugins);
+        yield* prepareAntigravityProfile({
+          profileDirectory,
+          userHome,
+          linkUserPlugins: false,
+        });
+        expect(yield* hasLink(profilePlugins)).toBe(false);
+        expect(yield* fs.exists(profilePlugins)).toBe(false);
+
+        // Pre-existing T3-managed per-plugin symlink directory is cleaned up and rmdired.
+        yield* fs.makeDirectory(path.join(userPlugins, "disabled-plugin"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(userHome, ".gemini", "config", "config.json"),
+          JSON.stringify({ plugins: { "disabled-plugin": { enabled: false } } }),
+        );
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* fs.readLink(path.join(profilePlugins, "rtk"))).toBe(
+          path.join(userPlugins, "rtk"),
+        );
+        yield* prepareAntigravityProfile({
+          profileDirectory,
+          userHome,
+          linkUserPlugins: false,
+        });
+        expect(yield* fs.exists(profilePlugins)).toBe(false);
+
+        // Real user content and custom external symlinks inside config/plugins are preserved while managed symlinks are removed.
+        const customExternal = path.join(temporaryDirectory, "custom-external-plugin");
+        yield* fs.makeDirectory(customExternal, { recursive: true });
+        yield* fs.makeDirectory(path.join(profilePlugins, "profile-only"), { recursive: true });
+        yield* fs.symlink(customExternal, path.join(profilePlugins, "custom-link"));
+        yield* fs.symlink(path.join(userPlugins, "rtk"), path.join(profilePlugins, "rtk"));
+        yield* prepareAntigravityProfile({
+          profileDirectory,
+          userHome,
+          linkUserPlugins: false,
+        });
+        expect(yield* fs.exists(path.join(profilePlugins, "profile-only"))).toBe(true);
+        expect(yield* fs.readLink(path.join(profilePlugins, "custom-link"))).toBe(customExternal);
+        expect(yield* hasLink(path.join(profilePlugins, "rtk"))).toBe(false);
+
+        // Even when profilePlugins contains only a custom external symlink, it is preserved.
+        yield* fs.remove(path.join(profilePlugins, "profile-only"), { recursive: true });
+        yield* fs.symlink(path.join(userPlugins, "rtk"), path.join(profilePlugins, "rtk"));
+        yield* prepareAntigravityProfile({
+          profileDirectory,
+          userHome,
+          linkUserPlugins: false,
+        });
+        expect(yield* fs.readLink(path.join(profilePlugins, "custom-link"))).toBe(customExternal);
+        expect(yield* hasLink(path.join(profilePlugins, "rtk"))).toBe(false);
+      }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "honors config.json disabled plugins and fails closed on invalid config.json",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(temporaryDirectory, "home");
+        const profileDirectory = path.join(temporaryDirectory, "profile");
+        const userConfigDir = path.join(userHome, ".gemini", "config");
+        const userConfigPath = path.join(userConfigDir, "config.json");
+        const userPlugins = path.join(userConfigDir, "plugins");
+        const profilePlugins = path.join(profileDirectory, "config", "plugins");
+        const hasLink = (link: string) =>
+          fs.readLink(link).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          );
+
+        yield* fs.makeDirectory(path.join(userPlugins, "enabled-a"), { recursive: true });
+        yield* fs.makeDirectory(path.join(userPlugins, "enabled-b"), { recursive: true });
+        yield* fs.makeDirectory(path.join(userPlugins, "disabled-c"), { recursive: true });
+        yield* fs.writeFileString(path.join(userPlugins, "README.md"), "stray non-directory file");
+
+        // Start with a whole-dir symlink when config.json is absent.
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* fs.readLink(profilePlugins)).toBe(userPlugins);
+
+        // Disabling a plugin migrates from whole-dir symlink to per-plugin directory symlinks (skipping regular files).
+        yield* fs.writeFileString(
+          userConfigPath,
+          JSON.stringify({
+            plugins: {
+              "disabled-c": { enabled: false },
+              "enabled-a": { enabled: true },
+            },
+          }),
+        );
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* hasLink(profilePlugins)).toBe(false);
+        expect((yield* fs.stat(profilePlugins)).type).toBe("Directory");
+        if ((yield* HostProcess.Platform) !== "win32") {
+          expect((yield* fs.stat(profilePlugins)).mode & 0o777).toBe(0o700);
+        }
+        expect(yield* fs.readLink(path.join(profilePlugins, "enabled-a"))).toBe(
+          path.join(userPlugins, "enabled-a"),
+        );
+        expect(yield* fs.readLink(path.join(profilePlugins, "enabled-b"))).toBe(
+          path.join(userPlugins, "enabled-b"),
+        );
+        expect(yield* fs.exists(path.join(profilePlugins, "disabled-c"))).toBe(false);
+        expect(yield* fs.exists(path.join(profilePlugins, "README.md"))).toBe(false);
+        expect(yield* hasLink(path.join(profilePlugins, "README.md"))).toBe(false);
+
+        // Disabling another plugin or deleting one removes stale managed symlinks without touching real dirs or external symlinks.
+        const customExternal = path.join(temporaryDirectory, "custom-external-plugin");
+        yield* fs.makeDirectory(customExternal, { recursive: true });
+        yield* fs.makeDirectory(path.join(profilePlugins, "local-dir"), { recursive: true });
+        yield* fs.symlink(customExternal, path.join(profilePlugins, "custom-link"));
+        yield* fs.writeFileString(
+          userConfigPath,
+          JSON.stringify({
+            plugins: {
+              "disabled-c": { enabled: false },
+              "enabled-b": { enabled: false },
+            },
+          }),
+        );
+        yield* fs.remove(path.join(userPlugins, "enabled-a"), { recursive: true });
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* hasLink(path.join(profilePlugins, "enabled-a"))).toBe(false);
+        expect(yield* hasLink(path.join(profilePlugins, "enabled-b"))).toBe(false);
+        expect(yield* fs.exists(path.join(profilePlugins, "local-dir"))).toBe(true);
+        expect(yield* fs.readLink(path.join(profilePlugins, "custom-link"))).toBe(customExternal);
+
+        // Removing the real dir and custom symlink then re-enabling all plugins migrates back to a whole-dir symlink.
+        yield* fs.remove(path.join(profilePlugins, "local-dir"), { recursive: true });
+        yield* fs.remove(path.join(profilePlugins, "custom-link"));
+        yield* fs.makeDirectory(path.join(userPlugins, "enabled-a"), { recursive: true });
+        yield* fs.writeFileString(
+          userConfigPath,
+          JSON.stringify({ plugins: { "enabled-a": { enabled: true } } }),
+        );
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* fs.readLink(profilePlugins)).toBe(userPlugins);
+
+        // Malformed, non-object, invalid plugins field, and oversized config.json fail closed.
+        for (const invalidConfig of [
+          "{not valid json",
+          "[]",
+          "null",
+          '"string"',
+          JSON.stringify({ plugins: [] }),
+          JSON.stringify({ plugins: null }),
+          `{"padding":"${"a".repeat(256 * 1024 + 1)}"}`,
+        ]) {
+          // Re-establish symlink first to verify fail-closed removes it each time.
+          yield* fs.remove(userConfigPath, { force: true });
+          yield* prepareAntigravityProfile({ profileDirectory, userHome });
+          expect(yield* fs.readLink(profilePlugins)).toBe(userPlugins);
+
+          yield* fs.writeFileString(userConfigPath, invalidConfig);
+          yield* prepareAntigravityProfile({ profileDirectory, userHome });
+          expect(yield* hasLink(profilePlugins)).toBe(false);
+          expect(yield* fs.exists(profilePlugins)).toBe(false);
+        }
+      }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "prepares a plugin-free text-generation sibling profile sharing antigravity-acp",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(temporaryDirectory, "home");
+        const profileDirectory = path.join(temporaryDirectory, "profile");
+        const expectedTextGen = antigravityTextGenerationProfileDirectory(path, profileDirectory);
+
+        yield* fs.makeDirectory(path.join(userHome, ".gemini", "config", "plugins", "rtk"), {
+          recursive: true,
+        });
+        yield* fs.writeFileString(
+          path.join(userHome, ".gemini", "config", "plugins", "rtk", "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"rtk"}]}}',
+        );
+
+        const results = yield* Effect.all(
+          Array.from({ length: 4 }, () =>
+            prepareAntigravityTextGenerationProfile({ profileDirectory }),
+          ),
+          { concurrency: "unbounded" },
+        );
+        expect(results).toEqual([
+          expectedTextGen,
+          expectedTextGen,
+          expectedTextGen,
+          expectedTextGen,
+        ]);
+        const textGenProfile = results[0]!;
+        expect(yield* fs.readLink(path.join(textGenProfile, "antigravity-acp"))).toBe(
+          path.join(profileDirectory, "antigravity-acp"),
+        );
+
+        // Concurrent calls also cleanly repoint a stale antigravity-acp symlink without EEXIST/ENOENT races.
+        yield* fs.remove(path.join(textGenProfile, "antigravity-acp"));
+        yield* fs.symlink(
+          path.join(temporaryDirectory, "stale-acp-target"),
+          path.join(textGenProfile, "antigravity-acp"),
+        );
+        const repointed = yield* Effect.all(
+          Array.from({ length: 4 }, () =>
+            prepareAntigravityTextGenerationProfile({ profileDirectory }),
+          ),
+          { concurrency: "unbounded" },
+        );
+        expect(repointed).toEqual([
+          expectedTextGen,
+          expectedTextGen,
+          expectedTextGen,
+          expectedTextGen,
+        ]);
+        expect(yield* fs.readLink(path.join(textGenProfile, "antigravity-acp"))).toBe(
+          path.join(profileDirectory, "antigravity-acp"),
+        );
+
+        yield* fs.writeFileString(
+          path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token"),
+          '{"id_token_email":"owner@example.com"}',
+        );
+        const prepared = yield* prepareAntigravityProfile({
+          profileDirectory: textGenProfile,
+          userHome,
+          linkUserPlugins: false,
+        });
+        expect(prepared.geminiHome).toBe(textGenProfile);
+        expect(yield* readAntigravityStoredEmail(textGenProfile)).toBe("owner@example.com");
+        expect(yield* fs.exists(path.join(textGenProfile, "config", "plugins"))).toBe(false);
+
+        // Session file cleanup traverses the shared antigravity-acp symlink cleanly.
+        const sessionId = "047c62f6-607b-44db-bfbe-f83b67e9e8b1";
+        const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+        const brain = path.join(profileDirectory, "antigravity-acp", "brain", sessionId);
+        yield* fs.makeDirectory(conversations, { recursive: true });
+        yield* fs.makeDirectory(brain, { recursive: true });
+        yield* fs.writeFileString(path.join(conversations, `${sessionId}.db`), "db");
+        yield* fs.writeFileString(
+          path.join(conversations, `${sessionId}.meta`),
+          JSON.stringify({ cwd: "/tmp/helper-cwd" }),
+        );
+        yield* fs.writeFileString(path.join(brain, "artifact.txt"), "data");
+        yield* removeAntigravitySessionFiles({
+          profileDirectory: textGenProfile,
+          sessionId,
+          cwd: "/tmp/helper-cwd",
+        });
+        expect(yield* fs.exists(path.join(conversations, `${sessionId}.db`))).toBe(false);
+        expect(yield* fs.exists(path.join(conversations, `${sessionId}.meta`))).toBe(false);
+        expect(yield* fs.exists(brain)).toBe(false);
       }),
   );
 

@@ -480,6 +480,7 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
           baseEnv: environment,
           // A shallow scoped profile cleans up unpacked files within Windows' path limit.
           tempDirectory: profileDirectory,
+          linkUserPlugins: false,
         });
         const runtime = yield* makeAntigravityAcpRuntime({
           runtimeVersion: expectedVersion,

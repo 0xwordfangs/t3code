@@ -28,6 +28,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as AntigravityInstallation from "../AntigravityInstallation.ts";
 import {
   ANTIGRAVITY_AUTH_STDOUT_PREFIX,
+  antigravityTextGenerationProfileDirectory,
   resolveAntigravityInstanceDirectories,
 } from "../antigravityAuthSupport.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -1006,6 +1007,138 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           .readDirectory(h.directories.runtimeTemp)
           .pipe(Effect.orElseSucceed(() => []));
         expect(tempEntries.filter((entry) => entry.startsWith("login-profile-"))).toEqual([]);
+        yield* h.assertClosed;
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "keeps user plugins out of codeLogin staging profiles and isolates text generation into a plugin-free sibling profile",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const fakeHome = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-plugins-home-" });
+        const rtkDir = path.join(fakeHome, ".gemini", "config", "plugins", "rtk");
+        yield* fs.makeDirectory(rtkDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(rtkDir, "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"rtk"}]}}',
+        );
+
+        const h = yield* makeHarness({
+          config: { authMethod: "oauth-personal" },
+          environment: [{ name: "HOME", value: fakeHome }],
+        });
+
+        // 1. codeLogin staging profile must not link ~/.gemini/config/plugins during --login or verification.
+        const cliDir = path.join(path.dirname(h.first.executablePath), "no-plugins-cli");
+        const cliExecutable = path.join(cliDir, "agy");
+        const pluginChecksLog = path.join(cliDir, "plugin-checks.log");
+        const loginUrl =
+          "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=no-plugins-state";
+        yield* fs.makeDirectory(cliDir, { recursive: true });
+        yield* fs.writeFileString(
+          cliExecutable,
+          [
+            "#!/bin/sh",
+            'plugins_state="absent"',
+            'if [ -e "$GEMINI_HOME/config/plugins" ] || [ -L "$GEMINI_HOME/config/plugins" ]; then plugins_state="present"; fi',
+            'case " $* " in',
+            '  *" --login "*)',
+            `    printf 'login:%s\\n' "$plugins_state" >> ${shellQuote(pluginChecksLog)}`,
+            `    printf '%s\\n' ${shellQuote(loginUrl)}`,
+            "    IFS= read -r code",
+            `    mkdir -p "$GEMINI_HOME/antigravity-acp"`,
+            `    printf '{"id_token_email":"isolated@example.com"}' > "$GEMINI_HOME/antigravity-acp/antigravity-oauth-token"`,
+            "    exit 0",
+            "    ;;",
+            "esac",
+            `printf 'verify:%s\\n' "$plugins_state" >> ${shellQuote(pluginChecksLog)}`,
+            `exec ${shellQuote(h.first.executablePath)} "$@"`,
+            "",
+          ].join("\n"),
+        );
+        yield* fs.chmod(cliExecutable, 0o755);
+        h.controls.selected = {
+          executablePath: cliExecutable,
+          harnessPath: null,
+          source: "path",
+          version: "1.5.13",
+          managedVersionDirectory: null,
+        };
+
+        const auth = h.instance.auth;
+        if (!auth?.respond) return yield* Effect.die("Antigravity auth respond is missing.");
+        const owner = "no-plugins-owner";
+        const startedFlow = yield* auth.start(owner);
+        yield* auth.subscribe(owner).pipe(
+          Stream.filter((state) => state.phase === "waiting"),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+        yield* auth.respond(owner, {
+          instanceId: h.instance.instanceId,
+          flowId: startedFlow.flowId!,
+          interactionId: startedFlow.flowId!,
+          response: { type: "credentials", values: { code: "4/0Ab-no-plugins-code" } },
+        });
+        yield* auth.subscribe(owner).pipe(
+          Stream.filter((state) => state.phase === "succeeded"),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+        expect((yield* fs.readFileString(pluginChecksLog)).trim().split("\n")).toEqual([
+          "login:absent",
+          "verify:absent",
+        ]);
+
+        // 2. Even with ~/.gemini/config/plugins/rtk/hooks.json active, supportsTextGeneration stays true
+        // and text generation runs on `<profile>-textgen` (sharing antigravity-acp, without config/plugins).
+        h.controls.selected = h.first;
+        yield* h.refresh();
+        const readySnapshot = yield* h.instance.snapshot.getSnapshot;
+        expect(readySnapshot.supportsTextGeneration).toBe(true);
+        expect(yield* fs.readLink(path.join(h.profileDirectory, "config", "plugins"))).toBe(
+          path.join(fakeHome, ".gemini", "config", "plugins"),
+        );
+
+        const textGenProfile = antigravityTextGenerationProfileDirectory(path, h.profileDirectory);
+        const launchesBeforeTextGen = h.launches.length;
+        yield* h.instance.textGeneration
+          .generateThreadTitle({
+            cwd: h.profileDirectory,
+            message: "Name this thread",
+            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
+          })
+          .pipe(Effect.ignore);
+        const textGenLaunch = h.launches
+          .slice(launchesBeforeTextGen)
+          .find((launch) => launch.harnessPath !== undefined);
+        expect(textGenLaunch?.profileDirectory).toBe(textGenProfile);
+        expect(yield* fs.readLink(path.join(textGenProfile, "antigravity-acp"))).toBe(
+          path.join(h.profileDirectory, "antigravity-acp"),
+        );
+        expect(yield* fs.exists(path.join(textGenProfile, "config", "plugins"))).toBe(false);
+        expect(
+          yield* fs.readLink(path.join(textGenProfile, "config", "plugins")).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          ),
+        ).toBe(false);
+
+        // 3. Sign-in failure during text generation still notifies provider.onAuthRequired.
+        h.controls.selected = h.signedOut;
+        const authError = yield* h.instance.textGeneration
+          .generateThreadTitle({
+            cwd: h.profileDirectory,
+            message: "Name this thread",
+            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
+          })
+          .pipe(Effect.flip);
+        expect(authError.detail).toContain("Sign in to Antigravity");
+        const unauthenticatedSnapshot = yield* h.instance.snapshot.getSnapshot;
+        expect(unauthenticatedSnapshot.auth.status).toBe("unauthenticated");
+        expect(unauthenticatedSnapshot.models).toEqual([]);
         yield* h.assertClosed;
       }),
   );

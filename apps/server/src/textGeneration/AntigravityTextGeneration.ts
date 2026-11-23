@@ -64,38 +64,117 @@ export interface AntigravityTextGenerationOptions {
   ) => Effect.Effect<A, E | ProviderSetupError, R | Scope.Scope>;
 }
 
+const isConfigurationFileEmptyOrAbsent = Effect.fn(
+  "AntigravityTextGeneration.isConfigurationFileEmptyOrAbsent",
+)(function* (directory: string, name: "hooks.json" | "mcp_config.json") {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const configurationPath = path.join(directory, name);
+  const statResult = yield* fs.stat(configurationPath).pipe(
+    Effect.map((info) => ({ _tag: "Found" as const, info })),
+    Effect.catchReason("PlatformError", "NotFound", () =>
+      Effect.succeed({ _tag: "NotFound" as const }),
+    ),
+    Effect.orElseSucceed(() => ({ _tag: "Error" as const })),
+  );
+  if (statResult._tag === "NotFound") {
+    const isDanglingLink = yield* fs.readLink(configurationPath).pipe(
+      Effect.as(true),
+      Effect.orElseSucceed(() => false),
+    );
+    return !isDanglingLink;
+  }
+  if (
+    statResult._tag === "Error" ||
+    statResult.info.type !== "File" ||
+    statResult.info.size > 64_000n
+  ) {
+    return false;
+  }
+  // CLI 1.5.8 writes a 0-byte mcp_config.json before any server exists.
+  return yield* fs.readFileString(configurationPath).pipe(
+    Effect.flatMap((text) =>
+      text.trim().length === 0
+        ? Effect.succeed(true)
+        : decodeConfiguration(text).pipe(
+            Effect.flatMap((configuration) => {
+              const keys = Object.keys(configuration);
+              if (keys.length === 0) {
+                return Effect.succeed(true);
+              }
+              const wrapperKey = name === "hooks.json" ? "hooks" : "mcpServers";
+              if (keys.length === 1 && keys[0] === wrapperKey) {
+                return decodeConfigurationObject(configuration[wrapperKey]).pipe(
+                  Effect.map((wrapped) => Object.keys(wrapped).length === 0),
+                );
+              }
+              return Effect.succeed(false);
+            }),
+          ),
+    ),
+    Effect.orElseSucceed(() => false),
+  );
+});
+
 /** Global hooks and MCP servers can run before a helper can deny a tool request. */
 export const isAntigravityTextGenerationAvailable = Effect.fn(
   "isAntigravityTextGenerationAvailable",
 )(function* (profileDirectory: string) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  for (const name of ["hooks.json", "mcp_config.json"]) {
-    const configurationPath = path.join(profileDirectory, "config", name);
-    if (!(yield* fs.exists(configurationPath))) {
-      continue;
-    }
-    const info = yield* fs.stat(configurationPath);
-    if (info.type !== "File" || info.size > 64_000n) {
+  const configDirectory = path.join(profileDirectory, "config");
+  for (const name of ["hooks.json", "mcp_config.json"] as const) {
+    if (!(yield* isConfigurationFileEmptyOrAbsent(configDirectory, name))) {
       return false;
     }
-    // CLI 1.5.8 writes a 0-byte mcp_config.json before any server exists.
-    const empty = yield* fs.readFileString(configurationPath).pipe(
-      Effect.flatMap((text) =>
-        text.trim().length === 0
-          ? Effect.succeed(true)
-          : decodeConfiguration(text).pipe(
-              Effect.flatMap((configuration) =>
-                decodeConfigurationObject(
-                  configuration[name === "hooks.json" ? "hooks" : "mcpServers"] ?? configuration,
-                ),
-              ),
-              Effect.map((configuration) => Object.keys(configuration).length === 0),
-            ),
-      ),
+  }
+  const pluginsDirectory = path.join(configDirectory, "plugins");
+  const pluginsStat = yield* fs.stat(pluginsDirectory).pipe(
+    Effect.map((info) => ({ _tag: "Found" as const, info })),
+    Effect.catchReason("PlatformError", "NotFound", () =>
+      Effect.succeed({ _tag: "NotFound" as const }),
+    ),
+    Effect.orElseSucceed(() => ({ _tag: "Error" as const })),
+  );
+  if (pluginsStat._tag === "NotFound") {
+    const isDanglingLink = yield* fs.readLink(pluginsDirectory).pipe(
+      Effect.as(true),
       Effect.orElseSucceed(() => false),
     );
-    if (!empty) return false;
+    return !isDanglingLink;
+  }
+  if (pluginsStat._tag === "Error" || pluginsStat.info.type !== "Directory") {
+    return false;
+  }
+  for (const name of ["hooks.json", "mcp_config.json"] as const) {
+    if (!(yield* isConfigurationFileEmptyOrAbsent(pluginsDirectory, name))) {
+      return false;
+    }
+  }
+  const pluginEntries = yield* fs.readDirectory(pluginsDirectory).pipe(
+    Effect.asSome,
+    Effect.orElseSucceed(() => Option.none<ReadonlyArray<string>>()),
+  );
+  if (Option.isNone(pluginEntries)) {
+    return false;
+  }
+  for (const entry of pluginEntries.value) {
+    const entryPath = path.join(pluginsDirectory, entry);
+    const entryInfo = yield* fs.stat(entryPath).pipe(
+      Effect.asSome,
+      Effect.orElseSucceed(() => Option.none<FileSystem.File.Info>()),
+    );
+    if (Option.isNone(entryInfo)) {
+      return false;
+    }
+    if (entryInfo.value.type !== "Directory") {
+      continue;
+    }
+    for (const name of ["hooks.json", "mcp_config.json"] as const) {
+      if (!(yield* isConfigurationFileEmptyOrAbsent(entryPath, name))) {
+        return false;
+      }
+    }
   }
   return true;
 });

@@ -8,9 +8,11 @@ import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -255,6 +257,11 @@ function antigravityEnvironment(
   };
 }
 
+const MAX_ANTIGRAVITY_USER_CONFIG_BYTES = 256 * 1024;
+const UserConfigObject = Schema.Record(Schema.String, Schema.Unknown);
+const decodeUserConfigJson = Schema.decodeEffect(Schema.fromJsonString(UserConfigObject));
+const decodeUserConfigObject = Schema.decodeUnknownEffect(UserConfigObject);
+
 class AntigravitySkillLinkError extends Schema.TaggedError<AntigravitySkillLinkError>()(
   "AntigravitySkillLinkError",
   { link: Schema.String, cause: Schema.Defect() },
@@ -264,11 +271,537 @@ class AntigravitySkillLinkError extends Schema.TaggedError<AntigravitySkillLinkE
   }
 }
 
-/** Private GEMINI_HOME isolates credentials/MCP; link global skills and plugins from the real ~/.gemini. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isValidPluginEntryName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name !== "." &&
+    name !== ".." &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes("\0")
+  );
+}
+
+const textGenerationProfileSemaphore = Semaphore.makeUnsafe(1);
+const userPluginsSyncSemaphore = Semaphore.makeUnsafe(1);
+
+function sameNormalizedPath(a: string, b: string, platform: NodeJS.Platform): boolean {
+  return platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function isNodeErrorCode(cause: unknown, code: string): boolean {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    (cause as { readonly code?: unknown }).code === code
+  );
+}
+
+function isPathInsideDirectory(
+  path: Path.Path,
+  candidate: string,
+  directory: string,
+  platform: NodeJS.Platform,
+): boolean {
+  const normalizedCandidate = platform === "win32" ? candidate.toLowerCase() : candidate;
+  const normalizedDirectory = platform === "win32" ? directory.toLowerCase() : directory;
+  const relative = path.relative(normalizedDirectory, normalizedCandidate);
+  return (
+    relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  );
+}
+
+const ensurePrivateDirectory = Effect.fn("ensurePrivateDirectory")(function* (
+  directory: string,
+  platform: NodeJS.Platform,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const existing = yield* fs.stat(directory).pipe(Effect.option);
+  if (!(Option.isSome(existing) && existing.value.type === "Directory")) {
+    yield* fs
+      .makeDirectory(directory, { recursive: true, mode: 0o700 })
+      .pipe(
+        Effect.mapError(() =>
+          authSupportError("The Antigravity profile directory could not be created."),
+        ),
+      );
+  }
+  if (platform !== "win32") {
+    yield* fs
+      .chmod(directory, 0o700)
+      .pipe(
+        Effect.mapError(() =>
+          authSupportError("The Antigravity profile directory permissions could not be set."),
+        ),
+      );
+  }
+});
+
+/** Sibling profile for text generation so interactive plugins stay out while `antigravity-acp` is shared. */
+export function antigravityTextGenerationProfileDirectory(
+  path: Path.Path,
+  profileDirectory: string,
+): string {
+  return `${path.resolve(profileDirectory)}-textgen`;
+}
+
+/**
+ * Prepares the plugin-free sibling profile (`<profile>-textgen`) by sharing only `antigravity-acp`
+ * (credentials, settings, and disposable session files) with the main profile.
+ */
+export const prepareAntigravityTextGenerationProfile = Effect.fn(
+  "prepareAntigravityTextGenerationProfile",
+)(function* (input: {
+  readonly profileDirectory: string;
+  readonly platform?: NodeJS.Platform;
+}): Effect.fn.Return<string, AcpErrors.AcpError, FileSystem.FileSystem | Path.Path> {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const platform = input.platform ?? (yield* HostProcess.Platform);
+  const sourceProfile = path.resolve(input.profileDirectory);
+  const sourceAcpDirectory = path.join(sourceProfile, "antigravity-acp");
+  const textGenerationProfile = antigravityTextGenerationProfileDirectory(path, sourceProfile);
+  const targetAcpLink = path.join(textGenerationProfile, "antigravity-acp");
+
+  return yield* textGenerationProfileSemaphore.withPermits(1)(
+    Effect.gen(function* () {
+      for (const directory of [sourceProfile, sourceAcpDirectory, textGenerationProfile]) {
+        yield* ensurePrivateDirectory(directory, platform);
+      }
+
+      const linkFailure = () =>
+        authSupportError(
+          "The Antigravity text-generation profile could not link its credentials directory.",
+        );
+      const readResolvedTargetLink = () =>
+        fs.readLink(targetAcpLink).pipe(
+          Effect.map((value) => Option.some(path.resolve(path.dirname(targetAcpLink), value))),
+          Effect.catchReason("PlatformError", "NotFound", () =>
+            Effect.succeed(Option.none<string>()),
+          ),
+        );
+      const existingLink = yield* readResolvedTargetLink().pipe(
+        Effect.catch(() =>
+          Effect.tryPromise({
+            try: () => NodeFSP.rmdir(targetAcpLink),
+            catch: (cause) => new AntigravitySkillLinkError({ link: targetAcpLink, cause }),
+          }).pipe(
+            Effect.catch((error) =>
+              isNodeErrorCode(error.cause, "ENOENT") ? Effect.void : Effect.fail(linkFailure()),
+            ),
+            Effect.as(Option.none<string>()),
+          ),
+        ),
+      );
+      if (
+        Option.isSome(existingLink) &&
+        sameNormalizedPath(existingLink.value, sourceAcpDirectory, platform)
+      ) {
+        return textGenerationProfile;
+      }
+      if (Option.isSome(existingLink)) {
+        yield* fs.remove(targetAcpLink, { force: true }).pipe(Effect.mapError(linkFailure));
+      }
+      yield* Effect.tryPromise({
+        try: () =>
+          NodeFSP.symlink(
+            sourceAcpDirectory,
+            targetAcpLink,
+            platform === "win32" ? "junction" : "dir",
+          ),
+        catch: (cause) => new AntigravitySkillLinkError({ link: targetAcpLink, cause }),
+      }).pipe(
+        Effect.catch((error) =>
+          isNodeErrorCode(error.cause, "EEXIST")
+            ? readResolvedTargetLink().pipe(
+                Effect.mapError(linkFailure),
+                Effect.flatMap((racedLink) =>
+                  Option.isSome(racedLink) &&
+                  sameNormalizedPath(racedLink.value, sourceAcpDirectory, platform)
+                    ? Effect.void
+                    : Effect.fail(linkFailure()),
+                ),
+              )
+            : Effect.fail(linkFailure()),
+        ),
+      );
+      return textGenerationProfile;
+    }),
+  );
+});
+
+const readDisabledAntigravityPlugins = Effect.fn("readDisabledAntigravityPlugins")(function* (
+  userGeminiHome: string,
+): Effect.fn.Return<Option.Option<ReadonlySet<string>>, never, FileSystem.FileSystem | Path.Path> {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const configPath = path.join(userGeminiHome, "config", "config.json");
+  const warnAndFailClosed = (details: Record<string, unknown>) =>
+    Effect.logWarning(
+      "Antigravity user config.json could not be parsed; skipping user plugin linking.",
+      { configPath, ...details },
+    ).pipe(Effect.as(Option.none<ReadonlySet<string>>()));
+
+  const statResult = yield* fs.stat(configPath).pipe(
+    Effect.map((info) => ({ _tag: "Found" as const, info })),
+    Effect.catchReason("PlatformError", "NotFound", () =>
+      Effect.succeed({ _tag: "NotFound" as const }),
+    ),
+    Effect.catch((error) => Effect.succeed({ _tag: "Error" as const, error })),
+  );
+  if (statResult._tag === "NotFound") {
+    const isDanglingLink = yield* fs.readLink(configPath).pipe(
+      Effect.as(true),
+      Effect.orElseSucceed(() => false),
+    );
+    if (isDanglingLink) {
+      return yield* warnAndFailClosed({ reason: "dangling-symlink" });
+    }
+    return Option.some(new Set<string>());
+  }
+  if (statResult._tag === "Error") {
+    return yield* warnAndFailClosed({ error: statResult.error });
+  }
+  if (
+    statResult.info.type !== "File" ||
+    statResult.info.size > BigInt(MAX_ANTIGRAVITY_USER_CONFIG_BYTES)
+  ) {
+    return yield* warnAndFailClosed({
+      type: statResult.info.type,
+      size: Number(statResult.info.size),
+    });
+  }
+  const contents = yield* fs.readFileString(configPath).pipe(
+    Effect.asSome,
+    Effect.catch((error) =>
+      Effect.logWarning(
+        "Antigravity user config.json could not be read; skipping user plugin linking.",
+        { configPath, error },
+      ).pipe(Effect.as(Option.none<string>())),
+    ),
+  );
+  if (Option.isNone(contents)) return Option.none();
+  const parsed = yield* decodeUserConfigJson(contents.value).pipe(
+    Effect.asSome,
+    Effect.catch((error) =>
+      Effect.logWarning("Antigravity user config.json is invalid; skipping user plugin linking.", {
+        configPath,
+        error,
+      }).pipe(Effect.as(Option.none<Record<string, unknown>>())),
+    ),
+  );
+  if (Option.isNone(parsed) || !isPlainRecord(parsed.value)) {
+    return Option.none();
+  }
+  const rawPlugins = parsed.value.plugins;
+  if (rawPlugins === undefined) {
+    return Option.some(new Set<string>());
+  }
+  const plugins = yield* decodeUserConfigObject(rawPlugins).pipe(
+    Effect.asSome,
+    Effect.catch((error) =>
+      Effect.logWarning(
+        "Antigravity user config.json plugins field is invalid; skipping user plugin linking.",
+        { configPath, error },
+      ).pipe(Effect.as(Option.none<Record<string, unknown>>())),
+    ),
+  );
+  if (Option.isNone(plugins) || !isPlainRecord(plugins.value)) {
+    return Option.none();
+  }
+  const disabled = new Set<string>();
+  for (const [name, entry] of Object.entries(plugins.value)) {
+    if (isPlainRecord(entry) && entry.enabled === false) {
+      disabled.add(name);
+    }
+  }
+  return Option.some(disabled);
+});
+
+const cleanupAntigravityManagedPlugins = Effect.fn("cleanupAntigravityManagedPlugins")(
+  function* (input: {
+    readonly profilePlugins: string;
+    readonly userPlugins: string;
+    readonly platform: NodeJS.Platform;
+  }): Effect.fn.Return<
+    boolean,
+    AntigravitySkillLinkError | PlatformError.PlatformError,
+    FileSystem.FileSystem | Path.Path
+  > {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const { profilePlugins, userPlugins, platform } = input;
+    const isWholeLink = yield* fs.readLink(profilePlugins).pipe(
+      Effect.as(true),
+      Effect.orElseSucceed(() => false),
+    );
+    if (isWholeLink) {
+      yield* fs.remove(profilePlugins, { force: true });
+      return true;
+    }
+    const info = yield* fs.stat(profilePlugins).pipe(
+      Effect.asSome,
+      Effect.catchReason("PlatformError", "NotFound", () => Effect.succeedNone),
+    );
+    if (Option.isNone(info)) return true;
+    if (info.value.type !== "Directory") return false;
+    const resolvedUserPlugins = path.resolve(userPlugins);
+    const entries = yield* fs.readDirectory(profilePlugins);
+    const managedLinks: Array<string> = [];
+    let hasUnmanagedEntry = false;
+    for (const entry of entries) {
+      const entryPath = path.join(profilePlugins, entry);
+      const linked = yield* fs.readLink(entryPath).pipe(
+        Effect.map((value) => Option.some(path.resolve(path.dirname(entryPath), value))),
+        Effect.orElseSucceed(() => Option.none<string>()),
+      );
+      if (
+        Option.isSome(linked) &&
+        isPathInsideDirectory(path, linked.value, resolvedUserPlugins, platform)
+      ) {
+        managedLinks.push(entryPath);
+      } else {
+        hasUnmanagedEntry = true;
+      }
+    }
+    for (const entryPath of managedLinks) {
+      yield* fs.remove(entryPath, { force: true });
+    }
+    if (hasUnmanagedEntry) {
+      return false;
+    }
+    return yield* Effect.tryPromise({
+      try: () => NodeFSP.rmdir(profilePlugins),
+      catch: (cause) => new AntigravitySkillLinkError({ link: profilePlugins, cause }),
+    }).pipe(
+      Effect.as(true),
+      Effect.catch((error) =>
+        isNodeErrorCode(error.cause, "ENOENT")
+          ? Effect.succeed(true)
+          : isNodeErrorCode(error.cause, "ENOTEMPTY")
+            ? Effect.succeed(false)
+            : Effect.fail(error),
+      ),
+    );
+  },
+);
+
+const syncAntigravityUserPlugins = Effect.fn("syncAntigravityUserPlugins")(function* (input: {
+  readonly profileDirectory: string;
+  readonly userGeminiHome: string;
+  readonly platform: NodeJS.Platform;
+  readonly linkUserPlugins: boolean;
+}): Effect.fn.Return<void, never, FileSystem.FileSystem | Path.Path> {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const profilePlugins = path.join(input.profileDirectory, "config", "plugins");
+  const userPlugins = path.join(input.userGeminiHome, "config", "plugins");
+
+  yield* userPluginsSyncSemaphore
+    .withPermits(1)(
+      Effect.gen(function* () {
+        const resolvedUserPlugins = path.resolve(userPlugins);
+        if (sameNormalizedPath(path.resolve(profilePlugins), resolvedUserPlugins, input.platform)) {
+          return;
+        }
+        if (!input.linkUserPlugins) {
+          yield* cleanupAntigravityManagedPlugins({
+            profilePlugins,
+            userPlugins,
+            platform: input.platform,
+          });
+          return;
+        }
+        const disabledPlugins = yield* readDisabledAntigravityPlugins(input.userGeminiHome);
+        if (Option.isNone(disabledPlugins)) {
+          yield* cleanupAntigravityManagedPlugins({
+            profilePlugins,
+            userPlugins,
+            platform: input.platform,
+          });
+          return;
+        }
+        const userPluginsInfo = yield* fs.stat(userPlugins).pipe(
+          Effect.asSome,
+          Effect.catchReason("PlatformError", "NotFound", () => Effect.succeedNone),
+        );
+        if (Option.isNone(userPluginsInfo) || userPluginsInfo.value.type !== "Directory") {
+          yield* cleanupAntigravityManagedPlugins({
+            profilePlugins,
+            userPlugins,
+            platform: input.platform,
+          });
+          return;
+        }
+        if (disabledPlugins.value.size === 0) {
+          const existingLink = yield* fs.readLink(profilePlugins).pipe(
+            Effect.map((value) => Option.some(path.resolve(path.dirname(profilePlugins), value))),
+            Effect.orElseSucceed(() => Option.none<string>()),
+          );
+          if (
+            Option.isSome(existingLink) &&
+            sameNormalizedPath(existingLink.value, resolvedUserPlugins, input.platform)
+          ) {
+            return;
+          }
+          const cleared = yield* cleanupAntigravityManagedPlugins({
+            profilePlugins,
+            userPlugins,
+            platform: input.platform,
+          });
+          if (!cleared) return;
+          yield* fs.makeDirectory(path.dirname(profilePlugins), { recursive: true });
+          yield* Effect.tryPromise({
+            try: () =>
+              NodeFSP.symlink(
+                userPlugins,
+                profilePlugins,
+                input.platform === "win32" ? "junction" : "dir",
+              ),
+            catch: (cause) => new AntigravitySkillLinkError({ link: profilePlugins, cause }),
+          }).pipe(
+            Effect.catchIf(
+              (error) => isNodeErrorCode(error.cause, "EEXIST"),
+              (error) =>
+                fs.readLink(profilePlugins).pipe(
+                  Effect.map((value) =>
+                    sameNormalizedPath(
+                      path.resolve(path.dirname(profilePlugins), value),
+                      resolvedUserPlugins,
+                      input.platform,
+                    ),
+                  ),
+                  Effect.orElseSucceed(() => false),
+                  Effect.flatMap((matches) => (matches ? Effect.void : Effect.fail(error))),
+                ),
+            ),
+          );
+          return;
+        }
+
+        const isWholeLink = yield* fs.readLink(profilePlugins).pipe(
+          Effect.as(true),
+          Effect.orElseSucceed(() => false),
+        );
+        if (isWholeLink) {
+          yield* fs.remove(profilePlugins, { force: true });
+        }
+        const existingProfilePlugins = yield* fs.stat(profilePlugins).pipe(
+          Effect.asSome,
+          Effect.catchReason("PlatformError", "NotFound", () => Effect.succeedNone),
+        );
+        if (
+          Option.isSome(existingProfilePlugins) &&
+          existingProfilePlugins.value.type !== "Directory"
+        ) {
+          return;
+        }
+        if (Option.isNone(existingProfilePlugins)) {
+          yield* fs.makeDirectory(profilePlugins, { recursive: true, mode: 0o700 });
+        }
+        if (input.platform !== "win32") {
+          yield* fs.chmod(profilePlugins, 0o700);
+        }
+
+        const enabledTargets = new Map<string, string>();
+        for (const name of yield* fs.readDirectory(userPlugins)) {
+          if (!isValidPluginEntryName(name) || disabledPlugins.value.has(name)) continue;
+          const target = path.join(userPlugins, name);
+          const entryInfo = yield* fs.stat(target).pipe(Effect.option);
+          if (Option.isNone(entryInfo) || entryInfo.value.type !== "Directory") continue;
+          enabledTargets.set(name, path.resolve(target));
+        }
+
+        for (const entry of yield* fs.readDirectory(profilePlugins)) {
+          const entryPath = path.join(profilePlugins, entry);
+          const linked = yield* fs.readLink(entryPath).pipe(
+            Effect.map((value) => Option.some(path.resolve(path.dirname(entryPath), value))),
+            Effect.orElseSucceed(() => Option.none<string>()),
+          );
+          if (
+            Option.isNone(linked) ||
+            !isPathInsideDirectory(path, linked.value, resolvedUserPlugins, input.platform)
+          ) {
+            continue;
+          }
+          const expected = enabledTargets.get(entry);
+          if (!expected || !sameNormalizedPath(linked.value, expected, input.platform)) {
+            yield* fs.remove(entryPath, { force: true });
+          }
+        }
+
+        for (const [name, target] of enabledTargets) {
+          const entryPath = path.join(profilePlugins, name);
+          const existingLink = yield* fs.readLink(entryPath).pipe(
+            Effect.map((value) => Option.some(path.resolve(path.dirname(entryPath), value))),
+            Effect.orElseSucceed(() => Option.none<string>()),
+          );
+          if (
+            Option.isSome(existingLink) &&
+            sameNormalizedPath(existingLink.value, target, input.platform)
+          ) {
+            continue;
+          }
+          const existingStat = yield* fs.stat(entryPath).pipe(Effect.option);
+          if (Option.isSome(existingStat)) continue;
+          yield* Effect.tryPromise({
+            try: () =>
+              NodeFSP.symlink(target, entryPath, input.platform === "win32" ? "junction" : "dir"),
+            catch: (cause) => new AntigravitySkillLinkError({ link: entryPath, cause }),
+          }).pipe(
+            Effect.catch((error) =>
+              isNodeErrorCode(error.cause, "EEXIST")
+                ? fs.readLink(entryPath).pipe(
+                    Effect.map((value) =>
+                      sameNormalizedPath(
+                        path.resolve(path.dirname(entryPath), value),
+                        target,
+                        input.platform,
+                      ),
+                    ),
+                    Effect.orElseSucceed(() => false),
+                    Effect.flatMap((matches) =>
+                      matches
+                        ? Effect.void
+                        : Effect.logWarning(
+                            "Antigravity user plugin is not linked into the profile.",
+                            { link: entryPath, target, error },
+                          ),
+                    ),
+                  )
+                : Effect.logWarning("Antigravity user plugin is not linked into the profile.", {
+                    link: entryPath,
+                    target,
+                    error,
+                  }),
+            ),
+          );
+        }
+      }),
+    )
+    .pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Antigravity user plugins are not linked into the profile.", {
+          link: profilePlugins,
+          target: userPlugins,
+          error,
+        }),
+      ),
+    );
+});
+
+/** Private GEMINI_HOME isolates credentials/MCP; link global skills and optional enabled plugins from ~/.gemini. */
 const linkAntigravityUserSkills = Effect.fn("linkAntigravityUserSkills")(function* (input: {
   readonly profileDirectory: string;
   readonly userHome: string;
   readonly platform: NodeJS.Platform;
+  readonly linkUserPlugins?: boolean;
 }): Effect.fn.Return<void, never, FileSystem.FileSystem | Path.Path> {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -278,10 +811,6 @@ const linkAntigravityUserSkills = Effect.fn("linkAntigravityUserSkills")(functio
   for (const [link, target] of [
     [links[0], targets[0]],
     [links[1], targets[1]],
-    [
-      path.join(input.profileDirectory, "config", "plugins"),
-      path.join(userGeminiHome, "config", "plugins"),
-    ],
   ] as const) {
     yield* Effect.gen(function* () {
       if (path.resolve(link) === path.resolve(target)) return;
@@ -328,6 +857,12 @@ const linkAntigravityUserSkills = Effect.fn("linkAntigravityUserSkills")(functio
       ),
     );
   }
+  yield* syncAntigravityUserPlugins({
+    profileDirectory: input.profileDirectory,
+    userGeminiHome,
+    platform: input.platform,
+    linkUserPlugins: input.linkUserPlugins ?? true,
+  });
 });
 
 export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(function* (input: {
@@ -338,6 +873,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   readonly auth?: AntigravityAuthConfig;
   readonly userHome?: string;
   readonly tempDirectory?: string;
+  readonly linkUserPlugins?: boolean;
 }) {
   const auth = input.auth ?? ANTIGRAVITY_PERSONAL_AUTH;
   const fs = yield* FileSystem.FileSystem;
@@ -452,22 +988,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   );
 
   for (const directory of [geminiHome, acpDirectory, tempDirectory]) {
-    yield* fs
-      .makeDirectory(directory, { recursive: true, mode: 0o700 })
-      .pipe(
-        Effect.mapError(() =>
-          authSupportError("The Antigravity profile directory could not be created."),
-        ),
-      );
-    if (platform !== "win32") {
-      yield* fs
-        .chmod(directory, 0o700)
-        .pipe(
-          Effect.mapError(() =>
-            authSupportError("The Antigravity profile directory permissions could not be set."),
-          ),
-        );
-    }
+    yield* ensurePrivateDirectory(directory, platform);
   }
   yield* fs
     .writeFileString(path.join(acpDirectory, "settings.json"), antigravityProfileSettings(auth))
@@ -476,7 +997,12 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
         authSupportError("The Antigravity profile settings could not be written."),
       ),
     );
-  yield* linkAntigravityUserSkills({ profileDirectory: geminiHome, userHome, platform });
+  yield* linkAntigravityUserSkills({
+    profileDirectory: geminiHome,
+    userHome,
+    platform,
+    ...(input.linkUserPlugins === undefined ? {} : { linkUserPlugins: input.linkUserPlugins }),
+  });
   return profile;
 });
 

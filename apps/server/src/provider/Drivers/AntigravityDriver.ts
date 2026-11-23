@@ -41,9 +41,11 @@ import {
   antigravityAuthConfigIssue,
   antigravityAuthLabel,
   antigravityAuthUsesBrowser,
+  antigravityTextGenerationProfileDirectory,
   buildAntigravityAcpSpawnInput,
   isAntigravitySignInRequiredError,
   prepareAntigravityProfile,
+  prepareAntigravityTextGenerationProfile,
   readAntigravityStoredEmail,
   resolveAntigravityInstanceDirectories,
   type AntigravityAuthConfig,
@@ -180,6 +182,10 @@ export const AntigravityDriver: ProviderDriver<
       ),
     );
     const profileDirectory = directories.profile;
+    const textGenerationProfileDirectory = antigravityTextGenerationProfileDirectory(
+      path,
+      profileDirectory,
+    );
     for (const directory of [
       directories.runtimeTemp,
       path.join(profileDirectory, "antigravity-acp", "tmp"),
@@ -209,7 +215,10 @@ export const AntigravityDriver: ProviderDriver<
     const prepareSpawn = Effect.fn("AntigravityDriver.prepareSpawn")(function* (
       cwd: string,
       baseEnv: NodeJS.ProcessEnv,
-      spawnOptions?: { readonly profileDirectoryOverride?: string },
+      spawnOptions?: {
+        readonly profileDirectoryOverride?: string;
+        readonly linkUserPlugins?: boolean;
+      },
     ): Effect.fn.Return<
       {
         readonly executable: AntigravityInstallation.AntigravityExecutable;
@@ -242,6 +251,9 @@ export const AntigravityDriver: ProviderDriver<
         auth,
         userHome,
         tempDirectory: directories.runtimeTemp,
+        ...(spawnOptions?.linkUserPlugins === undefined
+          ? {}
+          : { linkUserPlugins: spawnOptions.linkUserPlugins }),
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
@@ -295,7 +307,11 @@ export const AntigravityDriver: ProviderDriver<
     });
 
     const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
-      input: AntigravityAdapterV2RuntimeInput & { readonly profileDirectoryOverride?: string },
+      input: AntigravityAdapterV2RuntimeInput & {
+        readonly profileDirectoryOverride?: string;
+        readonly linkUserPlugins?: boolean;
+        readonly notifyAuthRequiredOnStartError?: boolean;
+      },
     ): Effect.fn.Return<
       AcpSessionRuntime.AcpSessionRuntime["Service"],
       AcpErrors.AcpError | ProviderSetupError,
@@ -306,6 +322,8 @@ export const AntigravityDriver: ProviderDriver<
       const {
         processEnvironment: threadEnvironment,
         profileDirectoryOverride,
+        linkUserPlugins,
+        notifyAuthRequiredOnStartError = profileDirectoryOverride === undefined,
         ...runtimeInput
       } = input;
       const { executable, spawn } = yield* prepareSpawn(
@@ -313,7 +331,12 @@ export const AntigravityDriver: ProviderDriver<
         threadEnvironment === undefined
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment },
-        profileDirectoryOverride === undefined ? undefined : { profileDirectoryOverride },
+        profileDirectoryOverride === undefined && linkUserPlugins === undefined
+          ? undefined
+          : {
+              ...(profileDirectoryOverride === undefined ? {} : { profileDirectoryOverride }),
+              ...(linkUserPlugins === undefined ? {} : { linkUserPlugins }),
+            },
       );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
@@ -332,7 +355,7 @@ export const AntigravityDriver: ProviderDriver<
             .start()
             .pipe(
               Effect.tapError((cause): Effect.Effect<void> =>
-                profileDirectoryOverride === undefined &&
+                notifyAuthRequiredOnStartError &&
                 runtimeInput.onAuthorizationUrl === undefined &&
                 isAntigravitySignInRequiredError(cause)
                   ? provider.onAuthRequired
@@ -345,6 +368,7 @@ export const AntigravityDriver: ProviderDriver<
     const makeDisposableRuntime = Effect.fn("AntigravityDriver.makeDisposableRuntime")(function* (
       input: Pick<AntigravityAcpRuntimeInput, "onAuthorizationUrl"> & {
         readonly profileDirectoryOverride?: string;
+        readonly linkUserPlugins?: boolean;
       },
     ) {
       const effectiveProfileDirectory = input.profileDirectoryOverride ?? profileDirectory;
@@ -378,6 +402,7 @@ export const AntigravityDriver: ProviderDriver<
         ...(input.profileDirectoryOverride !== undefined
           ? { profileDirectoryOverride: input.profileDirectoryOverride }
           : {}),
+        ...(input.linkUserPlugins !== undefined ? { linkUserPlugins: input.linkUserPlugins } : {}),
       });
       return {
         ...runtime,
@@ -439,6 +464,7 @@ export const AntigravityDriver: ProviderDriver<
 
       const { executable, spawn } = yield* prepareSpawn(cwd, processEnvironment, {
         profileDirectoryOverride: stagingProfileDirectory,
+        linkUserPlugins: false,
       });
       if (executable.harnessPath !== null) return undefined;
       // Without a display it prints the link only, instead of opening a browser on this machine.
@@ -559,12 +585,13 @@ export const AntigravityDriver: ProviderDriver<
         makeRuntime: (
           runtimeInput?: Omit<
             Parameters<typeof makeDisposableRuntime>[0],
-            "profileDirectoryOverride"
+            "profileDirectoryOverride" | "linkUserPlugins"
           >,
         ) =>
           makeDisposableRuntime({
             ...runtimeInput,
             profileDirectoryOverride: stagingProfileDirectory,
+            linkUserPlugins: false,
           }),
         commit,
         cleanup,
@@ -680,7 +707,9 @@ export const AntigravityDriver: ProviderDriver<
           }
         : {}),
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
-      supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
+      supportsTextGeneration: isAntigravityTextGenerationAvailable(
+        textGenerationProfileDirectory,
+      ).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
         Effect.orElseSucceed(() => false),
@@ -729,14 +758,26 @@ export const AntigravityDriver: ProviderDriver<
         }),
     });
     const textGeneration = yield* makeAntigravityTextGeneration({
-      profileDirectory,
+      profileDirectory: textGenerationProfileDirectory,
       defaultModel,
       withProcess: authFlow.withProcess,
       makeRuntime: (cwd) =>
-        makeRuntime({
-          cwd,
-          mcpServers: [],
-        }),
+        prepareAntigravityTextGenerationProfile({
+          profileDirectory,
+          platform,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.andThen(
+            makeRuntime({
+              cwd,
+              mcpServers: [],
+              profileDirectoryOverride: textGenerationProfileDirectory,
+              linkUserPlugins: false,
+              notifyAuthRequiredOnStartError: true,
+            }),
+          ),
+        ),
     });
 
     const refreshModels = Effect.fn("AntigravityDriver.refreshModels")(

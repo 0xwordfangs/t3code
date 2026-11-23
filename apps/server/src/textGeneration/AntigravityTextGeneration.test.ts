@@ -547,6 +547,11 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
     { name: "hooks.json", value: "invalid JSON", available: false },
     { name: "mcp_config.json", value: "x".repeat(64_001), available: false },
     { name: "hooks.json", value: "{}", available: true },
+    {
+      name: "hooks.json",
+      value: '{"hooks":{},"default":{"PreInvocation":[{"command":"do-not-run"}]}}',
+      available: false,
+    },
     { name: "hooks.json", value: '{"hooks":{}}', available: true },
     { name: "mcp_config.json", value: '{"mcpServers":{}}', available: true },
     { name: "mcp_config.json", value: "", available: true },
@@ -564,6 +569,144 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
       expect(fixture.state.workspaces.length).toBe(available ? 1 : 0);
       yield* fixture.assertCleaned;
     }),
+  );
+
+  it.effect.each([
+    {
+      label: "plugin hooks.json",
+      relativePath: "config/plugins/rtk/hooks.json",
+      value: '{"hooks":{"PreInvocation":[{"command":"do-not-run"}]}}',
+      available: false,
+    },
+    {
+      label: "plugin mcp_config.json",
+      relativePath: "config/plugins/mcp-plugin/mcp_config.json",
+      value: '{"mcpServers":{"server":{"command":"do-not-run"}}}',
+      available: false,
+    },
+    {
+      label: "malformed plugin hooks.json",
+      relativePath: "config/plugins/broken/hooks.json",
+      value: "not-json",
+      available: false,
+    },
+    {
+      label: "oversized plugin mcp_config.json",
+      relativePath: "config/plugins/big/mcp_config.json",
+      value: "x".repeat(64_001),
+      available: false,
+    },
+    {
+      label: "direct config/plugins/hooks.json",
+      relativePath: "config/plugins/hooks.json",
+      value: '{"hooks":{"PreInvocation":[{"command":"do-not-run"}]}}',
+      available: false,
+    },
+    {
+      label: "empty plugin hooks.json",
+      relativePath: "config/plugins/clean/hooks.json",
+      value: '{"hooks":{}}',
+      available: true,
+    },
+    {
+      label: "empty plugin mcp_config.json",
+      relativePath: "config/plugins/clean/mcp_config.json",
+      value: '{"mcpServers":{}}',
+      available: true,
+    },
+    {
+      label: "benign plugin metadata file",
+      relativePath: "config/plugins/README.md",
+      value: "notes",
+      available: true,
+    },
+  ])(
+    "checks $label under config/plugins before starting a helper, available=$available",
+    ({ relativePath, value, available }) =>
+      Effect.gen(function* () {
+        const fixture = yield* makeFixture();
+        const targetPath = fixture.path.join(fixture.profileDirectory, relativePath);
+        yield* fixture.fs.makeDirectory(fixture.path.dirname(targetPath), { recursive: true });
+        yield* fixture.fs.writeFileString(targetPath, value);
+        expect(yield* isAntigravityTextGenerationAvailable(fixture.profileDirectory)).toBe(
+          available,
+        );
+        const result = yield* fixture.textGeneration
+          .generateThreadTitle(fixture.titleInput)
+          .pipe(Effect.exit);
+        expect(Exit.isSuccess(result)).toBe(available);
+        expect(fixture.state.workspaces.length).toBe(available ? 1 : 0);
+        yield* fixture.assertCleaned;
+      }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "blocks symlinked config/plugins directories, per-plugin symlinks, dangling links, and non-directory plugins",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const externalRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-plugins-" });
+        const externalPlugins = path.join(externalRoot, "plugins");
+        yield* fs.makeDirectory(path.join(externalPlugins, "rtk"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(externalPlugins, "rtk", "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"do-not-run"}]}}',
+        );
+
+        // 1. Whole-dir symlink to external plugins directory containing hooks.json.
+        const wholeLinkFixture = yield* makeFixture();
+        yield* fs.makeDirectory(path.join(wholeLinkFixture.profileDirectory, "config"), {
+          recursive: true,
+        });
+        yield* fs.symlink(
+          externalPlugins,
+          path.join(wholeLinkFixture.profileDirectory, "config", "plugins"),
+        );
+        expect(yield* isAntigravityTextGenerationAvailable(wholeLinkFixture.profileDirectory)).toBe(
+          false,
+        );
+        const wholeLinkResult = yield* wholeLinkFixture.textGeneration
+          .generateThreadTitle(wholeLinkFixture.titleInput)
+          .pipe(Effect.exit);
+        expect(Exit.isFailure(wholeLinkResult)).toBe(true);
+        expect(wholeLinkFixture.state.workspaces).toEqual([]);
+
+        // 2. Per-plugin symlink inside a real config/plugins directory.
+        const perPluginFixture = yield* makeFixture();
+        const perPluginDir = path.join(perPluginFixture.profileDirectory, "config", "plugins");
+        yield* fs.makeDirectory(perPluginDir, { recursive: true });
+        yield* fs.symlink(path.join(externalPlugins, "rtk"), path.join(perPluginDir, "rtk"));
+        expect(yield* isAntigravityTextGenerationAvailable(perPluginFixture.profileDirectory)).toBe(
+          false,
+        );
+
+        // 3. Dangling config/plugins symlink fails closed.
+        const danglingFixture = yield* makeFixture();
+        yield* fs.makeDirectory(path.join(danglingFixture.profileDirectory, "config"), {
+          recursive: true,
+        });
+        yield* fs.symlink(
+          path.join(externalRoot, "does-not-exist"),
+          path.join(danglingFixture.profileDirectory, "config", "plugins"),
+        );
+        expect(yield* isAntigravityTextGenerationAvailable(danglingFixture.profileDirectory)).toBe(
+          false,
+        );
+
+        // 4. Non-directory file at config/plugins fails closed.
+        const filePluginsFixture = yield* makeFixture();
+        yield* fs.makeDirectory(path.join(filePluginsFixture.profileDirectory, "config"), {
+          recursive: true,
+        });
+        yield* fs.writeFileString(
+          path.join(filePluginsFixture.profileDirectory, "config", "plugins"),
+          "not a directory",
+        );
+        expect(
+          yield* isAntigravityTextGenerationAvailable(filePluginsFixture.profileDirectory),
+        ).toBe(false);
+      }),
   );
 
   it.effect("does not launch during sign-out or before sign-in", () =>

@@ -13,6 +13,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
@@ -1395,5 +1396,88 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
       expect(yield* installation.state).toMatchObject({ phase: "idle", operationId: null });
       expect(requests).toEqual([]);
     }),
+  );
+
+  it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+    "does not link user plugins into the temporary validation profile",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const realSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fakeHome = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-validate-home-" });
+        const userPluginDir = path.join(fakeHome, ".gemini", "config", "plugins", "probe-plugin");
+        yield* fs.makeDirectory(userPluginDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(userPluginDir, "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"do-not-run"}]}}',
+        );
+
+        let observedValidationProfile: string | undefined;
+        let pluginsPresentDuringValidation: boolean | undefined;
+        let pluginsSymlinkDuringValidation: boolean | undefined;
+        const unwrapCgroupCommand = (command: ChildProcess.Command): string | undefined => {
+          if (!ChildProcess.isStandardCommand(command)) return undefined;
+          const args = command.args.map(String);
+          return command.command === "/bin/sh" &&
+            args[0] === "-c" &&
+            args[2] === "t3-acp-cgroup-wrapper" &&
+            args[5] !== undefined
+            ? args[5]
+            : String(command.command);
+        };
+        const spawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            if (
+              ChildProcess.isStandardCommand(command) &&
+              unwrapCgroupCommand(command)?.endsWith(executableName)
+            ) {
+              const rawGeminiHome = command.options.env?.GEMINI_HOME;
+              const geminiHome = Redacted.isRedacted(rawGeminiHome)
+                ? Redacted.value(rawGeminiHome)
+                : rawGeminiHome;
+              observedValidationProfile = geminiHome;
+              if (geminiHome) {
+                const pluginsPath = path.join(geminiHome, "config", "plugins");
+                pluginsPresentDuringValidation = yield* fs
+                  .exists(pluginsPath)
+                  .pipe(Effect.orElseSucceed(() => false));
+                pluginsSymlinkDuringValidation = yield* fs.readLink(pluginsPath).pipe(
+                  Effect.as(true),
+                  Effect.orElseSucceed(() => false),
+                );
+              }
+              return yield* realSpawner.spawn(
+                ChildProcess.make(
+                  "sh",
+                  [
+                    "-c",
+                    'read -r _; printf \'{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"wrong","version":"0.0.0"}}}\\n\'',
+                  ],
+                  {
+                    stdin: "pipe",
+                    stdout: "pipe",
+                    stderr: "pipe",
+                  },
+                ),
+              );
+            }
+            return yield* realSpawner.spawn(command);
+          }),
+        );
+
+        yield* Effect.gen(function* () {
+          const { installation } = yield* makeHarness({
+            useDefaultValidation: true,
+            spawner,
+          });
+          yield* installation.start;
+          const state = yield* terminalState(installation);
+          expect(state.phase).toBe("failed");
+          expect(observedValidationProfile).toContain("t3-antigravity-validate-");
+          expect(pluginsPresentDuringValidation).toBe(false);
+          expect(pluginsSymlinkDuringValidation).toBe(false);
+        }).pipe(Effect.provideService(HostProcess.HomeDirectory, fakeHome));
+      }),
   );
 });
