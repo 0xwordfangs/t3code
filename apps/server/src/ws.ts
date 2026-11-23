@@ -147,7 +147,10 @@ import {
   toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
-import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
+import {
+  ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
+  ProjectionStoreThreadNotFoundError,
+} from "./orchestration-v2/ProjectionStore.ts";
 import {
   coalesceLiveUpdatedEvents,
   coalesceThreadLiveStream,
@@ -240,7 +243,11 @@ import * as DefectReporter from "./observability/DefectReporter.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
-import { requiredScopeForDeviceList, rpcAuthorizationError } from "./auth/RpcAuthorization.ts";
+import {
+  isLogoutPromptText,
+  requiredScopeForDeviceList,
+  rpcAuthorizationError,
+} from "./auth/RpcAuthorization.ts";
 import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
 import { RpcInstrumentation, rpcInstrumentationLayer } from "./observability/RpcInstrumentation.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
@@ -293,6 +300,7 @@ import { requestUrl } from "./requestUrl.ts";
 
 const CONFIG_DISCOVERY_TIMEOUT = Duration.seconds(5);
 const isProviderUploadFeedbackError = Schema.is(ProviderUploadFeedbackError);
+const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 
 const resolveDiscoveryForConfig = <A, E, R>(
   discovery: Effect.Effect<A, E, R>,
@@ -1636,6 +1644,97 @@ export const layerWsRpc = (
         currentSession.scopes.includes(requiredScope)
           ? effect
           : Effect.fail(rpcAuthorizationError(requiredScope));
+      const isProjectionStoreThreadNotFoundError = Schema.is(ProjectionStoreThreadNotFoundError);
+      const authorizePersistedLogoutCommand = Effect.fn("ws.authorizePersistedLogoutCommand")(
+        function* (command: OrchestrationV2Command) {
+          if (canManageProviders) return;
+          if (
+            command.type !== "message.dispatch" &&
+            command.type !== "prepared-run.retry" &&
+            command.type !== "prepared-run.release" &&
+            command.type !== "queued-run.start" &&
+            command.type !== "queue.resume"
+          ) {
+            return;
+          }
+          if (command.type === "message.dispatch" && command.steerFollowUpOfRunId !== undefined) {
+            return;
+          }
+          const runs = yield* Effect.gen(function* () {
+            if (command.type === "message.dispatch") {
+              return (yield* threadManagement.getThreadRecords(command.threadId, ["runs"], {
+                runStatuses: ["queued"],
+              })).runs.filter((run) => run.queueHeld === true);
+            }
+            if (command.type === "prepared-run.release") {
+              return (yield* threadManagement.getThreadRecords(command.threadId, ["runs"], {
+                runIds: [command.runId],
+              })).runs;
+            }
+            if (command.type === "prepared-run.retry") {
+              const targeted = (yield* threadManagement.getThreadRecords(
+                command.threadId,
+                ["runs"],
+                {
+                  runIds: [command.runId],
+                },
+              )).runs;
+              const heldQueued = (yield* threadManagement.getThreadRecords(
+                command.threadId,
+                ["runs"],
+                {
+                  runStatuses: ["queued"],
+                },
+              )).runs.filter((run) => run.queueHeld === true);
+              return [...targeted, ...heldQueued];
+            }
+            const queued = (yield* threadManagement.getThreadRecords(command.threadId, ["runs"], {
+              runStatuses: ["queued"],
+            })).runs;
+            if (
+              command.type === "queued-run.start" &&
+              !queued.some((run) => run.id === command.runId)
+            ) {
+              const targeted = (yield* threadManagement.getThreadRecords(
+                command.threadId,
+                ["runs"],
+                {
+                  runIds: [command.runId],
+                },
+              )).runs;
+              return [...queued, ...targeted];
+            }
+            return queued;
+          }).pipe(
+            Effect.catchTags({
+              OrchestratorProjectionError: (error) =>
+                isProjectionStoreThreadNotFoundError(error.cause)
+                  ? Effect.succeed([])
+                  : Effect.fail(error),
+            }),
+          );
+          const messageIds = [...new Set(runs.map((run) => run.userMessageId))];
+          if (messageIds.length === 0) return;
+          const messages = yield* threadManagement
+            .getMessagesById(command.threadId, messageIds)
+            .pipe(
+              Effect.catchTags({
+                OrchestratorProjectionError: (error) =>
+                  isProjectionStoreThreadNotFoundError(error.cause)
+                    ? Effect.succeed(new Map())
+                    : Effect.fail(error),
+              }),
+            );
+          for (const message of messages.values()) {
+            if (
+              message.attachments.length === 0 &&
+              isLogoutPromptText(message.text, message.context)
+            ) {
+              return yield* rpcAuthorizationError(AuthProvidersManageScope);
+            }
+          }
+        },
+      );
 
       const listAcpRegistrySessions = Effect.fn("ws.acpRegistry.listSessions")(function* (
         input: AcpRegistryListSessionsInput,
@@ -2038,16 +2137,20 @@ export const layerWsRpc = (
             Effect.andThen(
               startup
                 .enqueueCommand(
-                  (command.type === "prepared-run.retry"
-                    ? threadLaunch.retryPreparation(command)
-                    : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          createdBy: "user",
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
-                      )
-                  ).pipe(Effect.provide(intakeContext)),
+                  authorizePersistedLogoutCommand(command).pipe(
+                    Effect.andThen(
+                      (command.type === "prepared-run.retry"
+                        ? threadLaunch.retryPreparation(command)
+                        : ThreadMessageIntake.dispatchCommand(
+                            ThreadManagementService.withCreationProvenance(command, {
+                              createdBy: "user",
+                              creationSource:
+                                "creationSource" in command ? command.creationSource : "web",
+                            }),
+                          )
+                      ).pipe(Effect.provide(intakeContext)),
+                    ),
+                  ),
                 )
                 .pipe(
                   Effect.tap((result) =>
@@ -2055,6 +2158,7 @@ export const layerWsRpc = (
                   ),
                   Effect.map((result) => ({ sequence: result.sequence })),
                   Effect.mapError((cause) => {
+                    if (isEnvironmentAuthorizationError(cause)) return cause;
                     const detail = userFacingDispatchErrorMessage(cause);
                     return new OrchestrationV2DispatchCommandError({
                       commandId: command.commandId,
@@ -2385,7 +2489,18 @@ export const layerWsRpc = (
           ),
         [WS_METHODS.scheduledTasksRunNow]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(scheduledTasks.runNow(input)),
+            Effect.andThen(
+              canManageProviders
+                ? scheduledTasks.runNow(input)
+                : Effect.gen(function* () {
+                    const { tasks } = yield* scheduledTasks.list();
+                    const task = tasks.find((candidate) => candidate.id === input.id);
+                    if (task !== undefined && isLogoutPromptText(task.prompt)) {
+                      return yield* rpcAuthorizationError(AuthProvidersManageScope);
+                    }
+                    return yield* scheduledTasks.runNow(input);
+                  }),
+            ),
           ),
         [WS_METHODS.scheduledTasksRotateWebhookToken]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(

@@ -157,8 +157,9 @@ export const AntigravityDriver: ProviderDriver<
     };
     const authConfigIssue = antigravityAuthConfigIssue(auth);
     const processEnvironment = yield* mergeProviderInstanceEnvironment(environment);
+    const platform = yield* HostProcess.Platform;
     const userHome = resolveAntigravityUserHome(
-      yield* HostProcess.Platform,
+      platform,
       processEnvironment,
       yield* HostProcess.HomeDirectory,
     );
@@ -208,6 +209,7 @@ export const AntigravityDriver: ProviderDriver<
     const prepareSpawn = Effect.fn("AntigravityDriver.prepareSpawn")(function* (
       cwd: string,
       baseEnv: NodeJS.ProcessEnv,
+      spawnOptions?: { readonly profileDirectoryOverride?: string },
     ): Effect.fn.Return<
       {
         readonly executable: AntigravityInstallation.AntigravityExecutable;
@@ -235,7 +237,7 @@ export const AntigravityDriver: ProviderDriver<
         ),
       );
       const profile = yield* prepareAntigravityProfile({
-        profileDirectory,
+        profileDirectory: spawnOptions?.profileDirectoryOverride ?? profileDirectory,
         baseEnv: processEnvironment,
         auth,
         userHome,
@@ -293,7 +295,7 @@ export const AntigravityDriver: ProviderDriver<
     });
 
     const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
-      input: AntigravityAdapterV2RuntimeInput,
+      input: AntigravityAdapterV2RuntimeInput & { readonly profileDirectoryOverride?: string },
     ): Effect.fn.Return<
       AcpSessionRuntime.AcpSessionRuntime["Service"],
       AcpErrors.AcpError | ProviderSetupError,
@@ -301,12 +303,17 @@ export const AntigravityDriver: ProviderDriver<
     > {
       // `buildAntigravityAcpSpawnInput` sets `extendEnv: false`, so thread variables only reach the
       // agent's shell through `baseEnv`.
-      const { processEnvironment: threadEnvironment, ...runtimeInput } = input;
+      const {
+        processEnvironment: threadEnvironment,
+        profileDirectoryOverride,
+        ...runtimeInput
+      } = input;
       const { executable, spawn } = yield* prepareSpawn(
         runtimeInput.cwd,
         threadEnvironment === undefined
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment },
+        profileDirectoryOverride === undefined ? undefined : { profileDirectoryOverride },
       );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
@@ -325,6 +332,7 @@ export const AntigravityDriver: ProviderDriver<
             .start()
             .pipe(
               Effect.tapError((cause): Effect.Effect<void> =>
+                profileDirectoryOverride === undefined &&
                 runtimeInput.onAuthorizationUrl === undefined &&
                 isAntigravitySignInRequiredError(cause)
                   ? provider.onAuthRequired
@@ -335,8 +343,11 @@ export const AntigravityDriver: ProviderDriver<
     });
 
     const makeDisposableRuntime = Effect.fn("AntigravityDriver.makeDisposableRuntime")(function* (
-      input: Pick<AntigravityAcpRuntimeInput, "onAuthorizationUrl">,
+      input: Pick<AntigravityAcpRuntimeInput, "onAuthorizationUrl"> & {
+        readonly profileDirectoryOverride?: string;
+      },
     ) {
+      const effectiveProfileDirectory = input.profileDirectoryOverride ?? profileDirectory;
       const cwd = yield* fileSystem
         .makeTempDirectoryScoped({ prefix: "t3-antigravity-setup-" })
         .pipe(
@@ -352,7 +363,7 @@ export const AntigravityDriver: ProviderDriver<
       let sessionId: string | undefined;
       yield* Effect.addFinalizer(() =>
         removeAntigravitySessionFiles({
-          profileDirectory,
+          profileDirectory: effectiveProfileDirectory,
           sessionId,
           cwd,
         }).pipe(
@@ -364,6 +375,9 @@ export const AntigravityDriver: ProviderDriver<
         cwd,
         mcpServers: [],
         ...(input.onAuthorizationUrl ? { onAuthorizationUrl: input.onAuthorizationUrl } : {}),
+        ...(input.profileDirectoryOverride !== undefined
+          ? { profileDirectoryOverride: input.profileDirectoryOverride }
+          : {}),
       });
       return {
         ...runtime,
@@ -388,22 +402,45 @@ export const AntigravityDriver: ProviderDriver<
         .resolve(settings.binaryPath, processEnvironment)
         .pipe(Effect.option);
       if (Option.isSome(resolved) && resolved.value.harnessPath !== null) return undefined;
-      const cwd = yield* fileSystem
-        .makeTempDirectoryScoped({ prefix: "t3-antigravity-login-" })
-        .pipe(
-          Effect.mapError(
-            () =>
-              new ProviderSetupError({
-                instanceId,
-                operation: "start",
-                detail: "Could not create an Antigravity setup workspace.",
-              }),
-          ),
-        );
-      const { executable, spawn } = yield* prepareSpawn(cwd, processEnvironment);
-      if (executable.harnessPath !== null) return undefined;
       const failed = (detail: string, cause?: unknown) =>
         new ProviderSetupError({ instanceId, operation: "start", detail, cause });
+      const cwd = yield* fileSystem
+        .makeTempDirectoryScoped({ prefix: "t3-antigravity-login-" })
+        .pipe(Effect.mapError(() => failed("Could not create an Antigravity setup workspace.")));
+      yield* fileSystem
+        .makeDirectory(directories.runtimeTemp, { recursive: true, mode: 0o700 })
+        .pipe(
+          Effect.mapError((cause) =>
+            failed("Could not create an Antigravity staging profile directory.", cause),
+          ),
+        );
+      if (platform !== "win32") {
+        yield* fileSystem
+          .chmod(directories.runtimeTemp, 0o700)
+          .pipe(
+            Effect.mapError((cause) =>
+              failed("Could not create an Antigravity staging profile directory.", cause),
+            ),
+          );
+      }
+      // Keep the staging profile alive past `--login` exit for post-login verification and commit.
+      const stagingProfileDirectory = yield* fileSystem
+        .makeTempDirectory({ directory: directories.runtimeTemp, prefix: "login-profile-" })
+        .pipe(
+          Effect.mapError((cause) =>
+            failed("Could not create an Antigravity staging profile directory.", cause),
+          ),
+        );
+      const cleanup = fileSystem
+        .remove(stagingProfileDirectory, { recursive: true, force: true })
+        .pipe(Effect.ignore);
+      let handedOffToCaller = false;
+      yield* Effect.addFinalizer(() => (handedOffToCaller ? Effect.void : cleanup));
+
+      const { executable, spawn } = yield* prepareSpawn(cwd, processEnvironment, {
+        profileDirectoryOverride: stagingProfileDirectory,
+      });
+      if (executable.harnessPath !== null) return undefined;
       // Without a display it prints the link only, instead of opening a browser on this machine.
       const { DISPLAY: _display, WAYLAND_DISPLAY: _wayland, ...env } = spawn.env ?? {};
       const resolvedSpawn = yield* resolveSpawnCommand(spawn.command, [...spawn.args, "--login"], {
@@ -440,6 +477,67 @@ export const AntigravityDriver: ProviderDriver<
         Effect.forkScoped,
       );
       yield* Stream.runDrain(child.stderr).pipe(Effect.ignore, Effect.forkScoped);
+      const commit = Effect.gen(function* () {
+        const stagedTokenPath = path.join(
+          stagingProfileDirectory,
+          "antigravity-acp",
+          "antigravity-oauth-token",
+        );
+        const tokenBytes = yield* fileSystem
+          .readFile(stagedTokenPath)
+          .pipe(
+            Effect.mapError((cause) =>
+              failed(
+                "Antigravity did not save Google sign-in credentials. Start sign-in again.",
+                cause,
+              ),
+            ),
+          );
+        if (tokenBytes.byteLength === 0) {
+          return yield* failed(
+            "Antigravity did not save Google sign-in credentials. Start sign-in again.",
+          );
+        }
+        const liveAcpDirectory = path.join(profileDirectory, "antigravity-acp");
+        for (const directory of [profileDirectory, liveAcpDirectory]) {
+          yield* fileSystem
+            .makeDirectory(directory, { recursive: true, mode: 0o700 })
+            .pipe(
+              Effect.mapError((cause) =>
+                failed("Could not save Google sign-in credentials.", cause),
+              ),
+            );
+          if (platform !== "win32") {
+            yield* fileSystem
+              .chmod(directory, 0o700)
+              .pipe(
+                Effect.mapError((cause) =>
+                  failed("Could not save Google sign-in credentials.", cause),
+                ),
+              );
+          }
+        }
+        const tokenSuffix = yield* random
+          .uuidV4()
+          .pipe(
+            Effect.mapError((cause) => failed("Could not save Google sign-in credentials.", cause)),
+          );
+        const pendingTokenPath = path.join(
+          liveAcpDirectory,
+          `.antigravity-oauth-token.${tokenSuffix}.tmp`,
+        );
+        const liveTokenPath = path.join(liveAcpDirectory, "antigravity-oauth-token");
+        yield* fileSystem.writeFile(pendingTokenPath, tokenBytes, { mode: 0o600 }).pipe(
+          Effect.andThen(
+            platform !== "win32" ? fileSystem.chmod(pendingTokenPath, 0o600) : Effect.void,
+          ),
+          Effect.andThen(fileSystem.rename(pendingTokenPath, liveTokenPath)),
+          Effect.ensuring(fileSystem.remove(pendingTokenPath, { force: true }).pipe(Effect.ignore)),
+          Effect.uninterruptible,
+          Effect.mapError((cause) => failed("Could not save Google sign-in credentials.", cause)),
+        );
+      });
+      handedOffToCaller = true;
       return {
         submit: (response: string) => Deferred.succeed(code, response).pipe(Effect.asVoid),
         completed: Effect.gen(function* () {
@@ -458,6 +556,18 @@ export const AntigravityDriver: ProviderDriver<
             );
           }
         }),
+        makeRuntime: (
+          runtimeInput?: Omit<
+            Parameters<typeof makeDisposableRuntime>[0],
+            "profileDirectoryOverride"
+          >,
+        ) =>
+          makeDisposableRuntime({
+            ...runtimeInput,
+            profileDirectoryOverride: stagingProfileDirectory,
+          }),
+        commit,
+        cleanup,
       };
     });
 

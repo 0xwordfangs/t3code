@@ -9,6 +9,7 @@ import {
   CommandId,
   DEFAULT_SERVER_SETTINGS,
   MessageId,
+  NodeId,
   ORCHESTRATION_V2_WS_METHODS,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -616,6 +617,7 @@ describe("logout prompt authorization", () => {
   const tested = [
     ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
     ORCHESTRATION_V2_WS_METHODS.launchThread,
+    WS_METHODS.scheduledTasksUpsert,
   ] as const;
   const group = WsRpcGroup.omit(
     ...[...WsRpcGroup.requests.keys()].filter(
@@ -628,6 +630,7 @@ describe("logout prompt authorization", () => {
   const commandId = CommandId.make("cmd-logout-auth");
   const messageId = MessageId.make("msg-logout-auth");
   const runId = RunId.make("run-logout-auth");
+  const nodeId = NodeId.make("node-logout-auth");
   const modelSelection = {
     instanceId: ProviderInstanceId.make("antigravity"),
     model: "gemini-2.5-pro",
@@ -641,7 +644,7 @@ describe("logout prompt authorization", () => {
   };
 
   it.effect(
-    "requires providers:manage for /logout prompts across dispatchCommand and launchThread",
+    "requires providers:manage for /logout prompts across dispatchCommand, launchThread, and scheduledTasksUpsert",
     () =>
       Effect.gen(function* () {
         let handled = 0;
@@ -656,6 +659,12 @@ describe("logout prompt authorization", () => {
             Effect.sync(() => {
               handled += 1;
               return { threadId, projection: {} as never, resumed: false, sequence: handled };
+            }),
+          ),
+          group.toLayerHandler(WS_METHODS.scheduledTasksUpsert, () =>
+            Effect.sync(() => {
+              handled += 1;
+              return { task: {} as never };
             }),
           ),
         );
@@ -698,6 +707,20 @@ describe("logout prompt authorization", () => {
           threadId,
           continuation: { messageId, text },
         });
+        const delegateTask = (task: string) => ({
+          type: "delegated_task.request" as const,
+          commandId,
+          parentThreadId: threadId,
+          parentRunId: runId,
+          parentNodeId: nodeId,
+          task,
+          modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          completionWake: "always" as const,
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+        });
         const launch = (text: string, attachments: Array<typeof attachment> = []) => ({
           commandId,
           projectId,
@@ -707,6 +730,18 @@ describe("logout prompt authorization", () => {
           interactionMode: "default" as const,
           workspaceStrategy: { type: "root" as const },
           initialMessage: { messageId, text, attachments },
+        });
+        const upsertScheduledTask = (prompt: string) => ({
+          title: "Nightly check",
+          prompt,
+          enabled: true,
+          schedule: { type: "interval" as const, everyMs: 60_000 },
+          projectId,
+          threadId: null,
+          workspaceStrategy: { type: "root" as const },
+          modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
         });
 
         // Ordinary prompts and /logout with attachments still need only orchestration:operate.
@@ -721,8 +756,10 @@ describe("logout prompt authorization", () => {
         yield* operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](
           updateContinuation("continue"),
         );
+        yield* operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](delegateTask("summarize"));
         yield* operator[ORCHESTRATION_V2_WS_METHODS.launchThread](launch("hello"));
-        expect(handled).toBe(6);
+        yield* operator[WS_METHODS.scheduledTasksUpsert](upsertScheduledTask("run report"));
+        expect(handled).toBe(8);
 
         const protectedDispatches = [
           dispatchMessage("/logout"),
@@ -730,6 +767,8 @@ describe("logout prompt authorization", () => {
           editQueued("/logout"),
           editQueued(" /Logout ", []),
           updateContinuation(" /logout "),
+          delegateTask("/logout"),
+          delegateTask(" /LOGOUT "),
         ] as const;
         for (const payload of protectedDispatches) {
           expect(
@@ -747,13 +786,22 @@ describe("logout prompt authorization", () => {
           _tag: "EnvironmentAuthorizationError",
           requiredPermission: AuthProvidersManageScope,
         });
-        expect(handled).toBe(6);
+        expect(
+          yield* operator[WS_METHODS.scheduledTasksUpsert](upsertScheduledTask("/logout")).pipe(
+            Effect.flip,
+          ),
+        ).toMatchObject({
+          _tag: "EnvironmentAuthorizationError",
+          requiredPermission: AuthProvidersManageScope,
+        });
+        expect(handled).toBe(8);
 
         for (const payload of protectedDispatches) {
           yield* manager[ORCHESTRATION_V2_WS_METHODS.dispatchCommand](payload);
         }
         yield* manager[ORCHESTRATION_V2_WS_METHODS.launchThread](launch(" /LOGOUT "));
-        expect(handled).toBe(12);
+        yield* manager[WS_METHODS.scheduledTasksUpsert](upsertScheduledTask(" /LOGOUT "));
+        expect(handled).toBe(17);
       }),
   );
 });

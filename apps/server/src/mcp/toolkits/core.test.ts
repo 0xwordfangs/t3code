@@ -51,7 +51,10 @@ import * as ThreadManagement from "../../orchestration-v2/ThreadManagementServic
 import type * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ThreadSearch from "../../orchestration-v2/ThreadSearch.ts";
 import * as PreviewBrowser from "../../preview/PreviewBrowser.ts";
+import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
+import * as ProjectCloneTracker from "../../project/ProjectCloneTracker.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
+import * as SourceControlRepositoryService from "../../sourceControl/SourceControlRepositoryService.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as SecretRequests from "../../secrets/SecretRequests.ts";
 import * as RemoteDelegation from "../../peer/RemoteDelegation.ts";
@@ -1132,6 +1135,18 @@ it.effect.each([
     code: "invalid_request",
     message: "The scheduled task was not found.",
   },
+  {
+    scenario: "rejects running a /logout scheduled task via MCP",
+    tasks: [
+      {
+        ...Schema.decodeSync(ScheduledTask)(scheduledTask("task-webhook", "full-access")),
+        prompt: " /LOGOUT \n",
+      },
+    ],
+    error: new ScheduledTaskError({ message: "must not run a /logout task" }),
+    code: "invalid_request",
+    message: "Scheduled tasks with `/logout` prompts cannot be run via MCP.",
+  },
 ])("run_scheduled_task_now $scenario", ({ tasks, error, code, message }) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -1624,3 +1639,62 @@ it.effect(
     );
   },
 );
+
+it.effect("t3_thread_launch rejects /logout as its initial message when unattached", () => {
+  let launchCalls = 0;
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    for (const message of ["/logout", " /LOGOUT \n"]) {
+      const result = yield* server
+        .callTool({
+          name: "t3_thread_launch",
+          arguments: { title: "Sign out", message },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(result.isError).toBe(true);
+      expect(declaredFailure(result)).toMatchObject({ code: "invalid_request" });
+    }
+    expect(launchCalls).toBe(0);
+  }).pipe(
+    Effect.provide(
+      McpHttpServer.layerProjectRegistration.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(NodeServices.layer),
+        Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+            launch: () =>
+              Effect.sync(() => {
+                launchCalls += 1;
+                return {} as never;
+              }),
+          }),
+        ),
+        Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+        Layer.provide(Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({})),
+        Layer.provide(
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/p" }),
+        ),
+        Layer.provide(
+          Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({}),
+        ),
+        Layer.provide(DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer))),
+        Layer.provide(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-launch-logout-" }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+        Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
+        Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
+        Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+        Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+      ),
+    ),
+  );
+});

@@ -6081,4 +6081,133 @@ describe("OrchestratorMcpService thread stop", () => {
       }).pipe(Effect.provide(layerTest));
     }),
   );
+
+  it.effect(
+    "rejects /logout prompts across sendToThread, createThreads, scheduleTask, updateScheduledTask, and delegateTask",
+    () =>
+      Effect.gen(function* () {
+        const parentThreadId = ThreadId.make("thread:mcp-logout-parent");
+        const targetThreadId = ThreadId.make("thread:mcp-logout-target");
+        const projectId = ProjectId.make("project:mcp-logout");
+        const providerInstanceId = ProviderInstanceId.make("codex");
+        const model = { instanceId: providerInstanceId, model: "gpt-5.4" };
+        const parentShell = {
+          ...liveThreadShell(parentThreadId),
+          projectId,
+          modelSelection: model,
+        };
+        const parentProjection = {
+          ...idleThreadProjection(parentShell),
+          runs: [
+            {
+              id: RunId.make("run:mcp-logout-parent"),
+              threadId: parentThreadId,
+              ordinal: 1,
+              providerInstanceId,
+              modelSelection: model,
+              providerThreadId: null,
+              userMessageId: MessageId.make("msg:mcp-logout-parent"),
+              rootNodeId: NodeId.make("node:mcp-logout-parent"),
+              activeAttemptId: null,
+              status: "running" as const,
+              requestedAt: parentShell.createdAt,
+              startedAt: parentShell.createdAt,
+              completedAt: null,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const scope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("env:mcp-logout"),
+          requestNamespace: "session:mcp-logout",
+          thread: {
+            threadId: parentThreadId,
+            providerSessionId: "session:mcp-logout",
+            providerInstanceId,
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+        let mutations = 0;
+        const serviceLayer = layerOrchestratorService.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              NodeServices.layer,
+              NodeCrypto.layer,
+              ServerSettings.layerTest(),
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadRecords: () => Effect.succeed(parentProjection),
+                dispatch: () =>
+                  Effect.sync(() => {
+                    mutations += 1;
+                    return { sequence: 1, storedEvents: [] } as never;
+                  }),
+                sendToThread: () =>
+                  Effect.sync(() => {
+                    mutations += 1;
+                    return {} as never;
+                  }),
+              }),
+              Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+              Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+                list: () => Effect.succeed([]),
+              }),
+              Layer.mock(ProjectService.ProjectService)({}),
+              Layer.mock(SecretRequests.SecretRequests)({}),
+              Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+              Layer.mock(ScheduledTaskService.ScheduledTaskService)({
+                upsert: () =>
+                  Effect.sync(() => {
+                    mutations += 1;
+                    return {} as never;
+                  }),
+              }),
+            ),
+          ),
+        );
+
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          for (const prompt of ["/logout", " /LOGOUT \n"]) {
+            assert.equal(
+              (yield* service
+                .sendToThread(scope, { threadId: targetThreadId, message: prompt })
+                .pipe(Effect.flip)).code,
+              "invalid_request",
+            );
+            assert.equal(
+              (yield* service
+                .createThreads(scope, { threads: [{ prompt: "ok" }, { prompt }] })
+                .pipe(Effect.flip)).code,
+              "invalid_request",
+            );
+            assert.equal(
+              (yield* service
+                .scheduleTask(scope, {
+                  prompt,
+                  schedule: { type: "interval", everyMs: 60_000 },
+                })
+                .pipe(Effect.flip)).code,
+              "invalid_request",
+            );
+            assert.equal(
+              (yield* service
+                .updateScheduledTask(scope, {
+                  scheduledTaskId: ScheduledTaskId.make("task:existing"),
+                  prompt,
+                })
+                .pipe(Effect.flip)).code,
+              "invalid_request",
+            );
+            assert.equal(
+              (yield* service.delegateTask(scope, { task: prompt }).pipe(Effect.flip)).code,
+              "invalid_request",
+            );
+          }
+          assert.equal(mutations, 0);
+        }).pipe(Effect.provide(serviceLayer));
+      }),
+  );
 });

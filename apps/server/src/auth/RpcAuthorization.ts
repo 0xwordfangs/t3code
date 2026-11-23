@@ -271,7 +271,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const isLogoutCommandText = (text: string): boolean => text.trim().toLowerCase() === "/logout";
 
-const isLogoutPromptText = (text: unknown, context?: unknown): boolean => {
+export const isLogoutPromptText = (text: unknown, context?: unknown): boolean => {
   if (typeof text !== "string") return false;
   if (isLogoutCommandText(text)) return true;
   if (!isRecord(context) || !Array.isArray(context.records)) return false;
@@ -311,6 +311,8 @@ const requiresProviderManageForLogoutPrompt = (method: string, payload: unknown)
           hasNoAttachments(payload.initialMessage.attachments) &&
           isLogoutPromptText(payload.initialMessage.text, payload.initialMessage.context)
         );
+      case "delegated_task.request":
+        return isLogoutPromptText(payload.task);
       default:
         return false;
     }
@@ -321,6 +323,9 @@ const requiresProviderManageForLogoutPrompt = (method: string, payload: unknown)
       hasNoAttachments(payload.initialMessage.attachments) &&
       isLogoutPromptText(payload.initialMessage.text, payload.initialMessage.context)
     );
+  }
+  if (method === WS_METHODS.scheduledTasksUpsert) {
+    return isLogoutPromptText(payload.prompt);
   }
   return false;
 };

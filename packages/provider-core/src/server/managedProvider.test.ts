@@ -1193,4 +1193,160 @@ describe("makeManagedServerProvider", () => {
         }),
       ).pipe(Effect.provide(layerAlwaysRunTest)),
   );
+
+  it.effect(
+    "detects two-step email switches across transient missing-email probes in both enrichment and refresh",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const publishEnrichedRef = yield* Ref.make<
+            ((snapshot: ServerProvider) => Effect.Effect<void>) | null
+          >(null);
+          const enrichmentReadyRef = yield* Ref.make(yield* Deferred.make<void>());
+          const resetEnrichmentReady = Effect.gen(function* () {
+            const next = yield* Deferred.make<void>();
+            yield* Ref.set(enrichmentReadyRef, next);
+            return next;
+          });
+          const aliceLimits = {
+            checkedAt: "2026-04-10T00:00:01.000Z",
+            credentialFingerprint: "fp-alice",
+            windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 30 }],
+          } as const;
+          const failedLimits = {
+            checkedAt: "2026-04-10T00:00:05.000Z",
+            windows: [],
+            unavailable: { reason: "probeFailed" },
+          } as const;
+          const probeRef = yield* Ref.make<ServerProvider>({
+            ...refreshedSnapshot,
+            auth: {
+              status: "authenticated",
+              email: "alice@example.com",
+              workspaceId: "ws-alice",
+              label: "tier-alice",
+            },
+            usageLimits: aliceLimits,
+          });
+          const provider = yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Ref.get(probeRef),
+            enrichSnapshot: ({ publishSnapshot }) =>
+              Ref.set(publishEnrichedRef, publishSnapshot).pipe(
+                Effect.andThen(Ref.get(enrichmentReadyRef)),
+                Effect.flatMap((ready) => Deferred.succeed(ready, undefined).pipe(Effect.ignore)),
+              ),
+            refreshOnInterval: false,
+          });
+
+          yield* Stream.take(provider.streamChanges, 1).pipe(Stream.runDrain);
+          yield* Deferred.await(yield* Ref.get(enrichmentReadyRef));
+
+          yield* provider.applyUsageLimits({
+            checkedAt: "2026-04-10T00:00:02.000Z",
+            authLabel: "tier-live-alice",
+            windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 55 }],
+          });
+
+          // Transient missing-email refresh followed by same account preserves cache.
+          yield* Ref.set(probeRef, {
+            ...refreshedSnapshot,
+            checkedAt: "2026-04-10T00:00:03.000Z",
+            auth: { status: "authenticated" },
+            usageLimits: failedLimits,
+          });
+          const transientMissing = yield* provider.refresh;
+          assert.strictEqual(transientMissing.usageLimits?.windows[0]?.usedPercent, 55);
+          assert.strictEqual(transientMissing.auth.workspaceId, "ws-alice");
+          assert.strictEqual(transientMissing.auth.label, "tier-live-alice");
+
+          yield* Ref.set(probeRef, {
+            ...refreshedSnapshot,
+            checkedAt: "2026-04-10T00:00:04.000Z",
+            auth: { status: "authenticated", email: "ALICE@example.com" },
+            usageLimits: failedLimits,
+          });
+          const sameAccountBack = yield* provider.refresh;
+          assert.strictEqual(sameAccountBack.usageLimits?.windows[0]?.usedPercent, 55);
+          assert.strictEqual(sameAccountBack.auth.workspaceId, "ws-alice");
+          assert.strictEqual(sameAccountBack.auth.label, "tier-live-alice");
+
+          // Two-step alice -> undefined -> bob via refresh clears usageLimits, workspaceId, and label.
+          yield* Ref.set(probeRef, {
+            ...refreshedSnapshot,
+            checkedAt: "2026-04-10T00:00:05.000Z",
+            auth: { status: "authenticated" },
+            usageLimits: failedLimits,
+          });
+          yield* provider.refresh;
+
+          yield* Ref.set(probeRef, {
+            ...refreshedSnapshot,
+            checkedAt: "2026-04-10T00:00:06.000Z",
+            auth: { status: "authenticated", email: "bob@example.com" },
+            usageLimits: failedLimits,
+          });
+          const bobRefresh = yield* provider.refresh;
+          assert.deepStrictEqual(bobRefresh.usageLimits, failedLimits);
+          assert.strictEqual(bobRefresh.auth.workspaceId, undefined);
+          assert.strictEqual(bobRefresh.auth.label, undefined);
+
+          // Two-step bob -> undefined -> carol via enrichment clears usageLimits and label.
+          const bobLimits = {
+            checkedAt: "2026-04-10T00:00:07.000Z",
+            credentialFingerprint: "fp-bob",
+            windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 15 }],
+          } as const;
+          yield* Ref.set(probeRef, {
+            ...refreshedSnapshot,
+            checkedAt: "2026-04-10T00:00:07.000Z",
+            auth: { status: "authenticated", email: "bob@example.com", workspaceId: "ws-bob" },
+            usageLimits: bobLimits,
+          });
+          const bobEnrichmentReady = yield* resetEnrichmentReady;
+          yield* provider.refresh;
+          yield* Deferred.await(bobEnrichmentReady);
+          yield* provider.applyUsageLimits({
+            checkedAt: "2026-04-10T00:00:08.000Z",
+            authLabel: "tier-live-bob",
+            windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 25 }],
+          });
+          const publish = (yield* Ref.get(publishEnrichedRef))!;
+
+          const missingEnrichFiber = yield* Stream.take(provider.streamChanges, 1).pipe(
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          yield* Effect.yieldNow;
+          yield* publish({
+            ...refreshedSnapshot,
+            checkedAt: "2026-04-10T00:00:09.000Z",
+            auth: { status: "authenticated" },
+            usageLimits: undefined,
+          });
+          const [missingEnrich] = Array.from(yield* Fiber.join(missingEnrichFiber));
+          assert.strictEqual(missingEnrich?.usageLimits?.windows[0]?.usedPercent, 25);
+          assert.strictEqual(missingEnrich?.auth.label, "tier-live-bob");
+
+          const carolEnrichFiber = yield* Stream.take(provider.streamChanges, 1).pipe(
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          yield* Effect.yieldNow;
+          yield* publish({
+            ...refreshedSnapshot,
+            checkedAt: "2026-04-10T00:00:10.000Z",
+            auth: { status: "authenticated", email: "carol@example.com" },
+            usageLimits: undefined,
+          });
+          const [carolEnrich] = Array.from(yield* Fiber.join(carolEnrichFiber));
+          assert.strictEqual(carolEnrich?.usageLimits, undefined);
+          assert.strictEqual(carolEnrich?.auth.label, undefined);
+        }),
+      ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
 });

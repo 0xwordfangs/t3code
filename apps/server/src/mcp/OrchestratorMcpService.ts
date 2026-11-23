@@ -252,6 +252,8 @@ function failure(code: OrchestratorMcpFailure["code"], message: string): Orchest
   return new OrchestratorMcpFailure({ code, message });
 }
 
+const isLogoutCommand = (text: string) => text.trim().toLowerCase() === "/logout";
+
 export function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
   if (!isThreadManagementError(error)) return failure("orchestration_error", errorMessage(error));
   switch (error._tag) {
@@ -2310,6 +2312,12 @@ const make = Effect.gen(function* () {
   return OrchestratorMcpService.of({
     scheduleTask: Effect.fn("OrchestratorMcpService.scheduleTask")(function* (scope, input) {
       const { parent, limits } = yield* loadCaller(scope, ["runs"]);
+      if (isLogoutCommand(input.prompt)) {
+        return yield* failure(
+          "invalid_request",
+          "Scheduled tasks cannot use `/logout` as their prompt.",
+        );
+      }
       const projectId = yield* resolveProjectTarget(parent, input.projectId);
       yield* assertLiveCallerForOtherProject(scope, parent, projectId);
       const project = yield* requireProject(projectId);
@@ -2395,6 +2403,12 @@ const make = Effect.gen(function* () {
     updateScheduledTask: Effect.fn("OrchestratorMcpService.updateScheduledTask")(
       function* (scope, input) {
         const { parent, limits } = yield* loadCaller(scope, ["runs"]);
+        if (input.prompt !== undefined && isLogoutCommand(input.prompt)) {
+          return yield* failure(
+            "invalid_request",
+            "Scheduled tasks cannot use `/logout` as their prompt.",
+          );
+        }
         const existing = yield* loadScheduledTask(input.scheduledTaskId, limits);
         yield* assertLiveCallerForOtherProject(scope, parent, existing.projectId);
         if (
@@ -2723,6 +2737,13 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
+      yield* requireCapability(callerScope);
+      if (isLogoutCommand(input.task)) {
+        return yield* failure(
+          "invalid_request",
+          "Delegated tasks cannot use `/logout` as their task.",
+        );
+      }
       const environmentId =
         input.target === undefined
           ? undefined
@@ -3237,6 +3258,16 @@ const make = Effect.gen(function* () {
     createThreads: Effect.fn("OrchestratorMcpService.createThreads")(
       function* (callerScope, input) {
         const { scope, parent } = yield* loadThreadCaller(callerScope, "create_threads");
+        if (
+          input.threads.some(
+            (request) => request.prompt !== undefined && isLogoutCommand(request.prompt),
+          )
+        ) {
+          return yield* failure(
+            "invalid_request",
+            "Created threads cannot use `/logout` as their prompt.",
+          );
+        }
         const parentRun = ThreadManagementService.latestActiveRun(parent);
         if (
           parentRun === undefined ||
@@ -3675,6 +3706,10 @@ const make = Effect.gen(function* () {
       } satisfies OrchestratorMcpThreadReadResult;
     }),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
+      yield* requireCapability(scope);
+      if (isLogoutCommand(input.message)) {
+        return yield* failure("invalid_request", "Messages sent via MCP cannot be `/logout`.");
+      }
       const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId, ["runs"]);
       yield* assertLiveCallerForOtherThread(scope, parent, target);
       yield* assertTargetWithinLimits(limits, target.thread);

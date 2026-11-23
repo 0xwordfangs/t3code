@@ -1048,4 +1048,64 @@ describe("Antigravity subscription limits", () => {
         }
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
+
+  it.effect(
+    "strips sensitive URL query parameters from verification messages while preserving verificationUrl",
+    () =>
+      Effect.gen(function* () {
+        const sensitiveUrl = "https://accounts.google.com/v3/signin/continue?plt=SECRET_PLT_TOKEN";
+        for (const payload of [
+          {
+            error: {
+              code: 403,
+              message: "Outer message",
+              status: "PERMISSION_DENIED",
+              details: [
+                {
+                  "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                  reason: "VALIDATION_REQUIRED",
+                  metadata: {
+                    validation_url: sensitiveUrl,
+                    validation_error_message: `Please verify at ${sensitiveUrl} now.`,
+                  },
+                },
+              ],
+            },
+          },
+          {
+            error: {
+              code: 403,
+              message: `Verification required: visit ${sensitiveUrl}`,
+              status: "PERMISSION_DENIED",
+              details: [
+                {
+                  "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                  reason: "VALIDATION_REQUIRED",
+                  metadata: {
+                    validation_url: sensitiveUrl,
+                  },
+                },
+              ],
+            },
+          },
+        ]) {
+          const { probeDetailed } = yield* fixture({
+            summaryStatus: 403,
+            summary: payload,
+          });
+          const result = yield* probeDetailed;
+          expect(result.verificationRequired?.verificationUrl).toBe(
+            GoogleAccountVerificationUrl.make(sensitiveUrl),
+          );
+          expect(result.verificationRequired?.message).not.toContain("SECRET_PLT_TOKEN");
+          expect(result.verificationRequired?.message).toContain(
+            "https://accounts.google.com/v3/signin/continue",
+          );
+          expect(result.usageLimits.unavailable?.message).not.toContain("SECRET_PLT_TOKEN");
+          expect(result.usageLimits.unavailable?.message).toContain(
+            "https://accounts.google.com/v3/signin/continue",
+          );
+        }
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
 });

@@ -39,6 +39,7 @@ import { AgentScope, AgentScopeThreadId } from "@t3tools/shared/AgentScope";
 import { HTML_RENDER_TOOL_NAME } from "@t3tools/shared/htmlRender";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { type SelfInvocation, selfInvocationArgs } from "@t3tools/shared/nodeRuntime";
+import { causeErrorTag, redactUrlCredentials } from "@t3tools/shared/observability";
 import { resolveT3McpToolId } from "@t3tools/shared/t3McpToolPresentation";
 import {
   compactDynamicToolOutput,
@@ -10313,14 +10314,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         unstartedOnly: agentAnswered,
                       });
                     }
+                    const providerFailure =
+                      flavor.promptFailure?.(failure) ??
+                      makeProviderFailure({
+                        cause: failure,
+                        class: "provider_error",
+                      });
                     yield* finalizeTurn(
                       context,
                       interrupted ? "interrupted" : "failed",
-                      flavor.promptFailure?.(failure) ??
-                        makeProviderFailure({
-                          cause: failure,
-                          class: "provider_error",
-                        }),
+                      providerFailure,
                     ).pipe(
                       Effect.andThen(
                         Effect.logWarning("orchestration-v2.acp-prompt-failed", {
@@ -10328,7 +10331,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           providerSessionId: input.providerSessionId,
                           providerThreadId: turnInput.providerThread.id,
                           providerTurnId,
-                          cause,
+                          errorTag: causeErrorTag(cause),
+                          failureClass: providerFailure.class,
+                          failureCode: providerFailure.code,
+                          message: redactUrlCredentials(providerFailure.message),
                         }),
                       ),
                     );

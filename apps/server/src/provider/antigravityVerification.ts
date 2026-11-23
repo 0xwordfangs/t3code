@@ -1,4 +1,5 @@
 import { GoogleAccountVerificationUrl } from "@t3tools/contracts";
+import { sanitizeProviderFailureMessage } from "@t3tools/provider-core/server/failure";
 import * as Schema from "effect/Schema";
 
 export const ANTIGRAVITY_VERIFICATION_REQUIRED_CODE = "VALIDATION_REQUIRED";
@@ -108,8 +109,11 @@ export function extractAntigravityVerificationRequired(
 
   if (!matched) return undefined;
   const verificationUrl = validationUrl ?? helpUrl;
+  const rawMessage = validationMessage ?? nonEmptyString(error.message);
+  const sanitizedMessage =
+    rawMessage !== undefined ? sanitizeProviderFailureMessage(rawMessage) : "";
   const message =
-    validationMessage ?? nonEmptyString(error.message) ?? ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
+    sanitizedMessage.length > 0 ? sanitizedMessage : ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
   return {
     message,
     ...(verificationUrl === undefined ? {} : { verificationUrl }),

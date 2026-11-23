@@ -26,6 +26,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { acpProviderOptionDescriptors } from "@t3tools/provider-acp/server/sessionConfig";
+import { sanitizeProviderFailureMessage } from "@t3tools/provider-core/server/failure";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
 import {
   makeManualOnlyProviderMaintenanceCapabilities,
@@ -307,7 +308,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
               }
               if (probed.verificationRequired !== undefined) {
                 const verificationMessage =
-                  probed.verificationRequired.message.trim() ||
+                  sanitizeProviderFailureMessage(probed.verificationRequired.message) ||
                   ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
                 const verificationUrl =
                   probed.verificationRequired.verificationUrl ?? state.draft.auth.verificationUrl;
@@ -756,7 +757,8 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       yield* FiberHandle.clear(usageRead);
       const updatedAt = DateTime.formatIso(yield* DateTime.now);
       const verificationMessage =
-        input.message?.trim() || ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
+        (input.message !== undefined ? sanitizeProviderFailureMessage(input.message) : "") ||
+        ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
       yield* SubscriptionRef.update(metadata, (state) => {
         if (state.draft.auth.status === "unauthenticated") return state;
         const verificationUrl = input.verificationUrl ?? state.draft.auth.verificationUrl;
@@ -788,44 +790,50 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     },
   );
 
-  const clearAccountMetadata = Effect.fn("AntigravityProvider.clearAccountMetadata")(function* () {
-    yield* resetUsage;
-    if (!settings.enabled) return;
-    const updatedAt = DateTime.formatIso(yield* DateTime.now);
-    yield* SubscriptionRef.update(
-      metadata,
-      (state) =>
-        ({
-          authRevision: state.authRevision + 1,
-          verificationRequired: false,
-          draft: {
-            ...state.draft,
-            auth: {
-              status: "unauthenticated",
-              ...(usesCredentials ? options.auth : {}),
+  const clearAccountMetadata = Effect.fn("AntigravityProvider.clearAccountMetadata")(
+    function* (clearOptions?: { readonly syncRepublish?: boolean }) {
+      yield* resetUsage;
+      if (!settings.enabled) return;
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* SubscriptionRef.update(
+        metadata,
+        (state) =>
+          ({
+            authRevision: state.authRevision + 1,
+            verificationRequired: false,
+            draft: {
+              ...state.draft,
+              auth: {
+                status: "unauthenticated",
+                ...(usesCredentials ? options.auth : {}),
+              },
+              status: "warning",
+              message: signInMessage,
+              checkedAt: updatedAt,
+              models: [],
+              slashCommands: [],
+              skills: [],
+              workspaceSnapshots: [],
+              supportsTextGeneration: false,
+              usageLimits: undefined,
             },
-            status: "warning",
-            message: signInMessage,
-            checkedAt: updatedAt,
-            models: [],
-            slashCommands: [],
-            skills: [],
-            workspaceSnapshots: [],
-            supportsTextGeneration: false,
-            usageLimits: undefined,
-          },
-        }) satisfies AntigravityProviderState,
-    );
-    discoveredSkills.clear();
-    thinkingLevels.clear();
-    // Fork so sign-out cannot deadlock if an in-flight health check holds managedProvider's lock.
-    yield* Deferred.await(republish).pipe(
-      Effect.flatten,
-      Effect.provideService(PublishingUsage, true),
-      Effect.ignoreCause({ log: true }),
-      Effect.forkIn(scope),
-    );
-  });
+          }) satisfies AntigravityProviderState,
+      );
+      discoveredSkills.clear();
+      thinkingLevels.clear();
+      const publish = Deferred.await(republish).pipe(
+        Effect.flatten,
+        Effect.provideService(PublishingUsage, true),
+        Effect.ignoreCause({ log: true }),
+      );
+      if (clearOptions?.syncRepublish === true) {
+        yield* publish;
+      } else {
+        // Fork so sign-out cannot deadlock if an in-flight health check holds managedProvider's lock.
+        yield* Effect.forkIn(publish, scope);
+      }
+    },
+  );
 
   const snapshotForCwd = Effect.fn("AntigravityProvider.snapshotForCwd")(function* (
     cwd: string,
@@ -861,30 +869,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     onConfigOptionsUpdated,
     onAvailableCommands,
     onVerificationRequired,
-    // The new sign-in may be another account. Clear and republish its limits so a failed read
-    // cannot fall back to them; the session start then reads the new account's limits.
-    onSignedIn: resetUsage.pipe(
-      Effect.andThen(
-        SubscriptionRef.update(metadata, (state) => {
-          const { usageLimits: _previousAccount, ...draft } = state.draft;
-          return {
-            authRevision: state.authRevision + 1,
-            verificationRequired: false,
-            draft: {
-              ...draft,
-              auth: withAuthVerification(withAuthEmail(draft.auth, undefined), undefined),
-            },
-          };
-        }),
-      ),
-      Effect.andThen(
-        Deferred.await(republish).pipe(
-          Effect.flatten,
-          Effect.provideService(PublishingUsage, true),
-        ),
-      ),
-      Effect.asVoid,
-    ),
+    onSignedIn: clearAccountMetadata({ syncRepublish: true }),
     onSignedOut: clearAccountMetadata(),
     onAuthRequired: clearAccountMetadata(),
     snapshotForCwd,

@@ -25,8 +25,10 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as References from "effect/References";
 import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -117,7 +119,7 @@ const makeHarness = Effect.fnUntraced(function* (options: {
     | undefined;
   let onOutgoingResponse: ((requestId: string) => Effect.Effect<void>) | undefined;
   let promptStarted = yield* Deferred.make<void>();
-  let promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+  let promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>();
   let cancelCalled = yield* Deferred.make<void>();
   let runtimeScopeCloseCount = 0;
   let runtimeCreateCount = 0;
@@ -559,7 +561,7 @@ const makeHarness = Effect.fnUntraced(function* (options: {
     },
     resetPrompt: Effect.gen(function* () {
       promptStarted = yield* Deferred.make<void>();
-      promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+      promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>();
       cancelCalled = yield* Deferred.make<void>();
     }),
   };
@@ -2154,5 +2156,58 @@ describe("AcpAdapterV2 URL elicitation admission and permit release (R2-CF-02)",
         });
         assert.equal(urlCalls, 1);
       }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("does not log raw plt credentials in orchestration-v2.acp-prompt-failed warnings", () =>
+    Effect.gen(function* () {
+      const promptFailureLogs = yield* Queue.unbounded<ReadonlyArray<unknown>>();
+      const captureLogger = Logger.make<unknown, void>((options) => {
+        const parts = Array.isArray(options.message) ? options.message : [options.message];
+        if (parts[0] === "orchestration-v2.acp-prompt-failed") {
+          Queue.offerUnsafe(promptFailureLogs, parts);
+        }
+      });
+
+      yield* Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "r2-cf14-prompt-failed-log",
+          runtimeMode: "full-access",
+        });
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        const validationUrl =
+          "https://accounts.google.com/v3/signin/continue?plt=SECRET_PLT_ADAPTER&continue=https%3A%2F%2Fexample.com";
+        yield* Deferred.fail(
+          harness.promptGate,
+          EffectAcpErrors.AcpRequestError.internalError(`Verification required: ${validationUrl}`, {
+            validation_url: validationUrl,
+          }),
+        );
+
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        const loggedParts = yield* Queue.take(promptFailureLogs);
+        const serialized = JSON.stringify(loggedParts);
+        assert.notInclude(serialized, "SECRET_PLT_ADAPTER");
+        assert.notInclude(serialized, "validation_url");
+
+        const fields = loggedParts[1] as Record<string, unknown>;
+        assert.equal(fields.errorTag, "AcpRequestError");
+        assert.equal(fields.failureClass, "provider_error");
+        assert.isUndefined(fields.cause);
+        assert.isString(fields.message);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Logger.layer([captureLogger], { mergeWithExisting: false }),
+            Layer.succeed(References.MinimumLogLevel, "Info"),
+          ),
+        ),
+      );
+    }).pipe(Effect.provide(layerTest)),
   );
 });

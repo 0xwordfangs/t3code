@@ -297,9 +297,15 @@ const hasSwitchedAntigravityAccount = (
   if (nextProvider.driver !== antigravity || previousProvider.driver !== antigravity) {
     return false;
   }
-  const previousEmail = previousProvider.auth.email?.trim().toLowerCase();
-  const nextEmail = nextProvider.auth.email?.trim().toLowerCase();
-  return previousEmail !== undefined && nextEmail !== undefined && previousEmail !== nextEmail;
+  const previousEmail = previousProvider.auth.email?.trim().toLowerCase() || undefined;
+  const nextEmail = nextProvider.auth.email?.trim().toLowerCase() || undefined;
+  if (previousEmail === undefined) {
+    return false;
+  }
+  if (nextEmail === undefined) {
+    return nextProvider.auth.status !== "unknown";
+  }
+  return previousEmail !== nextEmail;
 };
 
 /** Antigravity health checks only initialize; preserve previously verified Google auth across restarts. */

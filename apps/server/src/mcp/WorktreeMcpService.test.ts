@@ -678,6 +678,20 @@ describe("t3_worktree_handoff", () => {
       expect(harness.dispatch).toHaveBeenCalled();
     });
   });
+
+  it.effect("rejects /logout continuationPrompt before creating a git worktree", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      for (const continuationPrompt of ["/logout", " /LOGOUT \n"]) {
+        const exit = yield* Effect.exit(
+          runHandoff(harness, { branch: "feature/logout", continuationPrompt }),
+        );
+        expectTypedFailure(exit, { _tag: "WorktreeMcpFailure", code: "invalid_request" });
+      }
+      expect(harness.createWorktree).not.toHaveBeenCalled();
+      expect(harness.dispatch).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("t3_worktree_status", () => {

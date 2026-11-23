@@ -18,6 +18,7 @@ import {
   ORCHESTRATION_PROTOCOL_VERSION,
   ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   ORCHESTRATION_V2_WS_METHODS,
+  type OrchestrationV2Command,
   EnvironmentId,
   EventId,
   GitManagerError,
@@ -30,6 +31,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   RunId,
+  ScheduledTaskId,
   SourceControlRepositoryError,
   WS_METHODS,
   WsRpcGroup,
@@ -38,13 +40,16 @@ import {
   type AuthEnvironmentScope,
   type AuthAccessStreamEvent,
   type OrchestrationV2AppThread,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2Run,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadStreamItem,
   type OrchestrationV2TurnItem,
   type OrchestrationProjectShell,
+  type ScheduledTask,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerProvider,
@@ -103,6 +108,10 @@ import * as ScratchThreadPromotion from "./project/ScratchThreadPromotion.ts";
 import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
 import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
+import {
+  ProjectionStoreReadError,
+  ProjectionStoreThreadNotFoundError,
+} from "./orchestration-v2/ProjectionStore.ts";
 import * as OtlpEndpointCheck from "./observability/OtlpEndpointCheck.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
@@ -3130,6 +3139,482 @@ it.effect(
         [AuthOrchestrationReadScope, AuthOrchestrationOperateScope, AuthProvidersManageScope],
         verificationUrl,
       );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+        ),
+      ),
+    ),
+);
+
+it.effect(
+  "requires providers:manage for persisted /logout run resumes and scheduledTasks.runNow",
+  () =>
+    Effect.gen(function* () {
+      const logoutThreadId = ThreadId.make("thread:persisted-logout");
+      const benignThreadId = ThreadId.make("thread:persisted-benign");
+      const heldLogoutThreadId = ThreadId.make("thread:held-logout");
+      const brokenProjectionThreadId = ThreadId.make("thread:broken-projection");
+      const missingThreadId = ThreadId.make("thread:missing-projection");
+      const logoutPreparedRunId = RunId.make("run:logout-prepared");
+      const benignPreparedRunId = RunId.make("run:benign-prepared");
+      const logoutQueuedRunId = RunId.make("run:logout-queued");
+      const heldLogoutQueuedRunId = RunId.make("run:held-logout-queued");
+      const benignQueuedRunId = RunId.make("run:benign-queued");
+      const benignOnlyRunId = RunId.make("run:benign-only");
+      const logoutPreparedMsgId = MessageId.make("msg:logout-prepared");
+      const benignPreparedMsgId = MessageId.make("msg:benign-prepared");
+      const logoutQueuedMsgId = MessageId.make("msg:logout-queued");
+      const heldLogoutQueuedMsgId = MessageId.make("msg:held-logout-queued");
+      const benignQueuedMsgId = MessageId.make("msg:benign-queued");
+      const benignOnlyMsgId = MessageId.make("msg:benign-only");
+      const logoutTaskId = ScheduledTaskId.make("task:logout");
+      const benignTaskId = ScheduledTaskId.make("task:benign");
+      const projectId = ProjectId.make("project:persisted-logout");
+      const instanceId = ProviderInstanceId.make("codex");
+      const at = DateTime.makeUnsafe("2026-11-23T00:00:00.000Z");
+
+      const makeRun = (
+        threadId: ThreadId,
+        id: RunId,
+        userMessageId: MessageId,
+        status: OrchestrationV2Run["status"],
+        ordinal: number,
+        queueHeld?: boolean,
+      ): OrchestrationV2Run => ({
+        id,
+        threadId,
+        ordinal,
+        providerInstanceId: instanceId,
+        modelSelection: { instanceId, model: "gpt-5.4" },
+        providerThreadId: null,
+        userMessageId,
+        rootNodeId: null,
+        activeAttemptId: null,
+        status,
+        ...(queueHeld === undefined ? {} : { queueHeld }),
+        requestedAt: at,
+        startedAt: null,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+      });
+      const makeMessage = (
+        threadId: ThreadId,
+        id: MessageId,
+        runId: RunId,
+        text: string,
+      ): OrchestrationV2ConversationMessage => ({
+        id,
+        threadId,
+        runId,
+        nodeId: null,
+        role: "user",
+        text,
+        attachments: [],
+        streaming: false,
+        createdBy: "user",
+        creationSource: "web",
+        createdAt: at,
+        updatedAt: at,
+      });
+
+      const runsByThread = new Map<ThreadId, ReadonlyArray<OrchestrationV2Run>>([
+        [
+          logoutThreadId,
+          [
+            makeRun(logoutThreadId, logoutPreparedRunId, logoutPreparedMsgId, "preparing", 1),
+            makeRun(logoutThreadId, benignQueuedRunId, benignQueuedMsgId, "queued", 2),
+            makeRun(logoutThreadId, logoutQueuedRunId, logoutQueuedMsgId, "queued", 3),
+          ],
+        ],
+        [
+          heldLogoutThreadId,
+          [
+            makeRun(heldLogoutThreadId, benignPreparedRunId, benignPreparedMsgId, "failed", 1),
+            makeRun(
+              heldLogoutThreadId,
+              heldLogoutQueuedRunId,
+              heldLogoutQueuedMsgId,
+              "queued",
+              2,
+              true,
+            ),
+          ],
+        ],
+        [
+          benignThreadId,
+          [makeRun(benignThreadId, benignOnlyRunId, benignOnlyMsgId, "queued", 1, true)],
+        ],
+      ]);
+      const messagesById = new Map<MessageId, OrchestrationV2ConversationMessage>([
+        [
+          logoutPreparedMsgId,
+          makeMessage(logoutThreadId, logoutPreparedMsgId, logoutPreparedRunId, "/logout"),
+        ],
+        [
+          benignPreparedMsgId,
+          makeMessage(heldLogoutThreadId, benignPreparedMsgId, benignPreparedRunId, "setup"),
+        ],
+        [
+          benignQueuedMsgId,
+          makeMessage(logoutThreadId, benignQueuedMsgId, benignQueuedRunId, "keep going"),
+        ],
+        [
+          logoutQueuedMsgId,
+          makeMessage(logoutThreadId, logoutQueuedMsgId, logoutQueuedRunId, " /LOGOUT \n"),
+        ],
+        [
+          heldLogoutQueuedMsgId,
+          makeMessage(heldLogoutThreadId, heldLogoutQueuedMsgId, heldLogoutQueuedRunId, "/logout"),
+        ],
+        [
+          benignOnlyMsgId,
+          makeMessage(benignThreadId, benignOnlyMsgId, benignOnlyRunId, "normal prompt"),
+        ],
+      ]);
+      const makeTask = (id: ScheduledTaskId, prompt: string): ScheduledTask =>
+        ({
+          id,
+          title: id,
+          prompt,
+          enabled: true,
+          schedule: { type: "interval", everyMs: 60_000 },
+          projectId,
+          threadId: null,
+          workspaceStrategy: { type: "root" },
+          modelSelection: { instanceId, model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdBy: "user",
+          creationSource: "web",
+          createdAt: "2026-11-23T00:00:00.000Z",
+          updatedAt: "2026-11-23T00:00:00.000Z",
+          nextRunAt: null,
+          lastRunAt: null,
+          lastRunStatus: null,
+          lastRunError: null,
+          lastRunThreadId: null,
+          runCount: 0,
+        }) as unknown as ScheduledTask;
+      const tasks: ReadonlyArray<ScheduledTask> = [
+        makeTask(logoutTaskId, " /LOGOUT "),
+        makeTask(benignTaskId, "daily summary"),
+      ];
+
+      let dispatchedCount = 0;
+      let retriedCount = 0;
+      let runNowCount = 0;
+
+      const services = Layer.mergeAll(
+        layerUnusedConfigRpcServices,
+        Layer.mock(AnalyticsService.AnalyticsService)({
+          record: () => Effect.void,
+        }),
+        Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+        Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+        Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),
+        Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+        Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+        Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
+          enqueueCommand: (effect) => effect,
+        }),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+          retryPreparation: () =>
+            Effect.sync(() => {
+              retriedCount += 1;
+              return { sequence: retriedCount, replayed: false } as never;
+            }),
+        }),
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          getThreadRecords: (threadId, _fields, filter) => {
+            if (threadId === brokenProjectionThreadId) {
+              return Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId,
+                  cause: new ProjectionStoreReadError({ threadId, cause: "SQLITE_BUSY" }),
+                }),
+              );
+            }
+            if (threadId === missingThreadId) {
+              return Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId,
+                  cause: new ProjectionStoreThreadNotFoundError({ threadId }),
+                }),
+              );
+            }
+            return Effect.sync(() => {
+              const allRuns = runsByThread.get(threadId) ?? [];
+              const filtered = allRuns.filter(
+                (run) =>
+                  (filter?.runIds === undefined || filter.runIds.includes(run.id)) &&
+                  (filter?.runStatuses === undefined || filter.runStatuses.includes(run.status)),
+              );
+              return { runs: filtered } as never;
+            });
+          },
+          getMessagesById: (_threadId, ids) =>
+            Effect.sync(() => {
+              const result = new Map<MessageId, OrchestrationV2ConversationMessage>();
+              for (const id of ids) {
+                const message = messagesById.get(id);
+                if (message !== undefined) result.set(id, message);
+              }
+              return result;
+            }),
+          dispatch: () =>
+            Effect.sync(() => {
+              dispatchedCount += 1;
+              return { sequence: dispatchedCount, replayed: false, storedEvents: [] } as never;
+            }),
+        }),
+        Layer.mock(ScheduledTasks.ScheduledTaskService)({
+          list: () => Effect.succeed({ tasks }),
+          runNow: ({ id }) =>
+            Effect.sync(() => {
+              runNowCount += 1;
+              const task = tasks.find((candidate) => candidate.id === id)!;
+              return { task, threadId: null };
+            }),
+        }),
+      );
+
+      const makeClient = (scopes: ReadonlyArray<AuthEnvironmentScope>, id: string) =>
+        Effect.gen(function* () {
+          const exits = yield* Queue.unbounded<Exit.Exit<unknown, unknown>>();
+          const server = yield* RpcServer.makeNoSerialization(WsRpcGroup, {
+            ...WS_RPC_SERVER_OPTIONS,
+            onFromServer: (response) =>
+              response._tag === "Exit" ? Queue.offer(exits, response.exit) : Effect.void,
+          }).pipe(
+            Effect.provide(
+              layerWsRpc(
+                {
+                  sessionId: AuthSessionId.make(`persisted-logout:${id}`),
+                  subject: id,
+                  method: "browser-session-cookie",
+                  scopes,
+                },
+                {},
+                yield* ServerBrowser.ServerBrowser,
+                () => Effect.void,
+                { secretReferences: true },
+              ).pipe(Layer.provide(services), Layer.merge(RpcAuthorization.layer(scopes))),
+            ),
+          );
+          let seq = 0;
+          const send = (
+            request:
+              | {
+                  readonly tag: typeof ORCHESTRATION_V2_WS_METHODS.dispatchCommand;
+                  readonly payload: OrchestrationV2Command;
+                }
+              | {
+                  readonly tag: typeof WS_METHODS.scheduledTasksRunNow;
+                  readonly payload: { readonly id: ScheduledTaskId };
+                },
+          ) =>
+            Effect.gen(function* () {
+              seq += 1;
+              yield* server.write(0, {
+                _tag: "Request",
+                id: RpcMessage.RequestId(`${id}:${seq}`),
+                ...request,
+                headers: Headers.empty,
+              });
+              return yield* Queue.take(exits);
+            });
+          return send;
+        });
+
+      const operatorCall = yield* makeClient([AuthOrchestrationOperateScope], "operator");
+      const managerCall = yield* makeClient(
+        [AuthOrchestrationOperateScope, AuthProvidersManageScope],
+        "manager",
+      );
+
+      const logoutCommands: ReadonlyArray<OrchestrationV2Command> = [
+        {
+          type: "prepared-run.retry",
+          commandId: CommandId.make("cmd:retry-logout"),
+          threadId: logoutThreadId,
+          runId: logoutPreparedRunId,
+        },
+        {
+          type: "prepared-run.release",
+          commandId: CommandId.make("cmd:release-logout"),
+          threadId: logoutThreadId,
+          runId: logoutPreparedRunId,
+        },
+        // Starting a benign queued run unholds the rest of the thread's queue, including /logout.
+        {
+          type: "queued-run.start",
+          commandId: CommandId.make("cmd:start-queued-logout"),
+          threadId: logoutThreadId,
+          runId: benignQueuedRunId,
+        },
+        {
+          type: "queue.resume",
+          commandId: CommandId.make("cmd:resume-queue-logout"),
+          threadId: logoutThreadId,
+        },
+        // Benign message.dispatch and benign prepared-run.retry unhold held queued /logout runs.
+        {
+          type: "message.dispatch",
+          commandId: CommandId.make("cmd:dispatch-unhold-logout"),
+          threadId: heldLogoutThreadId,
+          messageId: MessageId.make("msg:benign-unhold"),
+          text: "ok",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "start_immediately" },
+        },
+        {
+          type: "prepared-run.retry",
+          commandId: CommandId.make("cmd:retry-benign-unhold-logout"),
+          threadId: heldLogoutThreadId,
+          runId: benignPreparedRunId,
+        },
+      ];
+
+      for (const command of logoutCommands) {
+        const exit = yield* operatorCall({
+          tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+          payload: command,
+        });
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          assert.deepInclude(Cause.squash(exit.cause) as object, {
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthProvidersManageScope,
+          });
+        }
+      }
+      // Transient projection read failures must fail closed instead of bypassing the /logout gate.
+      const projectionFailed = yield* operatorCall({
+        tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+        payload: {
+          type: "queue.resume",
+          commandId: CommandId.make("cmd:resume-broken-projection"),
+          threadId: brokenProjectionThreadId,
+        },
+      });
+      assert.isTrue(Exit.isFailure(projectionFailed));
+      if (Exit.isFailure(projectionFailed)) {
+        assert.deepInclude(Cause.squash(projectionFailed.cause) as object, {
+          _tag: "OrchestrationV2DispatchCommandError",
+        });
+      }
+      const taskDenied = yield* operatorCall({
+        tag: WS_METHODS.scheduledTasksRunNow,
+        payload: { id: logoutTaskId },
+      });
+      assert.isTrue(Exit.isFailure(taskDenied));
+      if (Exit.isFailure(taskDenied)) {
+        assert.deepInclude(Cause.squash(taskDenied.cause) as object, {
+          _tag: "EnvironmentAuthorizationError",
+          requiredPermission: AuthProvidersManageScope,
+        });
+      }
+      assert.equal(dispatchedCount, 0);
+      assert.equal(retriedCount, 0);
+      assert.equal(runNowCount, 0);
+
+      // Benign queued runs, missing threads, and scheduled tasks remain allowed for orchestration:operate.
+      const benignCommands: ReadonlyArray<OrchestrationV2Command> = [
+        {
+          type: "prepared-run.retry",
+          commandId: CommandId.make("cmd:retry-benign"),
+          threadId: benignThreadId,
+          runId: benignOnlyRunId,
+        },
+        {
+          type: "prepared-run.release",
+          commandId: CommandId.make("cmd:release-benign"),
+          threadId: benignThreadId,
+          runId: benignOnlyRunId,
+        },
+        {
+          type: "queued-run.start",
+          commandId: CommandId.make("cmd:start-benign"),
+          threadId: benignThreadId,
+          runId: benignOnlyRunId,
+        },
+        {
+          type: "queue.resume",
+          commandId: CommandId.make("cmd:resume-benign"),
+          threadId: benignThreadId,
+        },
+        {
+          type: "message.dispatch",
+          commandId: CommandId.make("cmd:dispatch-benign-held"),
+          threadId: benignThreadId,
+          messageId: MessageId.make("msg:benign-held-dispatch"),
+          text: "hello",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "start_immediately" },
+        },
+        {
+          type: "queue.resume",
+          commandId: CommandId.make("cmd:resume-missing-thread"),
+          threadId: missingThreadId,
+        },
+      ];
+      for (const command of benignCommands) {
+        assert.isTrue(
+          Exit.isSuccess(
+            yield* operatorCall({
+              tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+              payload: command,
+            }),
+          ),
+        );
+      }
+      assert.isTrue(
+        Exit.isSuccess(
+          yield* operatorCall({
+            tag: WS_METHODS.scheduledTasksRunNow,
+            payload: { id: benignTaskId },
+          }),
+        ),
+      );
+      assert.equal(retriedCount, 1);
+      assert.equal(dispatchedCount, 5);
+      assert.equal(runNowCount, 1);
+
+      // A providers:manage session is allowed to resume/run the persisted /logout runs and task.
+      for (const command of logoutCommands) {
+        assert.isTrue(
+          Exit.isSuccess(
+            yield* managerCall({
+              tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+              payload: command,
+            }),
+          ),
+        );
+      }
+      assert.isTrue(
+        Exit.isSuccess(
+          yield* managerCall({
+            tag: WS_METHODS.scheduledTasksRunNow,
+            payload: { id: logoutTaskId },
+          }),
+        ),
+      );
+      assert.equal(retriedCount, 3);
+      assert.equal(dispatchedCount, 9);
+      assert.equal(runNowCount, 2);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(

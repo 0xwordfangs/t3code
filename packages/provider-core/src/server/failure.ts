@@ -283,6 +283,10 @@ function boundedText(value: string, maxLength: number): string {
   return `${redacted.slice(0, end)}…`;
 }
 
+export function sanitizeProviderFailureMessage(value: string): string {
+  return boundedText(value, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
+}
+
 const isGoogleAccountVerificationUrl = Schema.is(GoogleAccountVerificationUrl);
 
 function providerFailureTitle(failure: OrchestrationV2ProviderFailure): string {
@@ -306,7 +310,7 @@ export function makeProviderFailure(input: {
   const rawMessage = requestTooLarge
     ? REQUEST_TOO_LARGE_MESSAGE
     : (input.message ?? curated.known ?? curated.category ?? DEFAULT_PROVIDER_FAILURE_MESSAGE);
-  const message = boundedText(rawMessage, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
+  const message = sanitizeProviderFailureMessage(rawMessage);
   const rawCode = input.code ?? stringField(input.cause, "code") ?? null;
   const code =
     rawCode === null ? null : boundedText(rawCode, MAX_PROVIDER_FAILURE_CODE_LENGTH) || null;

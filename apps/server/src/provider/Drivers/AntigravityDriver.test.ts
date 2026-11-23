@@ -10,6 +10,7 @@ import {
   type AntigravitySettings,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -799,11 +800,212 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         expect(loginLaunch?.environment.SSH_CONNECTION).toBe("127.0.0.1 0 127.0.0.1 0");
         expect(loginLaunch?.environment.DISPLAY).toBeUndefined();
         expect(loginLaunch?.environment.WAYLAND_DISPLAY).toBeUndefined();
+        expect(loginLaunch?.profileDirectory).toBeDefined();
+        expect(loginLaunch?.profileDirectory).not.toBe(h.profileDirectory);
+        expect(yield* fs.exists(loginLaunch!.profileDirectory!)).toBe(false);
+        const liveTokenPath = path.join(
+          h.profileDirectory,
+          "antigravity-acp",
+          "antigravity-oauth-token",
+        );
+        expect(yield* fs.readFileString(liveTokenPath)).toBe(
+          '{"id_token_email":"isolated@example.com"}',
+        );
+        expect((yield* fs.stat(liveTokenPath)).mode & 0o777).toBe(0o600);
         expect((yield* h.instance.snapshot.getSnapshot).auth).toMatchObject({
           status: "authenticated",
           type: "oauth-personal",
           email: "isolated@example.com",
         });
+        yield* h.assertClosed;
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "preserves live Account A credentials and cleans up staging on failed or cancelled staged code login",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const nodePath = yield* HostProcess.ExecutablePath;
+        const h = yield* makeHarness({ config: { authMethod: "oauth-personal" } });
+        const liveAcpDir = path.join(h.profileDirectory, "antigravity-acp");
+        const liveTokenPath = path.join(liveAcpDir, "antigravity-oauth-token");
+        const accountAToken = JSON.stringify({
+          id_token_email: "account-a@example.com",
+          token: { refresh_token: "refresh-a" },
+        });
+        yield* fs.makeDirectory(liveAcpDir, { recursive: true });
+        yield* fs.writeFileString(liveTokenPath, accountAToken);
+        yield* h.refresh();
+        const beforeSnapshot = yield* h.instance.snapshot.getSnapshot;
+        expect(beforeSnapshot.auth).toMatchObject({
+          status: "authenticated",
+          email: "account-a@example.com",
+        });
+        expect(beforeSnapshot.models.length).toBeGreaterThan(0);
+
+        const cliDir = path.join(path.dirname(h.first.executablePath), "staged-cli");
+        yield* fs.makeDirectory(cliDir, { recursive: true });
+        const loginUrl =
+          "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=staged-state";
+        const subRequiredAgent = path.join(cliDir, "sub-required-agent.mjs");
+        yield* fs.writeFileString(
+          subRequiredAgent,
+          [
+            'import * as readline from "node:readline";',
+            "const rl = readline.createInterface({ input: process.stdin });",
+            'rl.on("line", (line) => {',
+            "  const msg = JSON.parse(line);",
+            '  if (msg.method === "initialize") {',
+            '    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, authMethods: [{ id: "oauth-personal", name: "Google" }] } }) + "\\n");',
+            "  } else if (msg.id !== undefined) {",
+            '    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "SUBSCRIPTION_REQUIRED" } }) + "\\n");',
+            "  }",
+            "});",
+            "",
+          ].join("\n"),
+        );
+
+        const writeCli = (
+          name: string,
+          options: {
+            readonly writeBeforeUrl?: boolean;
+            readonly failVerify?: boolean;
+          },
+        ) =>
+          Effect.gen(function* () {
+            const executablePath = path.join(cliDir, name);
+            const writeToken = [
+              `mkdir -p "$GEMINI_HOME/antigravity-acp"`,
+              `printf '{"id_token_email":"account-b@example.com","token":{"refresh_token":"refresh-b"}}' > "$GEMINI_HOME/antigravity-acp/antigravity-oauth-token"`,
+            ];
+            yield* fs.writeFileString(
+              executablePath,
+              [
+                "#!/bin/sh",
+                'case " $* " in',
+                '  *" --login "*)',
+                ...(options.writeBeforeUrl
+                  ? [
+                      ...writeToken,
+                      `    printf '%s\\n' ${shellQuote(loginUrl)}`,
+                      "    IFS= read -r code",
+                    ]
+                  : [
+                      `    printf '%s\\n' ${shellQuote(loginUrl)}`,
+                      "    IFS= read -r code",
+                      ...writeToken,
+                    ]),
+                "    exit 0",
+                "    ;;",
+                "esac",
+                options.failVerify
+                  ? `exec ${shellQuote(nodePath)} ${shellQuote(subRequiredAgent)}`
+                  : `exec ${shellQuote(h.first.executablePath)} "$@"`,
+                "",
+              ].join("\n"),
+            );
+            yield* fs.chmod(executablePath, 0o755);
+            return {
+              executablePath,
+              harnessPath: null,
+              source: "path" as const,
+              version: "1.5.13",
+              managedVersionDirectory: null,
+            };
+          });
+
+        const auth = h.instance.auth;
+        if (!auth?.respond) return yield* Effect.die("Antigravity auth respond is missing.");
+        const owner = "staged-owner";
+
+        // 1. Failed post-login verification (SUBSCRIPTION_REQUIRED).
+        h.controls.selected = yield* writeCli("agy-sub-required", { failVerify: true });
+        const failedFlow = yield* auth.start(owner);
+        yield* auth.subscribe(owner).pipe(
+          Stream.filter((state) => state.phase === "waiting"),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+        yield* auth.respond(owner, {
+          instanceId: h.instance.instanceId,
+          flowId: failedFlow.flowId!,
+          interactionId: failedFlow.flowId!,
+          response: { type: "credentials", values: { code: "4/0Ab-sub-fail" } },
+        });
+        const failedState = yield* auth.subscribe(owner).pipe(
+          Stream.filter((state) => state.phase === "failed"),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+        expect(failedState.message).toContain("eligible Antigravity subscription");
+        expect(yield* fs.readFileString(liveTokenPath)).toBe(accountAToken);
+        expect(yield* h.instance.snapshot.getSnapshot).toMatchObject({
+          auth: { status: "authenticated", email: "account-a@example.com" },
+          models: beforeSnapshot.models,
+        });
+
+        // 2. Cancelled post-login verification.
+        h.controls.selected = yield* writeCli("agy-cancel-verify", {});
+        const verifyEntered = yield* Deferred.make<void>();
+        let acquireCount = 0;
+        h.controls.beforeAcquire = Effect.suspend(() => {
+          acquireCount += 1;
+          return acquireCount === 2
+            ? Deferred.succeed(verifyEntered, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.void;
+        });
+        const cancelVerifyFlow = yield* auth.start(owner);
+        yield* auth.subscribe(owner).pipe(
+          Stream.filter((state) => state.phase === "waiting"),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+        yield* auth.respond(owner, {
+          instanceId: h.instance.instanceId,
+          flowId: cancelVerifyFlow.flowId!,
+          interactionId: cancelVerifyFlow.flowId!,
+          response: { type: "credentials", values: { code: "4/0Ab-cancel-verify" } },
+        });
+        yield* Deferred.await(verifyEntered);
+        yield* auth.cancel(owner, cancelVerifyFlow.flowId!);
+        h.controls.beforeAcquire = Effect.void;
+        expect(yield* fs.readFileString(liveTokenPath)).toBe(accountAToken);
+        expect((yield* h.instance.snapshot.getSnapshot).auth).toMatchObject({
+          status: "authenticated",
+          email: "account-a@example.com",
+        });
+
+        // 3. Cancelled mid-codeLogin after staging token write.
+        h.controls.selected = yield* writeCli("agy-cancel-login", { writeBeforeUrl: true });
+        const cancelLoginFlow = yield* auth.start(owner);
+        yield* auth.subscribe(owner).pipe(
+          Stream.filter((state) => state.phase === "waiting"),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+        const activeStagingProfile = h.launches.at(-1)?.profileDirectory;
+        expect(activeStagingProfile).toBeDefined();
+        expect(activeStagingProfile).not.toBe(h.profileDirectory);
+        expect(
+          yield* fs.exists(
+            path.join(activeStagingProfile!, "antigravity-acp", "antigravity-oauth-token"),
+          ),
+        ).toBe(true);
+        yield* auth.cancel(owner, cancelLoginFlow.flowId!);
+        expect(yield* fs.exists(activeStagingProfile!)).toBe(false);
+        expect(yield* fs.readFileString(liveTokenPath)).toBe(accountAToken);
+        expect((yield* h.instance.snapshot.getSnapshot).auth).toMatchObject({
+          status: "authenticated",
+          email: "account-a@example.com",
+        });
+
+        // All staging profile directories under runtimeTemp are cleaned up.
+        const tempEntries = yield* fs
+          .readDirectory(h.directories.runtimeTemp)
+          .pipe(Effect.orElseSucceed(() => []));
+        expect(tempEntries.filter((entry) => entry.startsWith("login-profile-"))).toEqual([]);
         yield* h.assertClosed;
       }),
   );

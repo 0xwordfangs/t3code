@@ -23,6 +23,8 @@ import {
   errorTag,
   makeLocalFileTracer,
   makeTraceSink,
+  redactCauseCredentials,
+  redactUrlCredentials,
   type EffectTraceRecord,
   type TraceRecord,
   OtlpHeadersFromString,
@@ -51,6 +53,63 @@ describe("causeErrorTag", () => {
       causeErrorTag(Cause.fail({ _tag: "ServerAuthInvalidCredentialError" })),
       "ServerAuthInvalidCredentialError",
     );
+  });
+});
+
+describe("redactUrlCredentials", () => {
+  it("redacts URL credential query parameters without corrupting plain error prose", () => {
+    assert.equal(
+      redactUrlCredentials(
+        "https://accounts.google.com/v3/signin/continue?plt=SECRET_PLT_1&continue=https%3A%2F%2Fexample.com&plt=SECRET_PLT_2",
+      ),
+      "https://accounts.google.com/v3/signin/continue?plt=<redacted>&continue=https%3A%2F%2Fexample.com&plt=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials(
+        '{"validation_url":"https://accounts.google.com/v3/signin/continue?foo=1\\u0026plt=SECRET_ESCAPED\\u0026token=SECRET_TOK"}',
+      ),
+      '{"validation_url":"https://accounts.google.com/v3/signin/continue?foo=1\\u0026plt=<redacted>\\u0026token=<redacted>"}',
+    );
+    assert.equal(
+      redactUrlCredentials(
+        "https://example.com/cb?access_token=AT_SECRET&id_token=ID_SECRET&refresh_token=RT_SECRET&code=CODE_SECRET&token=TOK_SECRET&state=ok",
+      ),
+      "https://example.com/cb?access_token=<redacted>&id_token=<redacted>&refresh_token=<redacted>&code=<redacted>&token=<redacted>&state=ok",
+    );
+    assert.equal(
+      redactUrlCredentials("Command failed with exit code=1 and status code=403"),
+      "Command failed with exit code=1 and status code=403",
+    );
+    assert.equal(
+      redactUrlCredentials(
+        "url: 'https://accounts.google.com/v3/signin/continue?foo=1&plt=SECRET_QUOTED'",
+      ),
+      "url: 'https://accounts.google.com/v3/signin/continue?foo=1&plt=<redacted>'",
+    );
+    assert.equal(
+      redactUrlCredentials(
+        '{"nested":"https://accounts.google.com/v3/signin/continue?foo=1\\\\u0026plt=SECRET_DOUBLE_ESCAPED"}',
+      ),
+      '{"nested":"https://accounts.google.com/v3/signin/continue?foo=1\\\\u0026plt=<redacted>"}',
+    );
+  });
+
+  it("stays linear on long runs of backslashes without quadratic regex backtracking", () => {
+    const adversarial = `x=1 ${"\\".repeat(200_000)}x`;
+    assert.equal(redactUrlCredentials(adversarial), adversarial);
+  });
+
+  it("redacts URL credentials inside Effect Causes while preserving non-secret causes", () => {
+    const secretCause = Cause.fail(
+      new Error("Verify at https://accounts.google.com/v3/signin/continue?plt=SECRET_CAUSE_PLT"),
+    );
+    const redactedCause = redactCauseCredentials(secretCause);
+    const pretty = Cause.pretty(redactedCause);
+    assert.include(pretty, "plt=<redacted>");
+    assert.notInclude(pretty, "SECRET_CAUSE_PLT");
+
+    const proseCause = Cause.fail(new Error("Command failed with exit code=1 and status code=403"));
+    assert.strictEqual(redactCauseCredentials(proseCause), proseCause);
   });
 });
 
@@ -452,6 +511,81 @@ describe("observability", () => {
         assert.include(written, "wsTicket=<redacted>&dpop=<redacted>&clientSurface=web");
         assert.include(exported.join("\n"), "effect.cause");
       }),
+    );
+
+    it.effect(
+      "redacts plt and OAuth query credentials from trace files and OTLP delegates without corrupting prose",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const tempDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-trace-sink-" });
+          const tracePath = path.join(tempDir, "plt.trace.ndjson");
+          const sink = yield* makeTraceSink({
+            filePath: tracePath,
+            maxBytes: 1024 * 1024,
+            maxFiles: 2,
+            batchWindowMs: 10_000,
+          });
+          const delegates: Array<Tracer.NativeSpan> = [];
+          const tracer = yield* makeLocalFileTracer({
+            filePath: tracePath,
+            maxBytes: 1024 * 1024,
+            maxFiles: 2,
+            batchWindowMs: 10_000,
+            sink,
+            delegate: Tracer.make({
+              span: (options) => {
+                const span = new Tracer.NativeSpan(options);
+                delegates.push(span);
+                return span;
+              },
+            }),
+          });
+
+          const errorMessage =
+            'Validation failed (exit code=1, status code=403): {"validation_url":"https://accounts.google.com/v3/signin/continue?plt=PLT_SECRET_1&access_token=AT_SECRET\\u0026plt=PLT_SECRET_2","cb":"https://example.com/cb?code=CODE_SECRET&token=TOK_SECRET"}';
+
+          yield* Effect.annotateCurrentSpan({
+            "validation.url":
+              "https://accounts.google.com/v3/signin/continue?foo=1&plt=PLT_ATTR_SECRET",
+          }).pipe(
+            Effect.andThen(Effect.die(new Error(errorMessage))),
+            Effect.tapCause((cause) => Effect.logError(errorMessage, cause)),
+            Effect.withSpan("acp.prompt"),
+            Effect.provideService(Tracer.Tracer, tracer),
+            Effect.provide(Logger.layer([Logger.tracerLogger], { mergeWithExisting: false })),
+            Effect.exit,
+          );
+          yield* sink.close();
+
+          const written = yield* fileSystem.readFileString(tracePath);
+          const exported = delegates.map((span) =>
+            JSON.stringify({
+              attributes: Object.fromEntries(span.attributes),
+              events: span.events.map(([name, , attributes]) => ({ name, attributes })),
+              exit:
+                span.status._tag === "Ended" && Exit.isFailure(span.status.exit)
+                  ? Cause.pretty(span.status.exit.cause)
+                  : "",
+            }),
+          );
+
+          for (const text of [written, ...exported]) {
+            assert.notInclude(text, "PLT_SECRET_1");
+            assert.notInclude(text, "PLT_SECRET_2");
+            assert.notInclude(text, "PLT_ATTR_SECRET");
+            assert.notInclude(text, "AT_SECRET");
+            assert.notInclude(text, "CODE_SECRET");
+            assert.notInclude(text, "TOK_SECRET");
+            assert.include(text, "exit code=1");
+            assert.include(text, "status code=403");
+            assert.include(text, "plt=<redacted>");
+            assert.include(text, "access_token=<redacted>");
+            assert.include(text, "code=<redacted>");
+            assert.include(text, "token=<redacted>");
+          }
+        }),
     );
 
     it.effect("drops only the invalid trace record when serialization fails", () =>

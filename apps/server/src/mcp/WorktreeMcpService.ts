@@ -157,6 +157,15 @@ const make = Effect.gen(function* () {
     scope: McpThreadInvocationScope,
     input: WorktreeMcpHandoffInput,
   ) {
+    if (
+      input.continuationPrompt !== undefined &&
+      input.continuationPrompt.trim().toLowerCase() === "/logout"
+    ) {
+      return yield* failure(
+        "invalid_request",
+        "Worktree handoff continuationPrompt cannot be `/logout`.",
+      );
+    }
     const alreadyInWorktree = (worktreePath: string) =>
       failure(
         "already_in_worktree",

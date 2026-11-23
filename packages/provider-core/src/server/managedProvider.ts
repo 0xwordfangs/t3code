@@ -28,6 +28,7 @@ interface ProviderSnapshotState {
   readonly enrichmentGeneration: number;
   // null preserves an explicitly cleared plan across probes and enrichment.
   readonly usageAuthLabel: string | null | undefined;
+  readonly lastKnownEmail: string | undefined;
   readonly checked: boolean;
 }
 
@@ -42,20 +43,25 @@ function withUsageLimits(
   return usageLimits ? { ...rest, usageLimits } : rest;
 }
 
+function normalizeEmail(value: string | undefined): string | undefined {
+  return value?.trim().toLowerCase() || undefined;
+}
+
 function isDifferentEmail(a: string | undefined, b: string | undefined): boolean {
-  const left = a?.trim().toLowerCase() || undefined;
-  const right = b?.trim().toLowerCase() || undefined;
+  const left = normalizeEmail(a);
+  const right = normalizeEmail(b);
   return left !== undefined && right !== undefined && left !== right;
 }
 
 function hasAuthBoundaryChanged(
   previousAuth: ServerProvider["auth"],
   nextAuth: ServerProvider["auth"],
+  lastKnownEmail?: string | undefined,
 ): boolean {
   return (
     nextAuth.status === "unauthenticated" ||
     previousAuth.status === "unauthenticated" ||
-    isDifferentEmail(previousAuth.email, nextAuth.email) ||
+    isDifferentEmail(normalizeEmail(previousAuth.email) ?? lastKnownEmail, nextAuth.email) ||
     (nextAuth.workspaceId !== undefined && nextAuth.workspaceId !== previousAuth.workspaceId)
   );
 }
@@ -100,6 +106,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     snapshot: initialSnapshot,
     enrichmentGeneration: 0,
     usageAuthLabel: undefined,
+    lastKnownEmail: normalizeEmail(initialSnapshot.auth.email),
     checked: false,
   });
   const settingsRef = yield* Ref.make(initialSettings);
@@ -115,12 +122,21 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
       if (state.enrichmentGeneration !== generation) {
         return [null, state] as const;
       }
-      const accountBoundaryChanged = hasAuthBoundaryChanged(state.snapshot.auth, nextSnapshot.auth);
+      const accountBoundaryChanged = hasAuthBoundaryChanged(
+        state.snapshot.auth,
+        nextSnapshot.auth,
+        state.lastKnownEmail,
+      );
       const authBoundaryChanged =
         accountBoundaryChanged ||
         nextSnapshot.auth.verificationRequired === true ||
         nextSnapshot.auth.verificationUrl !== undefined;
       const nextUsageAuthLabel = accountBoundaryChanged ? undefined : state.usageAuthLabel;
+      const nextLastKnownEmail =
+        nextSnapshot.auth.status === "unauthenticated"
+          ? undefined
+          : (normalizeEmail(nextSnapshot.auth.email) ??
+            (accountBoundaryChanged ? undefined : state.lastKnownEmail));
       // Enrichment must not revert usage updates newer than its input snapshot.
       const merged = withUsageLimits(
         authBoundaryChanged || state.usageAuthLabel === undefined
@@ -132,9 +148,13 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
         authBoundaryChanged ? nextSnapshot.usageLimits : state.snapshot.usageLimits,
       );
       const nextState =
-        nextUsageAuthLabel === state.usageAuthLabel
+        nextUsageAuthLabel === state.usageAuthLabel && nextLastKnownEmail === state.lastKnownEmail
           ? state
-          : { ...state, usageAuthLabel: nextUsageAuthLabel };
+          : {
+              ...state,
+              usageAuthLabel: nextUsageAuthLabel,
+              lastKnownEmail: nextLastKnownEmail,
+            };
       if (Equal.equals(state.snapshot, merged)) {
         return [null, nextState] as const;
       }
@@ -227,7 +247,16 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
           : state.enrichmentGeneration;
         // Failed reads retain limits only for the same account and original workspace.
         const previous = state.snapshot.auth;
-        const switchedAccount = hasAuthBoundaryChanged(previous, probedSnapshot.auth);
+        const switchedAccount = hasAuthBoundaryChanged(
+          previous,
+          probedSnapshot.auth,
+          state.lastKnownEmail,
+        );
+        const nextLastKnownEmail =
+          probedSnapshot.auth.status === "unauthenticated"
+            ? undefined
+            : (normalizeEmail(probedSnapshot.auth.email) ??
+              (switchedAccount ? undefined : state.lastKnownEmail));
         const usageLimits =
           probedSnapshot.auth.status === "unauthenticated"
             ? undefined
@@ -265,7 +294,13 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
         );
         return [
           { snapshot, generation },
-          { snapshot, enrichmentGeneration: generation, usageAuthLabel, checked: true },
+          {
+            snapshot,
+            enrichmentGeneration: generation,
+            usageAuthLabel,
+            lastKnownEmail: nextLastKnownEmail,
+            checked: true,
+          },
         ] as const;
       },
     );

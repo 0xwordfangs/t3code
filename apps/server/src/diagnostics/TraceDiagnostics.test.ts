@@ -297,4 +297,52 @@ describe("TraceDiagnostics", () => {
       });
     }),
   );
+
+  it("redacts pre-existing unredacted URL credentials across failures and warning/error logs", () => {
+    const secretUrl =
+      "https://accounts.google.com/v3/signin/continue?plt=SECRET_PLT_123&continue=https%3A%2F%2Fexample.com";
+    const diagnostics = aggregateLines([
+      record({
+        name: "acp.prompt",
+        traceId: "trace-plt-1",
+        spanId: "span-plt-1",
+        startMs: 1_000,
+        durationMs: 100,
+        exit: { _tag: "Failure", cause: `Validation required: ${secretUrl}` },
+        events: [
+          {
+            name: `acp warning for ${secretUrl}`,
+            timeUnixNano: ns(1_050),
+            attributes: { "effect.logLevel": "Warning" },
+          },
+        ],
+      }),
+      JSON.stringify({
+        type: "otlp-span",
+        name: "browser.auth",
+        traceId: "trace-plt-2",
+        spanId: "span-plt-2",
+        startTimeUnixNano: ns(2_000),
+        endTimeUnixNano: ns(2_050),
+        durationMs: 50,
+        status: { code: "2", message: `Redirect failed: ${secretUrl}` },
+        attributes: {},
+      }),
+    ]);
+
+    assert.equal(diagnostics.latestFailures.length, 2);
+    assert.equal(diagnostics.commonFailures.length, 2);
+    assert.equal(diagnostics.latestWarningAndErrorLogs.length, 1);
+
+    for (const failure of diagnostics.latestFailures) {
+      assert.include(failure.cause, "plt=<redacted>");
+      assert.notInclude(failure.cause, "SECRET_PLT_123");
+    }
+    for (const failure of diagnostics.commonFailures) {
+      assert.include(failure.cause, "plt=<redacted>");
+      assert.notInclude(failure.cause, "SECRET_PLT_123");
+    }
+    assert.include(diagnostics.latestWarningAndErrorLogs[0]?.message ?? "", "plt=<redacted>");
+    assert.notInclude(diagnostics.latestWarningAndErrorLogs[0]?.message ?? "", "SECRET_PLT_123");
+  });
 });

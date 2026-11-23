@@ -2328,6 +2328,70 @@ it.layer(
         assert.deepStrictEqual(switched.models, []);
       });
 
+      it("clears Antigravity model capabilities, workspaceSnapshots, and workspaceRescannedAt when an authenticated snapshot drops a known email while keeping restart probe carry", () => {
+        const capabilities = createModelCapabilities({
+          optionDescriptors: [booleanDescriptor("thinking", "Thinking")],
+        });
+        const previousWithEmail: ServerProvider = {
+          ...signedIn,
+          auth: { ...signedIn.auth, email: "alice@example.com" },
+          models: [
+            {
+              slug: "gemini-3.7-flash-high",
+              name: "Gemini 3.7 Flash",
+              isCustom: false,
+              capabilities,
+            },
+          ],
+          workspaceSnapshots: [
+            {
+              cwd: "/repo-a",
+              checkedAt: "2026-09-05T00:00:00.000Z",
+              slashCommands: [{ name: "plan" }],
+              skills: [],
+            },
+          ],
+          workspaceRescannedAt: "2026-09-05T00:00:00.000Z",
+        };
+
+        const carriedRestart = ProviderRegistry.mergeProviderSnapshot(
+          previousWithEmail,
+          restartProbe,
+        );
+        assert.deepStrictEqual(carriedRestart.auth, previousWithEmail.auth);
+        assert.equal(carriedRestart.status, "ready");
+        assert.deepStrictEqual(carriedRestart.models, previousWithEmail.models);
+        assert.deepStrictEqual(
+          carriedRestart.workspaceSnapshots,
+          previousWithEmail.workspaceSnapshots,
+        );
+        assert.equal(carriedRestart.workspaceRescannedAt, previousWithEmail.workspaceRescannedAt);
+
+        const droppedEmail = ProviderRegistry.mergeProviderSnapshot(previousWithEmail, {
+          ...signedIn,
+          auth: { status: "authenticated", type: "oauth-business", label: "Gemini Enterprise" },
+          checkedAt: "2026-09-05T00:02:00.000Z",
+          models: [
+            {
+              slug: "gemini-3.7-flash-high",
+              name: "Gemini 3.7 Flash",
+              isCustom: false,
+              capabilities: null,
+            },
+          ],
+        });
+        assert.deepStrictEqual(droppedEmail.models, [
+          {
+            slug: "gemini-3.7-flash-high",
+            name: "Gemini 3.7 Flash",
+            isCustom: false,
+            capabilities: null,
+          },
+        ]);
+        assert.isUndefined(droppedEmail.workspaceSnapshots);
+        assert.isUndefined(droppedEmail.workspaceRescannedAt);
+      });
+
       it("preserves warning and verificationUrl across restart probes until quota windows arrive", () => {
         const verificationUrl = GoogleAccountVerificationUrl.make(
           "https://accounts.google.com/v3/signin/continue?plt=registry-1",

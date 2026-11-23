@@ -81,7 +81,9 @@ import {
   managedRuntimeModeCeilingMessage,
 } from "@t3tools/contracts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { unsentManualContinuationSource } from "./manualContinuation.ts";
 import { modelSwitchSince } from "./modelSwitch.ts";
 import { contextBoundaryOrdinal, isScheduledFreshRun } from "./contextBoundary.ts";
 import { isPlaceholderThreadTitle } from "./placeholderThreadTitle.ts";
@@ -6978,6 +6980,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandId: command.commandId,
           commandType: command.type,
           cause: "This thread can no longer be resumed from that run.",
+        });
+      }
+      const resolvedSource =
+        unsentManualContinuationSource(
+          { manualContinuationOfRunId: command.manualContinuationOfRunId } as OrchestrationV2Run,
+          projection,
+        ) ?? source;
+      const sourceMessage =
+        projection.messages.find((message) => message.id === resolvedSource.userMessageId) ??
+        (yield* projectionStore
+          .getMessagesById(command.threadId, [resolvedSource.userMessageId])
+          .pipe(
+            mapDispatchError(command),
+            Effect.map((messages) => messages.get(resolvedSource.userMessageId)),
+          ));
+      if (
+        sourceMessage !== undefined &&
+        (isNativeMaintenanceCommand(sourceMessage) ||
+          (sourceMessage.attachments.length === 0 &&
+            ["/compact", "/logout"].includes(
+              projectComposerContextForProvider({
+                text: sourceMessage.text,
+                records: sourceMessage.context?.records ?? [],
+              })
+                .trim()
+                .toLowerCase(),
+            )))
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Maintenance commands cannot be resumed via manual continuation.",
         });
       }
     }

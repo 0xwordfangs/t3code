@@ -184,6 +184,11 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         const threadId = ThreadId.make(commandId);
         const messageId = MessageId.make(commandId);
         const attachments = input.attachments ?? [];
+        if (attachments.length === 0 && input.message?.trim().toLowerCase() === "/logout")
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: "Threads cannot be launched with `/logout` as their initial message.",
+          });
         if (attachments.some((attachment) => !Claims.attachmentIsPendingUpload(attachment)))
           return yield* new OrchestratorMcpFailure({
             code: "invalid_request",

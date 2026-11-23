@@ -63,10 +63,14 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
     readonly beforeInitialize?: Effect.Effect<void>;
     readonly forwardCallback?: Effect.Effect<void, ProviderSetupError>;
     readonly codeLogin?: boolean;
+    readonly stagedCodeLogin?: boolean;
+    readonly commitError?: ProviderSetupError;
+    readonly holdCodeLoginAfterStaging?: boolean;
   } = {},
 ) {
   const loginCodes: string[] = [];
   const loginCode = yield* Deferred.make<void>();
+  const stagedWritten = yield* Deferred.make<void>();
   const authenticated = yield* Deferred.make<void, AcpErrors.AcpError>();
   const discovered = yield* Deferred.make<void, AcpErrors.AcpError>();
   const closed = yield* Deferred.make<void>();
@@ -77,56 +81,64 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
     | undefined;
   let forwarded = 0;
   let catalog = ["previous-account-model"];
+  let liveToken = "account-a-token";
+  let stagedToken: string | undefined;
+  const makeTestRuntime = (
+    kind: "live" | "staged",
+    input: {
+      readonly onAuthorizationUrl?: (url: string) => Effect.Effect<void, AcpErrors.AcpError>;
+    },
+  ) =>
+    Effect.gen(function* () {
+      receiveAuthorizationUrl = input.onAuthorizationUrl;
+      events.push(kind === "staged" ? "staged-process-open" : "process-open");
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          events.push(kind === "staged" ? "staged-process-close" : "process-close");
+          yield* Deferred.succeed(closed, undefined);
+        }),
+      );
+      // Like AcpSessionRuntime, `start` reuses one memoized initialize handshake.
+      const initialize = yield* Effect.cached(
+        Effect.gen(function* () {
+          events.push("initialize");
+          yield* options.beforeInitialize ?? Effect.void;
+          return options.supportsLogout === false
+            ? { ...initialized, agentCapabilities: {} }
+            : initialized;
+        }),
+      );
+      return {
+        initialize: () => initialize,
+        start: () =>
+          Effect.gen(function* () {
+            yield* initialize;
+            events.push("authenticate");
+            yield* Deferred.succeed(authenticateCalled, undefined);
+            if (options.interactive !== false && input.onAuthorizationUrl) {
+              for (const url of options.authorizationUrls ?? [authorizationUrl]) {
+                yield* input.onAuthorizationUrl(url);
+              }
+            }
+            yield* Deferred.await(authenticated);
+            events.push("session-new");
+            yield* Deferred.await(discovered);
+            return started;
+          }),
+        request: (method) =>
+          Effect.sync(() => {
+            events.push(method);
+            return {};
+          }),
+      } satisfies AntigravityAuthRuntime;
+    });
   const auth = yield* makeAntigravityAuth({
     instanceId,
-    makeRuntime: (input) =>
-      Effect.gen(function* () {
-        receiveAuthorizationUrl = input.onAuthorizationUrl;
-        events.push("process-open");
-        yield* Effect.addFinalizer(() =>
-          Effect.gen(function* () {
-            events.push("process-close");
-            yield* Deferred.succeed(closed, undefined);
-          }),
-        );
-        // Like AcpSessionRuntime, `start` reuses one memoized initialize handshake.
-        const initialize = yield* Effect.cached(
-          Effect.gen(function* () {
-            events.push("initialize");
-            yield* options.beforeInitialize ?? Effect.void;
-            return options.supportsLogout === false
-              ? { ...initialized, agentCapabilities: {} }
-              : initialized;
-          }),
-        );
-        return {
-          initialize: () => initialize,
-          start: () =>
-            Effect.gen(function* () {
-              yield* initialize;
-              events.push("authenticate");
-              yield* Deferred.succeed(authenticateCalled, undefined);
-              if (options.interactive !== false && input.onAuthorizationUrl) {
-                for (const url of options.authorizationUrls ?? [authorizationUrl]) {
-                  yield* input.onAuthorizationUrl(url);
-                }
-              }
-              yield* Deferred.await(authenticated);
-              events.push("session-new");
-              yield* Deferred.await(discovered);
-              return started;
-            }),
-          request: (method) =>
-            Effect.sync(() => {
-              events.push(method);
-              return {};
-            }),
-        } satisfies AntigravityAuthRuntime;
-      }),
+    makeRuntime: (input) => makeTestRuntime("live", input),
     onAuthenticated: () =>
       Effect.sync(() => {
         catalog = ["gemini-test"];
-        events.push("catalog-published");
+        events.push(`catalog-published:${liveToken}`);
       }),
     onCredentialsReplaced: Effect.sync(() => {
       events.push("credentials-replaced");
@@ -146,17 +158,46 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
       }),
     codeLogin: ({ onAuthorizationUrl }) =>
       Effect.gen(function* () {
-        if (!options.codeLogin) return undefined;
+        if (!options.codeLogin && !options.stagedCodeLogin) return undefined;
         events.push("login-open");
         yield* Effect.addFinalizer(() => Effect.sync(() => events.push("login-close")));
         yield* onAuthorizationUrl(loginUrl);
+        if (!options.stagedCodeLogin) {
+          return {
+            submit: (response: string) =>
+              Effect.sync(() => loginCodes.push(response)).pipe(
+                Effect.andThen(Deferred.succeed(loginCode, undefined)),
+                Effect.asVoid,
+              ),
+            completed: Deferred.await(loginCode),
+          };
+        }
         return {
           submit: (response: string) =>
-            Effect.sync(() => loginCodes.push(response)).pipe(
-              Effect.andThen(Deferred.succeed(loginCode, undefined)),
+            Effect.sync(() => {
+              loginCodes.push(response);
+              stagedToken = "account-b-token";
+            }).pipe(
+              Effect.andThen(Deferred.succeed(stagedWritten, undefined)),
+              Effect.andThen(
+                options.holdCodeLoginAfterStaging
+                  ? Effect.void
+                  : Deferred.succeed(loginCode, undefined),
+              ),
               Effect.asVoid,
             ),
           completed: Deferred.await(loginCode),
+          makeRuntime: (input) => makeTestRuntime("staged", input),
+          commit: Effect.suspend(() => {
+            if (options.commitError) return Effect.fail(options.commitError);
+            liveToken = stagedToken ?? liveToken;
+            events.push(`commit:${liveToken}`);
+            return Effect.void;
+          }),
+          cleanup: Effect.sync(() => {
+            stagedToken = undefined;
+            events.push("staging-cleanup");
+          }),
         };
       }),
   });
@@ -166,8 +207,11 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
     discovered,
     closed,
     authenticateCalled,
+    stagedWritten,
     events,
     catalog: () => catalog,
+    liveToken: () => liveToken,
+    stagedToken: () => stagedToken,
     forwarded: () => forwarded,
     loginCodes,
     receiveAuthorizationUrl: (url: string) =>
@@ -254,7 +298,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
         "initialize",
         "authenticate",
         "session-new",
-        "catalog-published",
+        "catalog-published:account-a-token",
         "process-close",
       ]);
     }),
@@ -761,5 +805,97 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
       assert.include(harness.events, "catalog-cleared");
       assert.deepEqual(harness.catalog(), []);
     }),
+  );
+
+  it.effect(
+    "commits staged code login credentials only after verification succeeds and always cleans up staging",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({ stagedCodeLogin: true });
+        const state = yield* harness.auth.controller.start(owner);
+        yield* phase(harness.auth, "waiting");
+        yield* harness.auth.controller.respond!(owner, {
+          instanceId,
+          flowId: state.flowId!,
+          interactionId: state.flowId!,
+          response: { type: "credentials", values: { code: "4/0Ab-code" } },
+        });
+        yield* Deferred.await(harness.authenticateCalled);
+        assert.equal(harness.liveToken(), "account-a-token");
+        assert.deepEqual(harness.catalog(), ["previous-account-model"]);
+
+        yield* Deferred.succeed(harness.authenticated, undefined);
+        yield* Deferred.succeed(harness.discovered, undefined);
+        yield* phase(harness.auth, "succeeded");
+
+        assert.equal(harness.liveToken(), "account-b-token");
+        assert.isUndefined(harness.stagedToken());
+        assert.deepEqual(harness.catalog(), ["gemini-test"]);
+        assert.deepEqual(harness.events, [
+          "login-open",
+          "login-close",
+          "staged-process-open",
+          "initialize",
+          "authenticate",
+          "session-new",
+          "commit:account-b-token",
+          "catalog-published:account-b-token",
+          "staged-process-close",
+          "staging-cleanup",
+        ]);
+      }),
+  );
+
+  it.effect.each([
+    "subscription-required",
+    "cancel-verify",
+    "timeout-verify",
+    "cancel-login",
+  ] as const)(
+    "preserves live Account A credentials and cleans up staging when staged code login ends via %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          stagedCodeLogin: true,
+          holdCodeLoginAfterStaging: mode === "cancel-login",
+        });
+        const state = yield* harness.auth.controller.start(owner);
+        yield* phase(harness.auth, "waiting");
+        yield* harness.auth.controller.respond!(owner, {
+          instanceId,
+          flowId: state.flowId!,
+          interactionId: state.flowId!,
+          response: { type: "credentials", values: { code: "4/0Ab-code" } },
+        });
+        if (mode === "cancel-login") {
+          yield* Deferred.await(harness.stagedWritten);
+          const cancelled = yield* harness.auth.controller.cancel(owner, state.flowId!);
+          assert.equal(cancelled.phase, "cancelled");
+        } else {
+          yield* Deferred.await(harness.authenticateCalled);
+          if (mode === "subscription-required") {
+            yield* Deferred.fail(
+              harness.authenticated,
+              AcpErrors.AcpRequestError.internalError("SUBSCRIPTION_REQUIRED"),
+            );
+            const failed = yield* phase(harness.auth, "failed");
+            assert.include(failed.message ?? "", "eligible Antigravity subscription");
+          } else if (mode === "cancel-verify") {
+            const cancelled = yield* harness.auth.controller.cancel(owner, state.flowId!);
+            assert.equal(cancelled.phase, "cancelled");
+          } else {
+            yield* TestClock.adjust("300 seconds");
+            const failed = yield* phase(harness.auth, "failed");
+            assert.equal(failed.message, "Google sign-in expired. Start sign-in again.");
+          }
+        }
+        assert.equal(harness.liveToken(), "account-a-token");
+        assert.isUndefined(harness.stagedToken());
+        assert.deepEqual(harness.catalog(), ["previous-account-model"]);
+        assert.notInclude(harness.events, "credentials-replaced");
+        assert.notInclude(harness.events, "verification-failed");
+        assert.notInclude(harness.events, "commit:account-b-token");
+        assert.include(harness.events, "staging-cleanup");
+      }),
   );
 });

@@ -86,10 +86,15 @@ export interface AntigravityAuth {
 }
 
 /** `agy acp --login`: it prints a Google link and reads the code the Antigravity page shows. */
-export interface AntigravityCodeLogin {
+export interface AntigravityCodeLogin<
+  Runtime extends AntigravityAuthRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"],
+> {
   readonly submit: (response: string) => Effect.Effect<void>;
   /** Succeeds once the runtime has stored the sign-in. */
   readonly completed: Effect.Effect<void, ProviderSetupError>;
+  readonly makeRuntime?: AntigravityAuthOptions<Runtime>["makeRuntime"];
+  readonly commit?: Effect.Effect<void, ProviderSetupError>;
+  readonly cleanup?: Effect.Effect<void>;
 }
 
 export type AntigravityAuthRuntime = Pick<
@@ -119,7 +124,7 @@ export interface AntigravityAuthOptions<
   readonly codeLogin?: (input: {
     readonly onAuthorizationUrl: (url: string) => Effect.Effect<void, AcpErrors.AcpError>;
   }) => Effect.Effect<
-    AntigravityCodeLogin | undefined,
+    AntigravityCodeLogin<Runtime> | undefined,
     AcpErrors.AcpError | ProviderSetupError,
     Scope.Scope
   >;
@@ -323,85 +328,126 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
 
   const runSignIn = Effect.fn("AntigravityAuth.runSignIn")(
     function* (flow: AuthFlow, stopSessions: Effect.Effect<void, ProviderSetupError>) {
-      yield* stopSessions.pipe(Effect.ensuring(stopOwnedProcesses));
-      const signedIn = yield* Effect.scoped(
-        Effect.gen(function* () {
-          let submitToLogin: ((response: string) => Effect.Effect<void>) | undefined;
-          let queuedCode: string | undefined;
-          yield* lock.withPermits(1)(
-            Effect.sync(() => {
-              flow.submitCode = (response) =>
-                submitToLogin
-                  ? submitToLogin(response)
-                  : Effect.sync(() => {
-                      queuedCode = response;
-                    });
-            }),
-          );
-          const login = yield* (
-            options.codeLogin?.({
-              onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url, "code"),
-            }) ?? Effect.undefined
-          );
-          if (login === undefined) return false;
-          const pendingCode = yield* lock.withPermits(1)(
-            Effect.sync(() => {
-              submitToLogin = login.submit;
-              const code = queuedCode;
-              queuedCode = undefined;
-              return code;
-            }),
-          );
-          if (pendingCode !== undefined) yield* login.submit(pendingCode);
-          yield* login.completed;
-          return true;
-        }),
-      ).pipe(
-        Effect.ensuring(
-          lock.withPermits(1)(
-            Effect.sync(() => {
-              flow.submitCode = undefined;
-              if (flow.codeLogin) flow.pending = undefined;
-            }),
-          ),
-        ),
-      );
-      if (signedIn && options.onCredentialsReplaced) {
-        yield* options.onCredentialsReplaced;
-      }
+      let loginCleanup: Effect.Effect<void> = Effect.void;
       yield* Effect.gen(function* () {
-        const runtime = yield* options.makeRuntime(
-          signedIn
-            ? {}
-            : { onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url, "loopback") },
-        );
-        const startupHint = yield* publishStartingHint(flow, STARTUP_HINT_MS, NOT_STARTED_MESSAGE);
-        // `start` reuses this memoized handshake.
-        yield* runtime.initialize();
-        flow.initialized = true;
-        yield* Fiber.interrupt(startupHint);
-        yield* publishStartingHint(flow, NO_RESPONSE_HINT_MS, NO_RESPONSE_MESSAGE);
-        const started = yield* runtime.start();
-        yield* lock.withPermits(1)(
+        yield* stopSessions.pipe(Effect.ensuring(stopOwnedProcesses));
+        const codeLoginResult = yield* Effect.scoped(
           Effect.gen(function* () {
-            if (activeFlow !== flow) return;
-            flow.pending = undefined;
-            yield* publishFlow(flow, {
-              ...flow.state,
-              phase: "verifying",
-              authorizationUrl: null,
-              message: "Checking Antigravity access and models.",
-            });
+            let submitToLogin: ((response: string) => Effect.Effect<void>) | undefined;
+            let queuedCode: string | undefined;
+            yield* lock.withPermits(1)(
+              Effect.sync(() => {
+                flow.submitCode = (response) =>
+                  submitToLogin
+                    ? submitToLogin(response)
+                    : Effect.sync(() => {
+                        queuedCode = response;
+                      });
+              }),
+            );
+            const login = yield* (
+              options.codeLogin?.({
+                onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url, "code"),
+              }) ?? Effect.undefined
+            );
+            if (login === undefined) return undefined;
+            if (login.cleanup !== undefined) {
+              loginCleanup = login.cleanup;
+            }
+            const pendingCode = yield* lock.withPermits(1)(
+              Effect.sync(() => {
+                submitToLogin = login.submit;
+                const code = queuedCode;
+                queuedCode = undefined;
+                return code;
+              }),
+            );
+            if (pendingCode !== undefined) yield* login.submit(pendingCode);
+            yield* login.completed;
+            return {
+              makeRuntime: login.makeRuntime,
+              commit: login.commit,
+            };
           }),
+        ).pipe(
+          Effect.ensuring(
+            lock.withPermits(1)(
+              Effect.sync(() => {
+                flow.submitCode = undefined;
+                if (flow.codeLogin) flow.pending = undefined;
+              }),
+            ),
+          ),
         );
-        yield* options.onAuthenticated(started, runtime);
-      }).pipe(
-        Effect.onExit((exit) =>
-          signedIn && Exit.isFailure(exit) && options.onVerificationFailed
-            ? options.onVerificationFailed
-            : Effect.void,
-        ),
-      );
+        const signedIn = codeLoginResult !== undefined;
+        const stagedCommit = codeLoginResult?.commit;
+        const stagedMakeRuntime = codeLoginResult?.makeRuntime;
+        let committed = false;
+        if (signedIn && stagedCommit === undefined && options.onCredentialsReplaced) {
+          yield* options.onCredentialsReplaced;
+        }
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const runtime = yield* (stagedMakeRuntime ?? options.makeRuntime)(
+              signedIn
+                ? {}
+                : { onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url, "loopback") },
+            );
+            const startupHint = yield* publishStartingHint(
+              flow,
+              STARTUP_HINT_MS,
+              NOT_STARTED_MESSAGE,
+            );
+            // `start` reuses this memoized handshake.
+            yield* runtime.initialize();
+            flow.initialized = true;
+            yield* Fiber.interrupt(startupHint);
+            yield* publishStartingHint(flow, NO_RESPONSE_HINT_MS, NO_RESPONSE_MESSAGE);
+            const started = yield* runtime.start();
+            if (stagedCommit !== undefined) {
+              const stillActive = yield* lock.withPermits(1)(
+                Effect.gen(function* () {
+                  if (activeFlow !== flow || operation !== "auth") return false;
+                  flow.pending = undefined;
+                  yield* publishFlow(flow, {
+                    ...flow.state,
+                    phase: "verifying",
+                    authorizationUrl: null,
+                    message: "Checking Antigravity access and models.",
+                  });
+                  yield* stagedCommit;
+                  committed = true;
+                  return true;
+                }).pipe(Effect.uninterruptible),
+              );
+              if (!stillActive) return;
+            } else {
+              yield* lock.withPermits(1)(
+                Effect.gen(function* () {
+                  if (activeFlow !== flow) return;
+                  flow.pending = undefined;
+                  yield* publishFlow(flow, {
+                    ...flow.state,
+                    phase: "verifying",
+                    authorizationUrl: null,
+                    message: "Checking Antigravity access and models.",
+                  });
+                }),
+              );
+            }
+            yield* options.onAuthenticated(started, runtime);
+          }),
+        ).pipe(
+          Effect.onExit((exit) =>
+            signedIn &&
+            (stagedCommit === undefined || committed) &&
+            Exit.isFailure(exit) &&
+            options.onVerificationFailed
+              ? options.onVerificationFailed
+              : Effect.void,
+          ),
+        );
+      }).pipe(Effect.ensuring(Effect.suspend(() => loginCleanup)));
     },
     (effect, flow, _stopSessions) =>
       effect.pipe(

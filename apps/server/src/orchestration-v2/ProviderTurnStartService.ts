@@ -611,9 +611,19 @@ export const layer: Layer.Layer<
           });
         },
       );
+      const projectedPromptText =
+        providerMessage.attachments.length === 0
+          ? projectComposerContextForProvider({
+              text: providerMessage.text,
+              records: providerMessage.context?.records ?? [],
+            })
+          : "";
+      const isLogoutPrompt =
+        providerMessage.attachments.length === 0 &&
+        projectedPromptText.trim().toLowerCase() === "/logout";
       if (
         providerMessage.attachments.length === 0 &&
-        providerMessage.text.trimStart().startsWith("/")
+        (providerMessage.text.trimStart().startsWith("/") || isLogoutPrompt)
       ) {
         const isEmptyCompaction =
           providerMessage.text.trim().toLowerCase() === "/compact" && !projection.hasConversation;
@@ -642,38 +652,50 @@ export const layer: Layer.Layer<
         );
         const authInstanceId = nativeThread?.providerInstanceId ?? run.providerInstanceId;
         const mayRunProviderAuthPrompt =
+          unsentResumeMessage === undefined &&
+          run.manualContinuationOfRunId === undefined &&
           providerMessage.createdBy === "user" &&
           providerMessage.creationSource !== "mcp" &&
           providerMessage.creationSource !== "server" &&
           providerMessage.creationSource !== "provider" &&
           providerMessage.scheduledTaskId === undefined &&
+          providerMessage.senderThreadId === undefined &&
+          projection.thread.lineage.relationshipToParent !== "subagent" &&
           providerMessage.context?.guest === undefined;
+        const logoutDenied = isLogoutPrompt && !mayRunProviderAuthPrompt;
         const authResult =
-          isEmptyCompaction || !mayRunProviderAuthPrompt
+          isEmptyCompaction || logoutDenied || !mayRunProviderAuthPrompt
             ? null
             : yield* Effect.result(
                 providerAuth.tryHandlePromptCommand({
                   instanceId: authInstanceId,
-                  text: projectComposerContextForProvider({
-                    text: providerMessage.text,
-                    records: providerMessage.context?.records ?? [],
-                  }),
+                  text: projectedPromptText,
                   hasAttachments: false,
                 }),
               );
-        if (isEmptyCompaction || authResult?._tag === "Failure" || authResult?.success) {
+        if (
+          isEmptyCompaction ||
+          logoutDenied ||
+          authResult?._tag === "Failure" ||
+          authResult?.success
+        ) {
           const now = yield* DateTime.now;
           const failure = isEmptyCompaction
             ? makeProviderFailure({
                 class: "validation_error",
                 message: "Start a conversation before compacting this thread.",
               })
-            : authResult?._tag === "Failure"
+            : logoutDenied
               ? makeProviderFailure({
                   class: "permission_error",
-                  message: authResult.failure.detail,
+                  message: "Provider sign-out (/logout) can only be run directly by a user.",
                 })
-              : undefined;
+              : authResult?._tag === "Failure"
+                ? makeProviderFailure({
+                    class: "permission_error",
+                    message: authResult.failure.detail,
+                  })
+                : undefined;
           const status = failure === undefined ? "completed" : "failed";
           yield* settleRunBeforeStart({
             run,

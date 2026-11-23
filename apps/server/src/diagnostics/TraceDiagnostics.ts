@@ -7,6 +7,7 @@ import type {
   ServerTraceDiagnosticsSpanOccurrence,
   ServerTraceDiagnosticsSpanSummary,
 } from "@t3tools/contracts";
+import { redactUrlCredentials } from "@t3tools/shared/observability";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -104,7 +105,8 @@ function readExitTag(exit: unknown): string | null {
 
 function readExitCause(exit: unknown): string {
   if (!isRecordObject(exit) || !("cause" in exit)) return "Failure";
-  return toStringValue(exit.cause)?.trim() ?? "Failure";
+  const value = toStringValue(exit.cause)?.trim();
+  return value ? redactUrlCredentials(value) : "Failure";
 }
 
 function isTraceEvent(value: unknown): value is TraceEventLike {
@@ -271,10 +273,13 @@ export function makeTraceDiagnosticsAggregator(
     insertBounded(slowestSpans, spanItem, TOP_LIMIT, slowestFirst);
 
     if (isFailure) {
+      const rawStatusMessage = toStringValue(status.message)?.trim();
       const cause =
         exitTag === "Failure"
           ? readExitCause(parsed.exit)
-          : (toStringValue(status.message)?.trim() ?? "Failure");
+          : rawStatusMessage
+            ? redactUrlCredentials(rawStatusMessage)
+            : "Failure";
       insertBounded(latestFailures, { ...spanItem, cause }, RECENT_LIMIT, latestEndedFirst);
 
       const failureKey = `${name}\0${cause}`;
@@ -309,7 +314,8 @@ export function makeTraceDiagnosticsAggregator(
         }
 
         const seenAt = unixNanoToDateTime(rawEvent.timeUnixNano) ?? endedAt;
-        const message = toStringValue(rawEvent.name)?.trim() ?? "Log event";
+        const rawMessage = toStringValue(rawEvent.name)?.trim();
+        const message = rawMessage ? redactUrlCredentials(rawMessage) : "Log event";
         insertBounded(
           latestWarningAndErrorLogs,
           { spanName: name, level, message, seenAt, traceId, spanId },

@@ -1387,4 +1387,168 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         expect(yield* Ref.get(probeCount)).toBe(0);
       }),
   );
+
+  it.effect(
+    "clears Account A models, commands, skills, workspaces, thinking levels, and limits on onSignedIn even without an email change",
+    () =>
+      Effect.gen(function* () {
+        const thinkingOption = {
+          id: "thinking_level",
+          name: "Thinking Level",
+          category: "thought_level",
+          type: "select",
+          currentValue: "high",
+          options: [
+            { value: "low", name: "Low" },
+            { value: "high", name: "High" },
+          ],
+        } satisfies EffectAcpSchema.SessionConfigOption;
+        const accountALimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          credentialFingerprint: "fp-biz-a",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 70 },
+          ],
+        };
+        const accountBFailedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:05:00.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed", message: "Quota unavailable" },
+        };
+        const usage = yield* Ref.make<Effect.Effect<ServerProviderUsageLimits>>(
+          Effect.succeed(accountALimits),
+        );
+        const harness = yield* makeHarness({
+          auth: { type: "oauth-business", label: "Gemini Enterprise" },
+          probeUsage: Ref.get(usage).pipe(Effect.flatten),
+        });
+        const initialLimits = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
+        yield* harness.initialize;
+        expect((yield* initialLimits)?.usageLimits).toEqual(accountALimits);
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+
+        const skills = [
+          {
+            name: "deploy",
+            description: "Ship it",
+            path: "/workspace-a/.agent/skills/deploy",
+            enabled: true,
+          },
+        ];
+        yield* harness.provider.snapshotForCwd("/workspace-a", skills);
+        yield* harness.provider.onSessionStarted(
+          {
+            ...started,
+            sessionSetupResult: {
+              sessionId: "account-a-session",
+              configOptions: [
+                {
+                  ...modelConfig,
+                  currentValue: "gemini-pro-agent",
+                  options: [modelOptions[9]!, modelOptions[10]!],
+                },
+                thinkingOption,
+              ],
+            },
+          },
+          "/workspace-a",
+        );
+        yield* harness.provider.onAvailableCommands(commands, "/workspace-a");
+
+        yield* Ref.set(usage, Effect.succeed(accountBFailedLimits));
+        yield* harness.provider.onSignedIn;
+
+        const cleared = yield* harness.provider.snapshot.getSnapshot;
+        expect(cleared).toMatchObject({
+          auth: { status: "unauthenticated" },
+          models: [],
+          slashCommands: [],
+          skills: [],
+          workspaceSnapshots: [],
+          supportsTextGeneration: false,
+        });
+        expect(cleared.usageLimits).toBeUndefined();
+        expect((yield* harness.provider.snapshotForCwd("/workspace-a")).skills).toEqual([]);
+
+        const accountBPublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.usageLimits?.unavailable?.reason === "probeFailed",
+        );
+        yield* harness.provider.onSessionStarted({
+          ...started,
+          sessionSetupResult: {
+            sessionId: "account-b-session",
+            configOptions: [
+              {
+                ...modelConfig,
+                currentValue: "gemini-3.1-pro-low",
+                options: [modelOptions[9]!, modelOptions[10]!],
+              },
+            ],
+          },
+        });
+        const accountBSnapshot = yield* accountBPublished;
+        expect(accountBSnapshot?.usageLimits).toEqual(accountBFailedLimits);
+        expect(accountBSnapshot?.slashCommands).toEqual([]);
+        expect(accountBSnapshot?.workspaceSnapshots).toEqual([]);
+        const proModel = accountBSnapshot?.models.find(
+          (model) => model.slug === "gemini-pro-agent",
+        );
+        expect(proModel?.capabilities?.optionDescriptors).toEqual([]);
+      }),
+  );
+
+  it.effect(
+    "redacts sensitive query parameters from verification messages while preserving auth.verificationUrl",
+    () =>
+      Effect.gen(function* () {
+        const verificationUrl = GoogleAccountVerificationUrl.make(
+          "https://accounts.google.com/v3/signin/continue?plt=SECRET_PLT_TOKEN",
+        );
+        const rawMessage = `Verify your account at ${verificationUrl} with Bearer secret-bearer-token`;
+        const usage = yield* Ref.make<
+          Effect.Effect<ServerProviderUsageLimits | AntigravityUsageProbeResult>
+        >(
+          Effect.succeed({
+            usageLimits: {
+              checkedAt: "2026-10-09T12:00:00.000Z",
+              windows: [],
+              unavailable: {
+                reason: "probeFailed",
+                message: "Verify your account at https://accounts.google.com/v3/signin/continue",
+              },
+            },
+            verificationRequired: {
+              message: rawMessage,
+              verificationUrl,
+            },
+          }),
+        );
+        const harness = yield* makeHarness({
+          auth: { type: "oauth-personal", label: "Google account" },
+          probeUsage: Ref.get(usage).pipe(Effect.flatten),
+        });
+        const probePublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.auth.verificationUrl === verificationUrl,
+        );
+        yield* harness.initialize;
+        const fromProbe = yield* probePublished;
+        expect(fromProbe?.auth.verificationUrl).toBe(verificationUrl);
+        expect(fromProbe?.message).not.toContain("SECRET_PLT_TOKEN");
+        expect(fromProbe?.message).not.toContain("secret-bearer-token");
+        expect(fromProbe?.message).toContain("https://accounts.google.com/v3/signin/continue");
+
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+        yield* harness.provider.onSessionStarted(started);
+        yield* harness.provider.onVerificationRequired({
+          verificationUrl,
+          message: rawMessage,
+        });
+        const fromEvent = yield* harness.provider.snapshot.getSnapshot;
+        expect(fromEvent.auth.verificationUrl).toBe(verificationUrl);
+        expect(fromEvent.message).not.toContain("SECRET_PLT_TOKEN");
+        expect(fromEvent.message).not.toContain("secret-bearer-token");
+        expect(fromEvent.usageLimits?.unavailable?.message).not.toContain("SECRET_PLT_TOKEN");
+        expect(fromEvent.usageLimits?.unavailable?.message).not.toContain("secret-bearer-token");
+      }),
+  );
 });

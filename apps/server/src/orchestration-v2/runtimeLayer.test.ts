@@ -12200,6 +12200,92 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
   );
 
   it.effect.each([
+    { label: "literal /logout", text: "/logout" },
+    {
+      label: "composer-context /logout",
+      text: " /LOGOUT ",
+      context: { version: 1 as const, records: [] },
+    },
+  ])("rejects manual continuation of an interrupted $label run", ({ label, text, context }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const slug = label.replaceAll(/[^a-z0-9]+/gi, "-");
+      const threadId = ThreadId.make(`manual-resume-maintenance:${slug}`);
+      const projectId = ProjectId.make(`manual-resume-maintenance:project:${slug}`);
+      const now = yield* DateTime.now;
+      yield* seedProject({
+        projectId,
+        title: "Maintenance resume project",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        createdAt: DateTime.formatIso(now),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`manual-resume-maintenance:create:${slug}`),
+        threadId,
+        projectId,
+        title: "Maintenance thread",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`manual-resume-maintenance:start:${slug}`),
+        threadId,
+        messageId: MessageId.make(`manual-resume-maintenance:msg:${slug}`),
+        text,
+        attachments: [],
+        ...(context === undefined ? {} : { context }),
+        dispatchMode: { type: "defer_start" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const [source] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+      assert.isDefined(source);
+      yield* events.write({
+        events: [
+          {
+            id: EventId.make(`manual-resume-maintenance:stop:${slug}`),
+            type: "run.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...source!, status: "interrupted", completedAt: now },
+          },
+        ],
+      });
+      const failure = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`manual-resume-maintenance:resume:${slug}`),
+          threadId,
+          messageId: MessageId.make(`manual-resume-maintenance:resume-msg:${slug}`),
+          manualContinuationOfRunId: source!.id,
+          text: "Continue where you left off.",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        })
+        .pipe(Effect.flip);
+      assert.equal(failure._tag, "OrchestratorDispatchError");
+      if (failure._tag === "OrchestratorDispatchError") {
+        assert.equal(
+          failure.cause,
+          "Maintenance commands cannot be resumed via manual continuation.",
+        );
+      }
+      assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 1);
+    }),
+  );
+
+  it.effect.each([
     "resume",
     "resume-started",
     "resume-untagged",

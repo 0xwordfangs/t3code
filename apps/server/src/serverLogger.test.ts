@@ -4,6 +4,7 @@ import * as NodeOS from "node:os";
 import * as NodeUtil from "node:util";
 
 import { ExternalLauncherBrowserSpawnError } from "@t3tools/contracts";
+import * as EffectAcpErrors from "effect-acp/errors";
 import * as Cause from "effect/Cause";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
@@ -207,6 +208,77 @@ describe("ServerLoggerLive", () => {
       assert.include(output, "threadId: 'thread-1'");
       assert.include(output, "gh: HTTP 502 from api.github.com");
       assert.notInclude(output, "[Object]");
+    }),
+  );
+
+  it.effect("redacts plt credentials in embedded Cause fields and string log fields", () =>
+    Effect.gen(function* () {
+      const secretUrl =
+        "https://accounts.google.com/v3/signin/continue?plt=SECRET_PLT_LOG&continue=https%3A%2F%2Fexample.com";
+      const consoleOutput = yield* printThroughConsole({
+        validationUrl: secretUrl,
+        cause: Cause.fail(new Error(`Validation failed: ${secretUrl}`)),
+      });
+
+      assert.include(consoleOutput, "plt=<redacted>");
+      assert.notInclude(consoleOutput, "SECRET_PLT_LOG");
+
+      const { requests } = yield* logInSpanThrough(
+        { otlpLogsUrl: "https://collector.example.com/v1/logs" },
+        Effect.logWarning(`Verification needed at ${secretUrl}`, {
+          validationUrl: secretUrl,
+          cause: Cause.fail(new Error(`Validation failed: ${secretUrl}`)),
+        }),
+      );
+
+      const body = requests.map((request) => request.body).join("\n");
+      assert.include(body, "plt=<redacted>");
+      assert.notInclude(body, "SECRET_PLT_LOG");
+    }),
+  );
+
+  it.effect("redacts credentials inside Error.cause and Error subclass data fields", () =>
+    Effect.gen(function* () {
+      const dataUrl = "https://accounts.google.com/v3/signin/continue?plt=SECRET_DATA_PLT";
+      const causeUrl = "https://accounts.google.com/v3/signin/continue?plt=SECRET_CAUSE_PLT";
+      const errorWithDataAndCause = EffectAcpErrors.AcpRequestError.fromProtocolError(
+        {
+          code: -32603,
+          message: "PERMISSION_DENIED (code 403): VALIDATION_REQUIRED",
+          data: { validation_url: dataUrl },
+        },
+        {
+          method: "session/prompt",
+          cause: new Error(`Upstream verification: ${causeUrl}`),
+        },
+      );
+      const circular = new Error(`Self-referential ${causeUrl}`);
+      Object.defineProperty(circular, "cause", {
+        value: circular,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+
+      const consoleOutput = yield* printThroughConsole({
+        error: errorWithDataAndCause,
+        circular,
+      });
+      assert.include(consoleOutput, "plt=<redacted>");
+      assert.include(consoleOutput, "AcpRequestError");
+      assert.include(consoleOutput, "Upstream verification:");
+      assert.notInclude(consoleOutput, "SECRET_DATA_PLT");
+      assert.notInclude(consoleOutput, "SECRET_CAUSE_PLT");
+
+      const { requests } = yield* logInSpanThrough(
+        { otlpLogsUrl: "https://collector.example.com/v1/logs" },
+        Effect.logError("provider request failed", { error: errorWithDataAndCause }),
+      );
+      const body = requests.map((request) => request.body).join("\n");
+      assert.include(body, "plt=<redacted>");
+      assert.include(body, "AcpRequestError");
+      assert.notInclude(body, "SECRET_DATA_PLT");
+      assert.notInclude(body, "SECRET_CAUSE_PLT");
     }),
   );
 

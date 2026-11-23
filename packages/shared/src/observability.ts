@@ -317,15 +317,16 @@ function formatTraceExit(exit: Exit.Exit<unknown, unknown>): EffectTraceRecord["
   if (ExitRuntime.isSuccess(exit)) {
     return { _tag: "Success" };
   }
+  const cause = redactUrlCredentials(Cause.pretty(exit.cause));
   if (Cause.hasInterruptsOnly(exit.cause)) {
     return {
       _tag: "Interrupted",
-      cause: Cause.pretty(exit.cause),
+      cause,
     };
   }
   return {
     _tag: "Failure",
-    cause: Cause.pretty(exit.cause),
+    cause,
   };
 }
 
@@ -408,11 +409,52 @@ function spanToTraceRecord(span: SerializableSpan): EffectTraceRecord {
   };
 }
 
-// WebSocket tickets and their DPoP proofs ride in URL queries and stay valid after the request.
-const URL_CREDENTIAL_PARAMS = /(^|[?&"\s])(wsTicket|dpop)=[^&#"\\\s]*/g;
+// Auth tokens and WebSocket tickets ride in URL queries and stay valid after the request.
+const URL_CREDENTIAL_PARAMS =
+  /(^|[?&"\s]|\\u0026)(wsTicket|dpop|plt|access_token|id_token|refresh_token)=[^&#"'\\\s]*/gi;
+const URL_QUERY_CREDENTIAL_PARAMS = /([?&]|\\u0026)(code|token)=[^&#"'\\\s]*/gi;
 
-const redactUrlCredentials = (text: string) =>
-  text.replace(URL_CREDENTIAL_PARAMS, "$1$2=<redacted>");
+export const redactUrlCredentials = (text: string): string =>
+  text.includes("=")
+    ? text
+        .replace(URL_CREDENTIAL_PARAMS, "$1$2=<redacted>")
+        .replace(URL_QUERY_CREDENTIAL_PARAMS, "$1$2=<redacted>")
+    : text;
+
+function redactTraceValue(value: unknown, seen?: WeakSet<object>): unknown {
+  if (typeof value === "string") {
+    return redactUrlCredentials(value);
+  }
+  if (Array.isArray(value)) {
+    const visited = seen ?? new WeakSet<object>();
+    if (visited.has(value)) return value;
+    visited.add(value);
+    const redacted = value.map((entry) => redactTraceValue(entry, visited));
+    visited.delete(value);
+    return redacted.some((entry, index) => entry !== value[index]) ? redacted : value;
+  }
+  if (isPlainObject(value)) {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return value;
+    const visited = seen ?? new WeakSet<object>();
+    if (visited.has(value)) return value;
+    visited.add(value);
+    let redacted: Record<string, unknown> | undefined;
+    for (const [key, entry] of Object.entries(value)) {
+      const next = redactTraceValue(entry, visited);
+      if (next === entry) continue;
+      redacted ??= { ...value };
+      redacted[key] = next;
+    }
+    visited.delete(value);
+    return redacted ?? value;
+  }
+  return value;
+}
+
+function redactSpanAttributes(attributes: Record<string, unknown>): Record<string, unknown> {
+  return redactTraceValue(attributes) as Record<string, unknown>;
+}
 
 export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: TraceSinkOptions) {
   const sink = yield* makeAsyncRotatingFileSink({
@@ -623,14 +665,14 @@ class LocalFileSpan implements Tracer.Span {
 
   end(endTime: bigint, exit: Exit.Exit<unknown, unknown>): void {
     // Cached lookup fibers retain parent spans. Traces need success status, not result payloads.
-    const traceExit = ExitRuntime.isSuccess(exit) ? ExitRuntime.void : exit;
+    const traceExit = ExitRuntime.isSuccess(exit) ? ExitRuntime.void : redactExitCredentials(exit);
     this.status = {
       _tag: "Ended",
       startTime: this.status.startTime,
       endTime,
       exit: traceExit,
     };
-    this.delegate.end(endTime, redactExitCredentials(traceExit));
+    this.delegate.end(endTime, traceExit);
 
     if (this.sampled) {
       this.push(spanToTraceRecord(this));
@@ -638,22 +680,16 @@ class LocalFileSpan implements Tracer.Span {
   }
 
   attribute(key: string, value: unknown): void {
-    const recorded =
-      (key === "url.full" || key === "url.query") && typeof value === "string"
-        ? redactUrlCredentials(value)
-        : value;
+    const recorded = redactTraceValue(value);
     this.attributes.set(key, recorded);
     this.delegate.attribute(key, recorded);
   }
 
   event(name: string, startTime: bigint, attributes?: Record<string, unknown>): void {
-    const cause = attributes?.["effect.cause"];
-    const nextAttributes =
-      typeof cause === "string"
-        ? { ...attributes, "effect.cause": redactUrlCredentials(cause) }
-        : (attributes ?? {});
-    this.events.push([name, startTime, nextAttributes]);
-    this.delegate.event(name, startTime, nextAttributes);
+    const redactedName = redactUrlCredentials(name);
+    const nextAttributes = attributes === undefined ? {} : redactSpanAttributes(attributes);
+    this.events.push([redactedName, startTime, nextAttributes]);
+    this.delegate.event(redactedName, startTime, nextAttributes);
   }
 
   addLinks(links: ReadonlyArray<Tracer.SpanLink>): void {

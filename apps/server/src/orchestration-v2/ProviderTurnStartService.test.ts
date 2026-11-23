@@ -3226,6 +3226,12 @@ effectIt.effect.each([
   { label: "provider-created message", patch: { creationSource: "provider" as const } },
   { label: "scheduled task message", patch: { scheduledTaskId: ScheduledTaskId.make("task-1") } },
   {
+    label: "cross-thread sender message",
+    patch: { senderThreadId: ThreadId.make("thread-sender") },
+  },
+  { label: "subagent thread", threadKind: "delegated" as const },
+  { label: "manual continuation run", manualContinuation: true },
+  {
     label: "guest-attributed message",
     patch: {
       context: {
@@ -3239,25 +3245,42 @@ effectIt.effect.each([
       },
     },
   },
-])("skips provider auth prompt handling for /logout from $label", ({ patch }) =>
-  Effect.gen(function* () {
-    const harness = makeLocalCommandHarness({
-      text: "/logout",
-      previousNativeSession: true,
-      sessionForTurn: true,
-    });
-    const initial = harness.projection();
-    harness.setProjection({
-      ...initial,
-      messages: initial.messages.map((msg) => ({ ...msg, ...patch })),
-    });
+])(
+  "rejects /logout before provider start from $label",
+  ({ patch, threadKind, manualContinuation }) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "/logout",
+        previousNativeSession: true,
+        sessionForTurn: true,
+        ...(threadKind === undefined ? {} : { threadKind }),
+        ...(manualContinuation === undefined ? {} : { manualContinuation }),
+      });
+      if (patch !== undefined) {
+        const initial = harness.projection();
+        harness.setProjection({
+          ...initial,
+          messages: initial.messages.map((msg) => ({ ...msg, ...patch })),
+        });
+      }
 
-    yield* harness.start;
+      yield* harness.start;
 
-    expect(harness.tryHandlePromptCommand).not.toHaveBeenCalled();
-    expect(harness.open).toHaveBeenCalledTimes(1);
-    expect(harness.startRootRun).toHaveBeenCalledTimes(1);
-  }),
+      expect(harness.tryHandlePromptCommand).not.toHaveBeenCalled();
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+      expect(harness.projection().turnItems).toMatchObject([
+        {
+          type: "error",
+          title: "Provider sign-out failed",
+          failure: {
+            class: "permission_error",
+            message: "Provider sign-out (/logout) can only be run directly by a user.",
+          },
+        },
+      ]);
+    }),
 );
 
 for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
