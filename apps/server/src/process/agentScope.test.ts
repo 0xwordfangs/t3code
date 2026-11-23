@@ -732,4 +732,208 @@ describe("AgentScope service", () => {
       );
     },
   );
+
+  it.effect(
+    "tracks auxiliary scopes in ownedSlice with --collect without overwriting primary scope or oomKilled",
+    () =>
+      withFakeSystemd(({ scope, units, stateDir }) =>
+        Effect.gen(function* () {
+          const primary = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "acp",
+            threadId: "a",
+          });
+          const primaryUnit = unitOf(primary);
+          units.set(primaryUnit, { activeState: "active", result: "success" });
+
+          const aux1 = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "acp-terminal",
+            threadId: "a",
+            auxiliary: true,
+          });
+          const aux2 = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "acp-terminal",
+            threadId: "a",
+            auxiliary: true,
+          });
+          for (const aux of [aux1, aux2]) {
+            expect(sliceOf(aux)).toBe(ownedAgentSlice(stateDir));
+            expect(aux.args).toContain("--collect");
+            expect(aux.args).toContain("--property=Delegate=yes");
+            expect(aux.args).toContain("--property=TimeoutStopSec=10s");
+            expect(aux.args).toContain("--property=OOMPolicy=stop");
+          }
+
+          // An OOM in an auxiliary terminal scope must never mark the primary thread as OOM-killed.
+          units.set(unitOf(aux1), { activeState: "failed", result: "oom-kill" });
+          expect(yield* scope.oomKilled("a")).toBe(false);
+
+          // Primary scope OOM diagnosis remains intact.
+          units.set(primaryUnit, { activeState: "failed", result: "oom-kill" });
+          expect(yield* scope.oomKilled("a")).toBe(true);
+        }),
+      ),
+  );
+
+  it.effect(
+    "kill(threadId) terminates primary and auxiliary scopes, including when primary is shared or absent",
+    () =>
+      withFakeSystemd(({ scope, units, calls, cgroupRoot }) =>
+        Effect.gen(function* () {
+          // Thread "a": primary + two auxiliary units.
+          const primary = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "acp",
+            threadId: "a",
+          });
+          const aux1 = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "acp-terminal",
+            threadId: "a",
+            auxiliary: true,
+          });
+          const aux2 = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "acp-terminal",
+            threadId: "a",
+            auxiliary: true,
+          });
+          for (const unit of [unitOf(primary), unitOf(aux1), unitOf(aux2)]) {
+            exitedAgent(units, cgroupRoot, unit, { populated: true, oomKills: 0 });
+          }
+
+          expect(yield* scope.kill("a")).toBe(true);
+          for (const unit of [unitOf(primary), unitOf(aux1), unitOf(aux2)]) {
+            expect(
+              NodeFS.readFileSync(NodePath.join(cgroupRoot, unit, "cgroup.kill"), "utf8"),
+            ).toBe("1");
+          }
+          // After primary goes inactive, killed auxiliary units stay untracked.
+          units.get(unitOf(primary))!.activeState = "inactive";
+          expect(yield* scope.kill("a")).toBe(false);
+
+          // Thread "b": shared Codex primary + auxiliary unit -> only auxiliary unit is killed.
+          const codex = yield* launchCodex(scope, "b");
+          const sharedAux = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "acp-terminal",
+            threadId: "b",
+            auxiliary: true,
+          });
+          exitedAgent(units, cgroupRoot, unitOf(codex), { populated: true, oomKills: 0 });
+          exitedAgent(units, cgroupRoot, unitOf(sharedAux), { populated: true, oomKills: 0 });
+          expect(yield* scope.kill("b")).toBe(true);
+          expect(NodeFS.existsSync(NodePath.join(cgroupRoot, unitOf(codex), "cgroup.kill"))).toBe(
+            false,
+          );
+          expect(
+            NodeFS.readFileSync(
+              NodePath.join(cgroupRoot, unitOf(sharedAux), "cgroup.kill"),
+              "utf8",
+            ),
+          ).toBe("1");
+
+          // Thread "c": auxiliary unit with no primary scope, falling back to systemctl kill.
+          const auxOnly = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "acp-terminal",
+            threadId: "c",
+            auxiliary: true,
+          });
+          units.set(unitOf(auxOnly), { activeState: "active", result: "success" });
+          expect(yield* scope.kill("c")).toBe(true);
+          expect(calls).toContainEqual(["--user", "kill", "--signal=SIGKILL", unitOf(auxOnly)]);
+        }),
+      ),
+  );
+
+  it.effect(
+    "untracks auxiliary scopes on terminateUnit, confirmed-empty stop, and clear, while keeping active/deactivating scopes killable",
+    () =>
+      withFakeSystemd(
+        ({ scope, units, cgroupRoot }) =>
+          Effect.gen(function* () {
+            const auxTerminated = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "acp-terminal",
+              threadId: "a",
+              auxiliary: true,
+            });
+            const auxStoppedEmpty = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "acp-terminal",
+              threadId: "a",
+              auxiliary: true,
+            });
+            const auxStoppedStillPopulated = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "acp-terminal",
+              threadId: "a",
+              auxiliary: true,
+            });
+            const terminatedUnit = unitOf(auxTerminated);
+            const stoppedEmptyUnit = unitOf(auxStoppedEmpty);
+            const stoppedStillPopulatedUnit = unitOf(auxStoppedStillPopulated);
+            exitedAgent(units, cgroupRoot, terminatedUnit, { populated: true, oomKills: 0 });
+            exitedAgent(units, cgroupRoot, stoppedEmptyUnit, { populated: false, oomKills: 0 });
+            exitedAgent(units, cgroupRoot, stoppedStillPopulatedUnit, {
+              populated: true,
+              oomKills: 0,
+            });
+
+            yield* scope.terminateUnit(terminatedUnit);
+            yield* scope.stop(stoppedEmptyUnit);
+            yield* scope.stop(stoppedStillPopulatedUnit);
+
+            // Re-activating untracked units must not target them, while the unit whose async
+            // `--no-block` stop only transitioned it to `deactivating` MUST remain Force-Stoppable.
+            units.set(terminatedUnit, { activeState: "active", result: "success" });
+            units.set(stoppedEmptyUnit, { activeState: "active", result: "success" });
+            units.get(stoppedStillPopulatedUnit)!.activeState = "deactivating";
+            expect(yield* scope.kill("a")).toBe(true);
+            expect(
+              NodeFS.readFileSync(
+                NodePath.join(cgroupRoot, stoppedStillPopulatedUnit, "cgroup.kill"),
+                "utf8",
+              ),
+            ).toBe("1");
+            // Once Force Stopped, the deactivating auxiliary unit is untracked.
+            expect(yield* scope.kill("a")).toBe(false);
+
+            // clear(threadId) untracks auxiliary units for that thread.
+            const auxCleared = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "acp-terminal",
+              threadId: "b",
+              auxiliary: true,
+            });
+            units.set(unitOf(auxCleared), { activeState: "active", result: "success" });
+            yield* scope.clear("b");
+            expect(yield* scope.kill("b")).toBe(false);
+          }),
+        {
+          onWriteCgroupKill: (writePath, _data, _units, cgroupRoot) => {
+            const eventsPath = NodePath.join(
+              NodePath.dirname(writePath.replace("/sys/fs/cgroup", cgroupRoot)),
+              "cgroup.events",
+            );
+            NodeFS.writeFileSync(eventsPath, "populated 0\nfrozen 0\n");
+          },
+        },
+      ),
+  );
 });

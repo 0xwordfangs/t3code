@@ -28,6 +28,12 @@ export interface AgentScopeShape {
      * Falls back to ordinary scope behavior on older systemd.
      */
     readonly shared?: boolean | undefined;
+    /**
+     * Auxiliary per-thread units (such as ACP client terminals) are killed on
+     * `kill(threadId)` and reaped on server restart, but never overwrite the
+     * thread's primary scope or its `oomKilled(threadId)` attribution.
+     */
+    readonly auxiliary?: boolean | undefined;
   }) => Effect.Effect<AgentScopeCommand>;
   readonly oomKilled: (threadId: string) => Effect.Effect<boolean>;
   /**

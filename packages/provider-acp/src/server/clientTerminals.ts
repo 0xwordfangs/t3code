@@ -1,9 +1,11 @@
+import * as Cause from "effect/Cause";
 import * as Channel from "effect/Channel";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -12,7 +14,27 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as NodeBuffer from "node:buffer";
+import { AgentScope, AgentScopeThreadId, type AgentScopeShape } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+
+import {
+  capturePosixOwnershipLedger,
+  makeLinuxCgroupController,
+  makePosixProcessTreeController,
+  observePosixOwnershipLedger,
+  observePosixOwnershipLedgerContinuously,
+  resolveLinuxCgroupTargetCommand,
+  terminateLinuxCgroupLease,
+  terminatePosixOwnedProcessTree,
+  terminateWindowsProcessTreeWithTaskkill,
+  wrapCommandForLinuxCgroup,
+  type AcpLinuxCgroupController,
+  type AcpLinuxCgroupLease,
+  type AcpOwnedPosixProcess,
+  type AcpPosixOwnershipRoot,
+  type AcpPosixProcessTreeController,
+  type AcpProcessGroupTerminationError,
+} from "./AcpSessionRuntime.ts";
 
 const MAX_LIVE_TERMINALS = 16;
 const MAX_UNRELEASED_TERMINALS = 64;
@@ -132,21 +154,39 @@ export interface AcpClientTerminalsOptions {
     | ((sessionId: string) => NodeJS.ProcessEnv | undefined)
     | undefined;
   readonly forceKillAfter?: Duration.Input | undefined;
+  readonly threadId?: string | undefined;
+  readonly agentScope?: AgentScopeShape | undefined;
+  readonly linuxCgroupController?: AcpLinuxCgroupController | null | undefined;
+  readonly posixProcessTreeController?: AcpPosixProcessTreeController | undefined;
+  readonly windowsProcessTreeTerminator?:
+    | ((pid: number) => Effect.Effect<void, AcpProcessGroupTerminationError>)
+    | undefined;
 }
 
-function acpTerminalCommand(input: {
+function materializeAcpTerminalCommand(input: {
   readonly request: EffectAcpSchema.CreateTerminalRequest;
   readonly shellCommands?: boolean | undefined;
-  readonly defaultCwd: string;
-  readonly environment: NodeJS.ProcessEnv;
-  readonly forceKillAfter: Duration.Input;
-}) {
-  return ChildProcess.make(input.request.command, input.request.args ?? [], {
-    cwd: input.request.cwd ?? input.defaultCwd,
-    env: input.environment,
-    shell: input.shellCommands === true && (input.request.args?.length ?? 0) === 0,
-    forceKillAfter: input.forceKillAfter,
-  });
+  readonly isWindows: boolean;
+}): {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly shell: boolean;
+} {
+  const useShell = input.shellCommands === true && (input.request.args?.length ?? 0) === 0;
+  if (useShell && !input.isWindows) {
+    // Materialize POSIX shell invocation before cgroup or AgentScope wrapping so
+    // raw shell source is never passed to executable resolution or `shell: true`.
+    return {
+      command: "/bin/sh",
+      args: ["-c", input.request.command],
+      shell: false,
+    };
+  }
+  return {
+    command: input.request.command,
+    args: input.request.args ?? [],
+    shell: useShell,
+  };
 }
 
 // Windows variable names are case-insensitive and Node passes only one spelling to the child,
@@ -169,7 +209,10 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
 ): Effect.fn.Return<AcpClientTerminals, never, ChildProcessSpawner.ChildProcessSpawner> {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const forceKillAfter = options.forceKillAfter ?? "5 seconds";
-  const isWindows = yield* HostProcess.isWindows;
+  const platform = yield* HostProcess.Platform;
+  const isWindows = platform === "win32";
+  const agentScope = options.agentScope ?? (yield* AgentScope);
+  const threadId = options.threadId ?? (yield* AgentScopeThreadId);
   const creationPermit = yield* Semaphore.make(1);
   const terminals = new Map<string, ManagedAcpTerminal>();
   let nextTerminalNumber = 1;
@@ -246,15 +289,85 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
             Object.entries(sessionEnvironment ?? {}),
             (request.env ?? []).map((variable) => [variable.name, variable.value] as const),
           ]);
+          const cwd = request.cwd ?? options.defaultCwd;
+          const baseCommand = materializeAcpTerminalCommand({
+            request,
+            shellCommands: options.shellCommands,
+            isWindows,
+          });
+          const effectiveThreadId = threadId ?? sessionEnvironment?.T3CODE_THREAD_ID;
+          const resolvedTargetCommand =
+            baseCommand.shell || isWindows
+              ? undefined
+              : resolveLinuxCgroupTargetCommand(baseCommand.command, cwd, environment);
+          const explicitCgroupController =
+            platform === "linux" &&
+            options.linuxCgroupController !== undefined &&
+            options.linuxCgroupController !== null
+              ? options.linuxCgroupController
+              : undefined;
+          // Prefer AgentScope first on Linux so terminals join ownedSlice (Force Stop,
+          // stopLeftoverAgents, and memory/task limits); fall back to a delegated cgroup
+          // leaf when systemd user scopes are unavailable (or when injected explicitly).
+          const scopedLaunch =
+            baseCommand.shell || explicitCgroupController !== undefined
+              ? undefined
+              : yield* agentScope.wrap({
+                  command: resolvedTargetCommand ?? baseCommand.command,
+                  args: baseCommand.args,
+                  name: "acp-terminal",
+                  ...(effectiveThreadId === undefined ? {} : { threadId: effectiveThreadId }),
+                  env: environment,
+                  auxiliary: true,
+                });
+          const scopeUnit = scopedLaunch?.unit;
+          const linuxCgroupLease: AcpLinuxCgroupLease | undefined =
+            platform === "linux" &&
+            scopeUnit === undefined &&
+            options.linuxCgroupController !== null &&
+            resolvedTargetCommand !== undefined
+              ? yield* Effect.sync(() => {
+                  try {
+                    return (explicitCgroupController ?? makeLinuxCgroupController()).create();
+                  } catch {
+                    return undefined;
+                  }
+                })
+              : undefined;
+          const launchCommand =
+            linuxCgroupLease !== undefined && resolvedTargetCommand !== undefined
+              ? {
+                  ...wrapCommandForLinuxCgroup(
+                    linuxCgroupLease,
+                    resolvedTargetCommand,
+                    baseCommand.args,
+                  ),
+                  shell: false,
+                }
+              : scopedLaunch !== undefined
+                ? { command: scopedLaunch.command, args: scopedLaunch.args, shell: false }
+                : baseCommand;
+
           const terminalScope = yield* Scope.make();
+          const cleanupFailedSpawn = Effect.gen(function* () {
+            yield* Scope.close(terminalScope, Exit.void).pipe(Effect.ignore);
+            if (linuxCgroupLease !== undefined) {
+              yield* terminateLinuxCgroupLease(linuxCgroupLease).pipe(
+                Effect.ignoreCause({ log: true }),
+              );
+            }
+            if (scopeUnit !== undefined) {
+              yield* agentScope.terminateUnit(scopeUnit).pipe(Effect.ignoreCause({ log: true }));
+            }
+          });
           const child = yield* restore(
             spawner
               .spawn(
-                acpTerminalCommand({
-                  request,
-                  shellCommands: options.shellCommands,
-                  defaultCwd: options.defaultCwd,
-                  environment,
+                ChildProcess.make(launchCommand.command, launchCommand.args, {
+                  cwd,
+                  env: environment,
+                  shell: launchCommand.shell,
+                  detached: !isWindows,
                   forceKillAfter,
                 }),
               )
@@ -268,13 +381,208 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
                 ),
               ),
           ).pipe(
-            Effect.onExit((exit) =>
-              Exit.isFailure(exit) ? Scope.close(terminalScope, Exit.void) : Effect.void,
-            ),
+            Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanupFailedSpawn : Effect.void)),
           );
 
           const terminalId = `t3-term-${nextTerminalNumber}`;
           nextTerminalNumber += 1;
+
+          const rootPid = Number(child.pid);
+          const hasTrackablePid =
+            Number.isSafeInteger(rootPid) && rootPid > 1 && rootPid !== process.pid;
+          const posixOwnershipLedger = new Map<string, AcpOwnedPosixProcess>();
+          const posixOwnershipFrontier = new Map<number, AcpOwnedPosixProcess>();
+          const posixOwnershipChildQueues = new Map<number, Array<number>>();
+          const posixOwnershipRoot: AcpPosixOwnershipRoot = { value: undefined };
+          const posixController: AcpPosixProcessTreeController | undefined =
+            !isWindows && linuxCgroupLease === undefined && hasTrackablePid
+              ? (() => {
+                  if (options.posixProcessTreeController !== undefined) {
+                    return options.posixProcessTreeController;
+                  }
+                  try {
+                    return makePosixProcessTreeController(platform);
+                  } catch {
+                    return undefined;
+                  }
+                })()
+              : undefined;
+
+          let observerFiber: Fiber.Fiber<never> | undefined;
+          if (posixController !== undefined) {
+            yield* Effect.sync(() => {
+              try {
+                observePosixOwnershipLedger({
+                  childQueues: posixOwnershipChildQueues,
+                  controller: posixController,
+                  frontier: posixOwnershipFrontier,
+                  ledger: posixOwnershipLedger,
+                  root: posixOwnershipRoot,
+                  rootPid,
+                });
+              } catch {}
+            });
+            if (posixOwnershipRoot.value !== undefined) {
+              observerFiber = yield* observePosixOwnershipLedgerContinuously({
+                childQueues: posixOwnershipChildQueues,
+                controller: posixController,
+                frontier: posixOwnershipFrontier,
+                ledger: posixOwnershipLedger,
+                root: posixOwnershipRoot,
+                rootPid,
+              }).pipe(Effect.forkIn(terminalScope));
+            }
+          }
+
+          const interruptObserver = Effect.gen(function* () {
+            const fiber = observerFiber;
+            if (fiber === undefined) return;
+            observerFiber = undefined;
+            yield* Fiber.interrupt(fiber).pipe(Effect.ignore);
+          });
+
+          const snapshotPosixLedger =
+            posixController === undefined || linuxCgroupLease !== undefined
+              ? Effect.void
+              : Effect.gen(function* () {
+                  if (posixTreeTerminated || posixOwnershipRoot.value === undefined) return;
+                  const table =
+                    posixController.snapshotAsync !== undefined
+                      ? yield* posixController.snapshotAsync().pipe(Effect.option)
+                      : Option.none();
+                  yield* Effect.sync(() => {
+                    try {
+                      capturePosixOwnershipLedger({
+                        controller: posixController,
+                        ledger: posixOwnershipLedger,
+                        root: posixOwnershipRoot,
+                        rootPid,
+                        ...(Option.isSome(table) ? { table: table.value } : {}),
+                      });
+                    } catch {}
+                  });
+                });
+
+          const containmentSemaphore = yield* Semaphore.make(1);
+          let cgroupTerminated = false;
+          let posixTreeTerminated = false;
+          let scopeUnitTerminated = false;
+          let windowsTreeTerminated = false;
+
+          const terminateWindowsTreeIfRunning =
+            !isWindows ||
+            !hasTrackablePid ||
+            (options.windowsProcessTreeTerminator === undefined &&
+              HostProcess.Platform.defaultValue() !== "win32")
+              ? Effect.void
+              : Effect.gen(function* () {
+                  if (windowsTreeTerminated) return;
+                  const running = yield* child.isRunning.pipe(Effect.orElseSucceed(() => false));
+                  windowsTreeTerminated = true;
+                  if (!running) return;
+                  const terminateWindows =
+                    options.windowsProcessTreeTerminator ??
+                    ((pid: number) =>
+                      terminateWindowsProcessTreeWithTaskkill(pid).pipe(
+                        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                      ));
+                  yield* terminateWindows(rootPid).pipe(Effect.ignore);
+                });
+
+          const terminateContainment = (mode: "kill" | "dispose") =>
+            containmentSemaphore.withPermit(
+              Effect.uninterruptible(
+                Effect.gen(function* () {
+                  yield* terminateWindowsTreeIfRunning;
+                  yield* snapshotPosixLedger;
+                  yield* interruptObserver;
+
+                  if (linuxCgroupLease !== undefined && !cgroupTerminated) {
+                    const exit = yield* Effect.exit(terminateLinuxCgroupLease(linuxCgroupLease));
+                    if (Exit.isSuccess(exit)) {
+                      cgroupTerminated = true;
+                    } else {
+                      yield* Effect.logWarning("Failed to terminate ACP client terminal cgroup", {
+                        terminalId,
+                        path: linuxCgroupLease.path,
+                        cause: Cause.pretty(exit.cause),
+                      });
+                    }
+                  }
+
+                  if (
+                    posixController !== undefined &&
+                    linuxCgroupLease === undefined &&
+                    posixOwnershipRoot.value !== undefined &&
+                    !posixTreeTerminated
+                  ) {
+                    const exit = yield* Effect.exit(
+                      terminatePosixOwnedProcessTree({
+                        controller: posixController,
+                        grace: 0,
+                        ledger: posixOwnershipLedger,
+                        root: posixOwnershipRoot,
+                        rootPid,
+                      }),
+                    );
+                    if (Exit.isSuccess(exit)) {
+                      posixTreeTerminated = true;
+                    } else {
+                      yield* Effect.logWarning(
+                        "Failed to terminate ACP client terminal process tree",
+                        {
+                          terminalId,
+                          rootPid,
+                          cause: Cause.pretty(exit.cause),
+                        },
+                      );
+                    }
+                  }
+
+                  if (scopeUnit !== undefined && !scopeUnitTerminated) {
+                    const exit = yield* Effect.exit(agentScope.terminateUnit(scopeUnit));
+                    if (Exit.isSuccess(exit)) {
+                      scopeUnitTerminated = true;
+                    } else {
+                      yield* Effect.logWarning(
+                        "Failed to terminate ACP client terminal scope unit",
+                        {
+                          terminalId,
+                          unit: scopeUnit,
+                          cause: Cause.pretty(exit.cause),
+                        },
+                      );
+                      if (mode === "dispose") {
+                        yield* agentScope.stop(scopeUnit).pipe(Effect.ignoreCause({ log: true }));
+                      }
+                    }
+                  }
+                }),
+              ),
+            );
+
+          const stopObserverIfIdle = Effect.gen(function* () {
+            if (posixController === undefined || observerFiber === undefined) return;
+            if (posixController.refreshAsync !== undefined) {
+              yield* posixController.refreshAsync().pipe(Effect.ignore);
+            }
+            yield* Effect.sync(() => {
+              try {
+                observePosixOwnershipLedger({
+                  childQueues: posixOwnershipChildQueues,
+                  controller: posixController,
+                  frontier: posixOwnershipFrontier,
+                  ledger: posixOwnershipLedger,
+                  root: posixOwnershipRoot,
+                  rootPid,
+                });
+              } catch {}
+            });
+            if (posixOwnershipFrontier.size === 0) {
+              yield* interruptObserver;
+            }
+          });
+
           const record: ManagedAcpTerminal = {
             terminalId,
             sessionId: request.sessionId,
@@ -289,10 +597,22 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
               ),
             },
             exit: yield* Deferred.make<EffectAcpSchema.WaitForTerminalExitResponse>(),
-            // The spawner only applies the command's forceKillAfter on scope close;
-            // an explicit kill must pass it or a SIGTERM-ignoring command never exits.
-            kill: child.kill({ forceKillAfter }).pipe(Effect.ignore),
-            dispose: Scope.close(terminalScope, Exit.void).pipe(Effect.ignore),
+            // Snapshot live descendants (and on Windows kill live tree before releasing the handle)
+            // so freshly forked setsid children cannot reparent unseen, then reap containment layers.
+            kill: snapshotPosixLedger.pipe(
+              Effect.andThen(
+                containmentSemaphore.withPermit(
+                  Effect.uninterruptible(terminateWindowsTreeIfRunning),
+                ),
+              ),
+              Effect.andThen(child.kill({ forceKillAfter }).pipe(Effect.ignore)),
+              Effect.andThen(terminateContainment("kill")),
+            ),
+            // Terminate containment BEFORE closing terminalScope so observerFiber stays alive
+            // through the final snapshot and SIGTERM-ignoring leaders do not stall release/disposeAll.
+            dispose: terminateContainment("dispose").pipe(
+              Effect.andThen(Scope.close(terminalScope, Exit.void).pipe(Effect.ignore)),
+            ),
             exitStatus: undefined,
             released: false,
           };
@@ -319,6 +639,7 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
                 onFailure: (error) => ({ exitCode: null, signal: terminalExitSignal(error) }),
                 onSuccess: (code) => ({ exitCode: Number(code), signal: null }),
               }),
+              Effect.tap(() => stopObserverIfIdle),
               Effect.flatMap((status) =>
                 Effect.all([Fiber.join(stdoutPump), Fiber.join(stderrPump)], {
                   discard: true,

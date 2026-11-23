@@ -106,6 +106,7 @@ const TERMINATE_UNIT_STEP_TIMEOUT_MS = 2_000;
 const CLEAR_FAILED_INTERVAL = "1 second";
 const CLEAR_FAILED_ATTEMPTS = 120;
 const MAX_TRACKED_THREADS = 500;
+const MAX_AUXILIARY_UNITS_PER_THREAD = 64;
 const wallClock = Clock.Clock.defaultValue();
 
 export const make = Effect.gen(function* () {
@@ -259,6 +260,20 @@ export const make = Effect.gen(function* () {
 
   // `shared` scopes serve other threads too: tracked only for OOM diagnosis on old systemd.
   const scopeByThread = new Map<string, { unit: string; oomKilled: boolean; shared: boolean }>();
+  // Auxiliary per-thread units (e.g. ACP client terminals) are tracked separately so they
+  // never overwrite the thread's primary scope or pollute `oomKilled(threadId)`.
+  const auxiliaryScopesByThread = new Map<string, Set<string>>();
+  const auxiliaryThreadByUnit = new Map<string, string>();
+
+  const untrackAuxiliaryUnit = (unit: string): void => {
+    const threadId = auxiliaryThreadByUnit.get(unit);
+    if (threadId === undefined) return;
+    auxiliaryThreadByUnit.delete(unit);
+    const units = auxiliaryScopesByThread.get(threadId);
+    if (units === undefined) return;
+    units.delete(unit);
+    if (units.size === 0) auxiliaryScopesByThread.delete(threadId);
+  };
 
   const readScope = Effect.fn("agentScope.readScope")(function* (systemctl: string, unit: string) {
     const shown = yield* run(systemctl, [
@@ -329,6 +344,70 @@ export const make = Effect.gen(function* () {
     if (scopeByThread.size > MAX_TRACKED_THREADS) yield* evictOldest(systemctl);
   });
 
+  const evictOldestAuxiliaryUnit = Effect.fn("agentScope.evictOldestAuxiliaryUnit")(function* (
+    systemctl: string,
+    threadId: string,
+  ) {
+    const units = auxiliaryScopesByThread.get(threadId);
+    if (units === undefined) return;
+    const oldest = units.values().next();
+    if (oldest.done === true) return;
+    const unit = oldest.value;
+    const state = yield* readScope(systemctl, unit);
+    if (auxiliaryThreadByUnit.get(unit) !== threadId) return;
+    const status = state === undefined ? "running" : classifyScope(state);
+    if (status === "running" || status === "stopping") {
+      units.delete(unit);
+      units.add(unit);
+      return;
+    }
+    untrackAuxiliaryUnit(unit);
+    yield* forget(systemctl, unit);
+  });
+
+  const evictOldestAuxiliaryThread = Effect.fn("agentScope.evictOldestAuxiliaryThread")(function* (
+    systemctl: string,
+  ) {
+    const oldest = auxiliaryScopesByThread.entries().next();
+    if (oldest.done === true) return;
+    const [threadId, units] = oldest.value;
+    let hasLiveUnit = false;
+    for (const unit of Array.from(units)) {
+      const state = yield* readScope(systemctl, unit);
+      if (auxiliaryThreadByUnit.get(unit) !== threadId) continue;
+      const status = state === undefined ? "running" : classifyScope(state);
+      if (status === "running" || status === "stopping") {
+        hasLiveUnit = true;
+        continue;
+      }
+      untrackAuxiliaryUnit(unit);
+      yield* forget(systemctl, unit);
+    }
+    const remaining = auxiliaryScopesByThread.get(threadId);
+    if (hasLiveUnit && remaining !== undefined && remaining.size > 0) {
+      auxiliaryScopesByThread.delete(threadId);
+      auxiliaryScopesByThread.set(threadId, remaining);
+    }
+  });
+
+  const trackAuxiliary = Effect.fn("agentScope.trackAuxiliary")(function* (
+    systemctl: string,
+    threadId: string,
+    unit: string,
+  ) {
+    const units = auxiliaryScopesByThread.get(threadId) ?? new Set<string>();
+    auxiliaryScopesByThread.delete(threadId);
+    units.add(unit);
+    auxiliaryScopesByThread.set(threadId, units);
+    auxiliaryThreadByUnit.set(unit, threadId);
+    if (units.size > MAX_AUXILIARY_UNITS_PER_THREAD) {
+      yield* evictOldestAuxiliaryUnit(systemctl, threadId);
+    }
+    if (auxiliaryScopesByThread.size > MAX_TRACKED_THREADS) {
+      yield* evictOldestAuxiliaryThread(systemctl);
+    }
+  });
+
   const oomKilled: AgentScopeShape["oomKilled"] = Effect.fn("agentScope.oomKilled")(
     function* (threadId) {
       const tracked = scopeByThread.get(threadId);
@@ -361,7 +440,10 @@ export const make = Effect.gen(function* () {
   const stop = Effect.fn("AgentScope.stop")(function* (unit: string) {
     if (!unit.startsWith("t3code-") || !unit.endsWith(".scope")) return;
     const scope = yield* systemd;
-    if (scope === undefined) return;
+    if (scope === undefined) {
+      untrackAuxiliaryUnit(unit);
+      return;
+    }
     const state = yield* readScope(scope.systemctl, unit);
     if (
       state === undefined ||
@@ -369,8 +451,18 @@ export const make = Effect.gen(function* () {
       state.activeState !== "active" ||
       state.result === "oom-kill" ||
       state.populated === false
-    )
+    ) {
+      if (
+        state !== undefined &&
+        (state.loadState !== "loaded" ||
+          state.activeState === "inactive" ||
+          state.activeState === "failed" ||
+          state.populated === false)
+      ) {
+        untrackAuxiliaryUnit(unit);
+      }
       return;
+    }
     // The kernel counts OOM kills before signaling the victim. Let OOMPolicy
     // record the result before a manual stop can overwrite it; an unreadable
     // counter cannot rule out that race. Older managers need us to stop it.
@@ -388,7 +480,10 @@ export const make = Effect.gen(function* () {
     function* (unit: string, options?: { readonly preserveOomDiagnosis?: boolean | undefined }) {
       if (!unit.startsWith("t3code-") || !unit.endsWith(".scope")) return;
       const scope = yield* systemd;
-      if (scope === undefined) return;
+      if (scope === undefined) {
+        untrackAuxiliaryUnit(unit);
+        return;
+      }
       const deadlineMs = (yield* Clock.currentTimeMillis) + TERMINATE_UNIT_DEADLINE_MS;
       const remainingMs = Effect.map(Clock.currentTimeMillis, (now) => deadlineMs - now);
       const runBounded = Effect.fn("agentScope.terminateUnit.runBounded")(function* (
@@ -424,12 +519,14 @@ export const make = Effect.gen(function* () {
         const loadState = values.get("LoadState") ?? "";
         const activeState = values.get("ActiveState") ?? "";
         if (loadState !== "loaded" || activeState === "inactive" || activeState === "failed") {
+          untrackAuxiliaryUnit(unit);
           return;
         }
         const result = values.get("Result") ?? "";
         const controlGroup = values.get("ControlGroup") ?? "";
         const events = controlGroup ? yield* readCgroupFile(controlGroup, "cgroup.events") : "";
         if (parseCgroupCounter(events, "populated") === 0) {
+          untrackAuxiliaryUnit(unit);
           return;
         }
         if (
@@ -475,20 +572,21 @@ export const make = Effect.gen(function* () {
     Effect.provideService(Clock.Clock, wallClock),
   );
 
-  const kill: AgentScopeShape["kill"] = Effect.fn("AgentScope.kill")(function* (threadId) {
-    const tracked = scopeByThread.get(threadId);
-    if (tracked === undefined || tracked.shared) return false;
-    const scope = yield* systemd;
-    if (scope === undefined) return false;
-    const shown = yield* run(scope.systemctl, [
+  const killUnit = Effect.fn("agentScope.killUnit")(function* (systemctl: string, unit: string) {
+    const shown = yield* run(systemctl, [
       "--user",
       "show",
-      tracked.unit,
-      "--property=ActiveState,ControlGroup",
+      unit,
+      "--property=LoadState,ActiveState,ControlGroup",
     ]);
-    if (shown._tag === "None" || shown.value.code !== 0) return false;
+    if (shown._tag === "None" || shown.value.code !== 0) return "failed" as const;
     const values = parseKeyValues(shown.value.stdout);
-    if (values.get("ActiveState") !== "active") return false;
+    const loadState = values.get("LoadState") ?? "";
+    const activeState = values.get("ActiveState") ?? "";
+    if (loadState !== "loaded" || activeState === "inactive" || activeState === "failed") {
+      return "inactive" as const;
+    }
+    if (activeState !== "active" && activeState !== "deactivating") return "failed" as const;
     const controlGroup = values.get("ControlGroup") ?? "";
     // cgroup.kill (Linux 5.14+) kills the whole tree at once; systemd's kill is the fallback.
     const killedByCgroup =
@@ -499,20 +597,54 @@ export const make = Effect.gen(function* () {
           Effect.as(true),
           Effect.orElseSucceed(() => false),
         ));
-    if (killedByCgroup) return true;
-    const killed = yield* run(scope.systemctl, [
-      "--user",
-      "kill",
-      "--signal=SIGKILL",
-      tracked.unit,
-    ]);
-    return killed._tag === "Some" && killed.value.code === 0;
+    if (killedByCgroup) return "killed" as const;
+    const killed = yield* run(systemctl, ["--user", "kill", "--signal=SIGKILL", unit]);
+    return killed._tag === "Some" && killed.value.code === 0
+      ? ("killed" as const)
+      : ("failed" as const);
+  });
+
+  const kill: AgentScopeShape["kill"] = Effect.fn("AgentScope.kill")(function* (threadId) {
+    const tracked = scopeByThread.get(threadId);
+    const primaryUnit = tracked !== undefined && !tracked.shared ? tracked.unit : undefined;
+    const auxiliaryUnits = [...(auxiliaryScopesByThread.get(threadId) ?? [])];
+    if (primaryUnit === undefined && auxiliaryUnits.length === 0) return false;
+    const scope = yield* systemd;
+    if (scope === undefined) return false;
+    let killedAny = false;
+    if (primaryUnit !== undefined) {
+      if ((yield* killUnit(scope.systemctl, primaryUnit)) === "killed") {
+        killedAny = true;
+      }
+    }
+    for (const unit of auxiliaryUnits) {
+      const outcome = yield* killUnit(scope.systemctl, unit);
+      if (outcome === "killed") {
+        killedAny = true;
+        untrackAuxiliaryUnit(unit);
+        yield* forget(scope.systemctl, unit);
+      } else if (outcome === "inactive") {
+        untrackAuxiliaryUnit(unit);
+        yield* forget(scope.systemctl, unit);
+      }
+    }
+    return killedAny;
   });
 
   const clear: AgentScopeShape["clear"] = Effect.fn("agentScope.clear")(function* (threadId) {
-    if (!scopeByThread.has(threadId)) return;
+    const hasPrimary = scopeByThread.has(threadId);
+    const auxiliaryUnits = [...(auxiliaryScopesByThread.get(threadId) ?? [])];
+    if (!hasPrimary && auxiliaryUnits.length === 0) return;
     const scope = yield* systemd;
-    if (scope !== undefined) yield* track(scope.systemctl, threadId, undefined);
+    if (hasPrimary && scope !== undefined) {
+      yield* track(scope.systemctl, threadId, undefined);
+    }
+    for (const unit of auxiliaryUnits) {
+      untrackAuxiliaryUnit(unit);
+      if (scope !== undefined) {
+        yield* forget(scope.systemctl, unit);
+      }
+    }
   });
 
   return {
@@ -524,6 +656,7 @@ export const make = Effect.gen(function* () {
       env,
       survivesRestart,
       shared,
+      auxiliary,
     }) {
       const resolved = yield* resolve(command, env ?? hostEnvironment);
       if (resolved === null) return { command, args };
@@ -531,18 +664,24 @@ export const make = Effect.gen(function* () {
       if (scope === undefined) return agentScopeCommand({ command: resolved, args });
       yield* scope.applyMemoryLimits;
       const unit = `t3code-${name}-${NodeCrypto.randomUUID().slice(0, 8)}.scope`;
+      const isAuxiliary = auxiliary === true;
       // A continuing shared scope cannot attribute a tool's OOM to one thread.
       // Clear the launch thread's previous scope instead.
-      const continuing = shared === true && scope.supportsOomPolicy;
-      const owned = threadId !== undefined && !continuing;
-      if (threadId !== undefined)
-        yield* track(scope.systemctl, threadId, owned ? unit : undefined, shared === true);
+      const continuing = !isAuxiliary && shared === true && scope.supportsOomPolicy;
+      const owned = !isAuxiliary && threadId !== undefined && !continuing;
+      if (threadId !== undefined) {
+        if (isAuxiliary) {
+          yield* trackAuxiliary(scope.systemctl, threadId, unit);
+        } else {
+          yield* track(scope.systemctl, threadId, owned ? unit : undefined, shared === true);
+        }
+      }
       const systemdScope: AgentSystemdScope = {
         systemdRun: scope.systemdRun,
         runtimeDir: scope.runtimeDir,
         slice: survivesRestart === true ? AGENT_SLICE : ownedSlice,
         unit,
-        // Without an owning thread nothing reads the result, so let systemd
+        // Without an owning primary thread nothing reads the result, so let systemd
         // unload the unit even when it fails.
         options: [
           ...SCOPE_OPTIONS,

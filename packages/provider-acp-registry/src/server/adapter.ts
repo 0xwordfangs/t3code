@@ -87,6 +87,7 @@ export interface AcpRegistryAdapterV2Options {
   >;
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
   readonly assertComplete?: Effect.Effect<void, EffectAcpErrors.AcpError>;
+  readonly clientTerminalLinuxCgroupController?: AcpSessionRuntime.AcpLinuxCgroupController | null;
 }
 
 // Mistral Vibe's application rate-limit code, outside ACP.
@@ -384,6 +385,9 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
           clientTerminals: {
             environment: options.environment,
             shellCommands: true,
+            ...(options.clientTerminalLinuxCgroupController === undefined
+              ? {}
+              : { linuxCgroupController: options.clientTerminalLinuxCgroupController }),
           },
         }
       : {}),

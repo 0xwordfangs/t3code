@@ -1,15 +1,23 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import { AgentScope } from "@t3tools/shared/AgentScope";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as Sink from "effect/Sink";
-import * as TestClock from "effect/testing/TestClock";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Result from "effect/Result";
+import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
-import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as TestClock from "effect/testing/TestClock";
 
+import {
+  makePosixProcessTreeController,
+  posixProcessIsZombie,
+  type AcpLinuxCgroupController,
+} from "./AcpSessionRuntime.ts";
 import {
   makeAcpClientTerminals,
   resolveEmbeddedTerminalContent,
@@ -498,6 +506,371 @@ describe("AcpClientTerminals", () => {
         expect(terminals.readOutputSnapshot("owner-session", created.terminalId)).toBeDefined();
       }),
     ),
+  );
+
+  const isPosixProcessAlive = (pid: number, platform: NodeJS.Platform): boolean => {
+    try {
+      process.kill(pid, 0);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException | undefined)?.code === "ESRCH") {
+        return false;
+      }
+    }
+    if (platform === "linux" || platform === "darwin") {
+      const identity = makePosixProcessTreeController(platform).identity(pid);
+      if (identity === undefined || posixProcessIsZombie(identity)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const forceKillPid = (pid: number | undefined): void => {
+    if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  };
+
+  const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+
+  const spawnSetsidTrackedTerminal = (input: {
+    readonly shellCommands: boolean;
+    readonly nodeCode: string;
+    readonly trackedPids: Array<number>;
+    readonly linuxCgroupController?: AcpLinuxCgroupController | null | undefined;
+  }) =>
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const pidsReady = yield* Deferred.make<{
+        readonly leaderPid: number;
+        readonly childPid: number;
+      }>();
+      let stdout = "";
+      const terminals = yield* makeAcpClientTerminals({
+        defaultCwd: process.cwd(),
+        shellCommands: input.shellCommands,
+        forceKillAfter: "250 millis",
+        ...(input.linuxCgroupController === undefined
+          ? {}
+          : { linuxCgroupController: input.linuxCgroupController }),
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, {
+          ...spawner,
+          spawn: (command) =>
+            spawner.spawn(command).pipe(
+              Effect.map((child) => ({
+                ...child,
+                stdout: child.stdout.pipe(
+                  Stream.tap((chunk) => {
+                    stdout += Buffer.from(chunk).toString("utf8");
+                    const leaderMatch = /LEADER_PID=(\d+)/.exec(stdout);
+                    const childMatch = /CHILD_PID=(\d+)/.exec(stdout);
+                    if (leaderMatch === null || childMatch === null) return Effect.void;
+                    const leaderPid = Number(leaderMatch[1]);
+                    const childPid = Number(childMatch[1]);
+                    input.trackedPids.push(leaderPid, childPid);
+                    return Deferred.succeed(pidsReady, { leaderPid, childPid });
+                  }),
+                ),
+              })),
+            ),
+        }),
+      );
+      const created = yield* terminals.create(
+        input.shellCommands
+          ? {
+              sessionId: "session",
+              command: `exec ${shellQuote(process.execPath)} -e ${shellQuote(input.nodeCode)}`,
+            }
+          : { sessionId: "session", command: process.execPath, args: ["-e", input.nodeCode] },
+      );
+      const pids = yield* Deferred.await(pidsReady);
+      return { terminals, terminalId: created.terminalId, ...pids };
+    });
+
+  const DETACHED_RUNNING_LEADER_NODE_CODE = [
+    'const { spawn } = require("node:child_process");',
+    'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], { detached: true, stdio: "ignore" });',
+    "child.unref();",
+    "console.log(`LEADER_PID=${process.pid}`);",
+    "console.log(`CHILD_PID=${child.pid}`);",
+    "setTimeout(() => {}, 20000);",
+  ].join(" ");
+
+  const DETACHED_EXITED_LEADER_NODE_CODE = [
+    'const { spawn } = require("node:child_process");',
+    'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], { detached: true, stdio: "ignore" });',
+    "child.unref();",
+    "console.log(`LEADER_PID=${process.pid}`);",
+    "console.log(`CHILD_PID=${child.pid}`);",
+    // Stay alive longer than Darwin's 250 ms process-tree observe interval before exiting cleanly.
+    "setTimeout(() => process.exit(0), 400);",
+  ].join(" ");
+
+  it.live.each([
+    { mode: "default-cgroup", linuxCgroupController: undefined },
+    { mode: "posix-ledger", linuxCgroupController: null },
+  ])(
+    "terminates leader and setsid descendant on kill, release, and disposeAll with shellCommands: true ($mode)",
+    ({ linuxCgroupController }) =>
+      Effect.gen(function* () {
+        const platform = yield* HostProcess.Platform;
+        if (platform === "win32") return;
+
+        // 1) terminal/kill terminates both leader and setsid descendant and resolves waitForExit.
+        {
+          const trackedPids: Array<number> = [];
+          yield* Effect.gen(function* () {
+            const spawned = yield* spawnSetsidTrackedTerminal({
+              shellCommands: true,
+              nodeCode: DETACHED_RUNNING_LEADER_NODE_CODE,
+              trackedPids,
+              linuxCgroupController,
+            });
+            yield* Effect.addFinalizer(() => spawned.terminals.disposeAll);
+            expect(isPosixProcessAlive(spawned.leaderPid, platform)).toBe(true);
+            expect(isPosixProcessAlive(spawned.childPid, platform)).toBe(true);
+
+            yield* spawned.terminals.kill({
+              sessionId: "session",
+              terminalId: spawned.terminalId,
+            });
+            const exit = yield* spawned.terminals.waitForExit({
+              sessionId: "session",
+              terminalId: spawned.terminalId,
+            });
+            expect(exit.signal).not.toBeNull();
+            expect(isPosixProcessAlive(spawned.leaderPid, platform)).toBe(false);
+            expect(isPosixProcessAlive(spawned.childPid, platform)).toBe(false);
+          }).pipe(
+            Effect.scoped,
+            Effect.ensuring(
+              Effect.sync(() => {
+                for (const pid of trackedPids) forceKillPid(pid);
+              }),
+            ),
+          );
+        }
+
+        // 2) terminal/release terminates a setsid descendant even after the leader has already exited.
+        {
+          const trackedPids: Array<number> = [];
+          yield* Effect.gen(function* () {
+            const spawned = yield* spawnSetsidTrackedTerminal({
+              shellCommands: true,
+              nodeCode: DETACHED_EXITED_LEADER_NODE_CODE,
+              trackedPids,
+              linuxCgroupController,
+            });
+            yield* Effect.addFinalizer(() => spawned.terminals.disposeAll);
+
+            const exit = yield* spawned.terminals.waitForExit({
+              sessionId: "session",
+              terminalId: spawned.terminalId,
+            });
+            expect(exit.exitCode).toBe(0);
+            expect(isPosixProcessAlive(spawned.childPid, platform)).toBe(true);
+
+            yield* spawned.terminals.release({
+              sessionId: "session",
+              terminalId: spawned.terminalId,
+            });
+            expect(isPosixProcessAlive(spawned.leaderPid, platform)).toBe(false);
+            expect(isPosixProcessAlive(spawned.childPid, platform)).toBe(false);
+          }).pipe(
+            Effect.scoped,
+            Effect.ensuring(
+              Effect.sync(() => {
+                for (const pid of trackedPids) forceKillPid(pid);
+              }),
+            ),
+          );
+        }
+
+        // 3) disposeAll terminates both leader and setsid descendant.
+        {
+          const trackedPids: Array<number> = [];
+          yield* Effect.gen(function* () {
+            const spawned = yield* spawnSetsidTrackedTerminal({
+              shellCommands: true,
+              nodeCode: DETACHED_RUNNING_LEADER_NODE_CODE,
+              trackedPids,
+              linuxCgroupController,
+            });
+            expect(isPosixProcessAlive(spawned.leaderPid, platform)).toBe(true);
+            expect(isPosixProcessAlive(spawned.childPid, platform)).toBe(true);
+
+            yield* spawned.terminals.disposeAll;
+            expect(isPosixProcessAlive(spawned.leaderPid, platform)).toBe(false);
+            expect(isPosixProcessAlive(spawned.childPid, platform)).toBe(false);
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                for (const pid of trackedPids) forceKillPid(pid);
+              }),
+            ),
+          );
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("terminates setsid descendant on disposeAll with shellCommands: false", () =>
+    Effect.gen(function* () {
+      const platform = yield* HostProcess.Platform;
+      if (platform === "win32") return;
+
+      const trackedPids: Array<number> = [];
+      yield* Effect.gen(function* () {
+        const spawned = yield* spawnSetsidTrackedTerminal({
+          shellCommands: false,
+          nodeCode: DETACHED_RUNNING_LEADER_NODE_CODE,
+          trackedPids,
+          linuxCgroupController: null,
+        });
+        expect(isPosixProcessAlive(spawned.leaderPid, platform)).toBe(true);
+        expect(isPosixProcessAlive(spawned.childPid, platform)).toBe(true);
+
+        yield* spawned.terminals.disposeAll;
+        expect(isPosixProcessAlive(spawned.leaderPid, platform)).toBe(false);
+        expect(isPosixProcessAlive(spawned.childPid, platform)).toBe(false);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            for (const pid of trackedPids) forceKillPid(pid);
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "prefers AgentScope auxiliary units (including cwd-relative executables) and calls terminateUnit on kill, release, and disposeAll",
+    () =>
+      Effect.gen(function* () {
+        const platform = yield* HostProcess.Platform;
+        if (platform === "win32") return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-client-term-cwd-" });
+        const relativeScript = path.join(workDir, "local-helper.sh");
+        yield* fs.writeFileString(relativeScript, "#!/bin/sh\nsleep 20\n");
+        yield* fs.chmod(relativeScript, 0o755);
+
+        const wrapCalls: Array<{
+          readonly command: string;
+          readonly args: ReadonlyArray<string>;
+          readonly name: string;
+          readonly threadId: string | undefined;
+          readonly auxiliary: boolean | undefined;
+        }> = [];
+        const terminatedUnits: Array<string> = [];
+        let nextUnit = 1;
+
+        const terminals = yield* makeAcpClientTerminals({
+          defaultCwd: workDir,
+          shellCommands: true,
+          threadId: "thread-terminal-scope",
+          forceKillAfter: "250 millis",
+        }).pipe(
+          Effect.provideService(AgentScope, {
+            ...AgentScope.defaultValue(),
+            wrap: ({ command, args, name, threadId, auxiliary }) =>
+              Effect.sync(() => {
+                wrapCalls.push({ command, args, name, threadId, auxiliary });
+                const unit = `t3code-${name}-${nextUnit}.scope`;
+                nextUnit += 1;
+                return { command, args, unit };
+              }),
+            terminateUnit: (unit) =>
+              Effect.sync(() => {
+                terminatedUnits.push(unit);
+              }),
+          }),
+        );
+        yield* Effect.addFinalizer(() => terminals.disposeAll);
+
+        // 1) kill -> terminateUnit
+        const t1 = yield* terminals.create({ sessionId: "session", command: "sleep 20" });
+        yield* terminals.kill({ sessionId: "session", terminalId: t1.terminalId });
+        expect(terminatedUnits).toEqual(["t3code-acp-terminal-1.scope"]);
+
+        // 2) release -> terminateUnit (cwd-relative executable with args bypasses shell and resolves against cwd)
+        const t2 = yield* terminals.create({
+          sessionId: "session",
+          command: "./local-helper.sh",
+          args: ["arg1"],
+        });
+        yield* terminals.release({ sessionId: "session", terminalId: t2.terminalId });
+        expect(terminatedUnits).toEqual([
+          "t3code-acp-terminal-1.scope",
+          "t3code-acp-terminal-2.scope",
+        ]);
+
+        // 3) disposeAll -> terminateUnit
+        yield* terminals.create({ sessionId: "session", command: "sleep 20" });
+        yield* terminals.disposeAll;
+        expect(terminatedUnits).toEqual([
+          "t3code-acp-terminal-1.scope",
+          "t3code-acp-terminal-2.scope",
+          "t3code-acp-terminal-3.scope",
+        ]);
+
+        expect(wrapCalls).toHaveLength(3);
+        expect(wrapCalls[0]!.command).toBe("/bin/sh");
+        expect(wrapCalls[0]!.args).toEqual(["-c", "sleep 20"]);
+        expect(wrapCalls[1]!.command).toBe(relativeScript);
+        expect(wrapCalls[1]!.args).toEqual(["arg1"]);
+        expect(wrapCalls[2]!.command).toBe("/bin/sh");
+        expect(wrapCalls[2]!.args).toEqual(["-c", "sleep 20"]);
+        for (const call of wrapCalls) {
+          expect(call.name).toBe("acp-terminal");
+          expect(call.threadId).toBe("thread-terminal-scope");
+          expect(call.auxiliary).toBe(true);
+        }
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "invokes windowsProcessTreeTerminator at most once while running and skips already-exited terminals",
+    () =>
+      Effect.gen(function* () {
+        const terminatedPids: Array<number> = [];
+        const terminals = yield* makeAcpClientTerminals({
+          defaultCwd: process.cwd(),
+          forceKillAfter: "250 millis",
+          windowsProcessTreeTerminator: (pid) =>
+            Effect.sync(() => {
+              terminatedPids.push(pid);
+            }),
+        }).pipe(Effect.provideService(HostProcess.Platform, "win32"));
+        yield* Effect.addFinalizer(() => terminals.disposeAll);
+
+        // 1) Already-exited short-lived command must never trigger taskkill on release or disposeAll.
+        const shortTerm = yield* terminals.create({
+          sessionId: "session",
+          command: process.execPath,
+          args: ["-e", "process.exit(0)"],
+        });
+        expect(
+          yield* terminals.waitForExit({ sessionId: "session", terminalId: shortTerm.terminalId }),
+        ).toEqual({ exitCode: 0, signal: null });
+        yield* terminals.release({ sessionId: "session", terminalId: shortTerm.terminalId });
+        yield* terminals.disposeAll;
+        expect(terminatedPids).toEqual([]);
+
+        // 2) Live command invokes terminator once on kill and never again on release or disposeAll.
+        const liveTerm = yield* terminals.create({
+          sessionId: "session",
+          command: process.execPath,
+          args: ["-e", "setTimeout(() => {}, 20000)"],
+        });
+        yield* terminals.kill({ sessionId: "session", terminalId: liveTerm.terminalId });
+        expect(terminatedPids).toHaveLength(1);
+        yield* terminals.release({ sessionId: "session", terminalId: liveTerm.terminalId });
+        yield* terminals.disposeAll;
+        expect(terminatedPids).toHaveLength(1);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
 

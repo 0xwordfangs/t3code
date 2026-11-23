@@ -731,6 +731,7 @@ export interface AcpAdapterV2Options {
   readonly clientTerminals?: {
     readonly environment?: NodeJS.ProcessEnv;
     readonly shellCommands?: boolean;
+    readonly linuxCgroupController?: AcpSessionRuntime.AcpLinuxCgroupController | null;
   };
   readonly nativeLogging?: (threadId: ThreadId) => AcpAdapterV2NativeLogging;
   readonly continuationRequests?: {
@@ -2370,6 +2371,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 defaultCwd: input.runtimePolicy.cwd ?? process.cwd(),
                 environment: options.clientTerminals.environment,
                 shellCommands: options.clientTerminals.shellCommands,
+                ...(input.threadId === null ? {} : { threadId: input.threadId }),
+                ...(options.clientTerminals.linuxCgroupController === undefined
+                  ? {}
+                  : { linuxCgroupController: options.clientTerminals.linuxCgroupController }),
                 environmentForSession: (sessionId) => {
                   const remembered = terminalEnvironmentBySessionId.get(sessionId);
                   if (remembered !== undefined) return remembered;
@@ -2389,6 +2394,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 },
               }).pipe(
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+                Effect.provideService(AgentScope, agentScope),
               );
         if (clientTerminals !== undefined) {
           yield* Scope.addFinalizer(sessionScope, clientTerminals.disposeAll);

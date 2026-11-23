@@ -1,6 +1,6 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   MessageId,
@@ -13,6 +13,8 @@ import {
   ProviderSessionId,
   ThreadId,
 } from "@t3tools/contracts";
+import { AgentScope } from "@t3tools/shared/AgentScope";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { pendingBackgroundTurnItems } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { resolveSelfInvocation, selfInvocationArgs } from "@t3tools/shared/nodeRuntime";
 import * as Exit from "effect/Exit";
@@ -4508,6 +4510,418 @@ describe("AcpRegistryAdapterV2", () => {
           }
           assert.isFalse(yield* session.hasPendingBackgroundWork!);
         }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+  });
+
+  describe("Devin client terminal process-tree and AgentScope containment (R3-CF-05)", () => {
+    const isPosixProcessAlive = (pid: number, platform: NodeJS.Platform): boolean => {
+      try {
+        process.kill(pid, 0);
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException | undefined)?.code === "ESRCH") {
+          return false;
+        }
+      }
+      if (platform === "linux" || platform === "darwin") {
+        const identity = AcpSessionRuntime.makePosixProcessTreeController(platform).identity(pid);
+        if (identity === undefined || AcpSessionRuntime.posixProcessIsZombie(identity)) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    const forceKillPid = (pid: number | undefined): void => {
+      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) {
+        return;
+      }
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    };
+
+    const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+    const DETACHED_DEVIN_NODE_CODE = [
+      'const { spawn } = require("node:child_process");',
+      'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], { detached: true, stdio: "ignore" });',
+      "child.unref();",
+      "console.log(`LEADER_PID=${process.pid}`);",
+      "console.log(`CHILD_PID=${child.pid}`);",
+      "setTimeout(() => {}, 20000);",
+    ].join(" ");
+    const SETSID_DEVIN_COMMAND = `exec ${shellQuote(process.execPath)} -e ${shellQuote(DETACHED_DEVIN_NODE_CODE)}`;
+
+    it.live(
+      "wraps Devin client terminals in auxiliary AgentScope units and kills setsid descendants on Stop, Force Stop, and session close",
+      () =>
+        Effect.gen(function* () {
+          const platform = yield* HostProcess.Platform;
+          if (platform === "win32") return;
+
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const workDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3-devin-terminal-containment-",
+          });
+          const trackedPids: Array<number> = [];
+
+          const openDevinHarness = Effect.fn("openDevinHarness")(function* (label: string) {
+            const instanceId = ProviderInstanceId.make(`devin-containment-${label}`);
+            const threadId = ThreadId.make(`thread-devin-containment-${label}`);
+            const modelSelection = { instanceId, model: "default" } as const;
+            const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              cwd: workDir,
+            });
+            const now = yield* DateTime.now;
+            const sessionId = `devin-session-${label}`;
+
+            const wrapCalls: Array<{
+              readonly command: string;
+              readonly args: ReadonlyArray<string>;
+              readonly name: string;
+              readonly threadId: string | undefined;
+              readonly auxiliary: boolean | undefined;
+              readonly unit: string;
+            }> = [];
+            const terminatedUnits: Array<string> = [];
+            const killedThreads: Array<{
+              readonly threadId: string;
+              readonly units: ReadonlyArray<string>;
+            }> = [];
+            const auxiliaryUnitsByThread = new Map<string, Set<string>>();
+            const unitToPids = new Map<string, { leaderPid?: number; childPid?: number }>();
+            let pendingSpawnUnit: string | undefined;
+            let nextUnit = 1;
+
+            let pidsReady = yield* Deferred.make<{
+              readonly leaderPid: number;
+              readonly childPid: number;
+            }>();
+            let stdout = "";
+
+            const tappedSpawner: ChildProcessSpawner.ChildProcessSpawner["Service"] = {
+              ...spawner,
+              spawn: (command) =>
+                spawner.spawn(command).pipe(
+                  Effect.map((child) => {
+                    const unitForChild = pendingSpawnUnit;
+                    pendingSpawnUnit = undefined;
+                    return {
+                      ...child,
+                      stdout: child.stdout.pipe(
+                        Stream.tap((chunk) => {
+                          stdout += Buffer.from(chunk).toString("utf8");
+                          const leaderMatch = /LEADER_PID=(\d+)/.exec(stdout);
+                          const childMatch = /CHILD_PID=(\d+)/.exec(stdout);
+                          if (leaderMatch === null || childMatch === null) return Effect.void;
+                          const leaderPid = Number(leaderMatch[1]);
+                          const childPid = Number(childMatch[1]);
+                          trackedPids.push(leaderPid, childPid);
+                          if (unitForChild !== undefined) {
+                            unitToPids.set(unitForChild, { leaderPid, childPid });
+                          }
+                          return Deferred.succeed(pidsReady, { leaderPid, childPid });
+                        }),
+                      ),
+                    };
+                  }),
+                ),
+            };
+
+            const agentScopeSpy = {
+              ...AgentScope.defaultValue(),
+              wrap: ({
+                command,
+                args,
+                name,
+                threadId: wrapThreadId,
+                auxiliary,
+              }: Parameters<(typeof AgentScope)["Service"]["wrap"]>[0]) =>
+                Effect.sync(() => {
+                  const unit = `t3code-${name}-${label}-${nextUnit}.scope`;
+                  nextUnit += 1;
+                  wrapCalls.push({
+                    command,
+                    args,
+                    name,
+                    threadId: wrapThreadId,
+                    auxiliary,
+                    unit,
+                  });
+                  if (auxiliary === true && wrapThreadId !== undefined) {
+                    const units = auxiliaryUnitsByThread.get(wrapThreadId) ?? new Set<string>();
+                    units.add(unit);
+                    auxiliaryUnitsByThread.set(wrapThreadId, units);
+                    pendingSpawnUnit = unit;
+                  }
+                  return { command, args, unit };
+                }),
+              terminateUnit: (unit: string) =>
+                Effect.sync(() => {
+                  terminatedUnits.push(unit);
+                  for (const units of auxiliaryUnitsByThread.values()) {
+                    units.delete(unit);
+                  }
+                }),
+              kill: (killThreadId: string) =>
+                Effect.sync(() => {
+                  const units = [...(auxiliaryUnitsByThread.get(killThreadId) ?? [])];
+                  killedThreads.push({ threadId: killThreadId, units });
+                  if (units.length === 0) return false;
+                  for (const unit of units) {
+                    const pids = unitToPids.get(unit);
+                    forceKillPid(pids?.childPid);
+                    forceKillPid(pids?.leaderPid);
+                  }
+                  auxiliaryUnitsByThread.delete(killThreadId);
+                  return true;
+                }),
+            };
+
+            let createTerminalHandler:
+              | Parameters<
+                  AcpSessionRuntime.AcpSessionRuntime["Service"]["handleCreateTerminal"]
+                >[0]
+              | undefined;
+            const promptStarted = yield* Deferred.make<void>();
+            const promptGate = yield* Deferred.make<
+              EffectAcpSchema.PromptResponse,
+              EffectAcpErrors.AcpError
+            >();
+
+            const fakeRuntime: AcpSessionRuntime.AcpSessionRuntime["Service"] = {
+              handleRequestPermission: () => Effect.void,
+              handleElicitation: () => Effect.void,
+              handleMcpConnect: () => Effect.void,
+              handleMcpMessage: () => Effect.void,
+              handleMcpDisconnect: () => Effect.void,
+              handleMcpNotification: () => Effect.void,
+              handleReadTextFile: () => Effect.void,
+              handleWriteTextFile: () => Effect.void,
+              handleCreateTerminal: (handler) =>
+                Effect.sync(() => {
+                  createTerminalHandler = handler;
+                }),
+              handleTerminalOutput: () => Effect.void,
+              handleTerminalWaitForExit: () => Effect.void,
+              handleTerminalKill: () => Effect.void,
+              handleTerminalRelease: () => Effect.void,
+              handleSessionUpdate: () => Effect.void,
+              handleElicitationComplete: () => Effect.void,
+              handleUnknownExtRequest: () => Effect.void,
+              handleUnknownExtNotification: () => Effect.void,
+              handleExtRequest: () => Effect.void,
+              handleExtNotification: () => Effect.void,
+              initialize: () =>
+                Effect.succeed({
+                  protocolVersion: 1,
+                  agentCapabilities: {},
+                  authMethods: [],
+                }),
+              start: () =>
+                Effect.succeed({
+                  sessionId,
+                  initializeResult: {
+                    protocolVersion: 1,
+                    agentCapabilities: {},
+                    authMethods: [],
+                  },
+                  sessionSetupResult: { sessionId },
+                  modelConfigId: undefined,
+                }),
+              getEvents: () => Stream.empty,
+              drainEvents: Effect.void,
+              getModeState: Effect.undefined,
+              getConfigOptions: Effect.succeed([]),
+              configOptionChanges: Stream.empty,
+              loadSession: () => Effect.die("unused"),
+              resumeSession: () => Effect.die("unused"),
+              forkSession: () => Effect.die("unused"),
+              listSessions: () => Effect.succeed({ sessions: [] }),
+              closeSession: () => Effect.succeed({}),
+              deleteSession: () => Effect.succeed({}),
+              listProviders: Effect.succeed({ providers: [] }),
+              setProvider: () => Effect.succeed({}),
+              disableProvider: () => Effect.succeed({}),
+              logout: Effect.succeed({}),
+              prompt: (_payload, options) =>
+                Deferred.succeed(promptStarted, undefined).pipe(
+                  Effect.andThen(
+                    options?.dispatched === undefined
+                      ? Effect.void
+                      : Deferred.succeed(options.dispatched, undefined),
+                  ),
+                  Effect.andThen(Deferred.await(promptGate)),
+                ),
+              cancel: Deferred.succeed(promptGate, { stopReason: "cancelled" }).pipe(Effect.asVoid),
+              setMode: () => Effect.succeed({}),
+              setSessionModel: () => Effect.succeed({}),
+              setConfigOption: () => Effect.succeed({ configOptions: [] }),
+              setModel: () => Effect.void,
+              request: () => Effect.succeed({}),
+              notify: () => Effect.void,
+            };
+
+            const adapter = yield* makeAcpRegistryAdapterV2({
+              selfInvocation: yield* resolveSelfInvocation(),
+              instanceId,
+              settings: yield* decodeAcpRegistryAdapterSettings({ agentId: "devin" }),
+              environment: {},
+              makeRuntime: () => Effect.succeed(fakeRuntime),
+            }).pipe(
+              Effect.provide(layerInjectedRuntimeCatalog),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, tappedSpawner),
+              Effect.provideService(AgentScope, agentScopeSpy),
+            );
+
+            const session = yield* adapter.openSession({
+              threadId,
+              providerSessionId: ProviderSessionId.make(`provider-session-devin-${label}`),
+              modelSelection,
+              runtimePolicy,
+            });
+            const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+            yield* session.events.pipe(
+              Stream.runForEach((event) => Queue.offer(events, event)),
+              Effect.forkScoped,
+            );
+            const providerThread = yield* session.ensureThread({
+              threadId,
+              modelSelection,
+              runtimePolicy,
+            });
+            const turnInput = makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy,
+              now,
+              ordinal: 1,
+              modelSelection,
+            });
+            const turnFiber = yield* session.startTurn(turnInput).pipe(Effect.forkScoped);
+            yield* Deferred.await(promptStarted);
+
+            let activeProviderTurnId:
+              | Extract<
+                  ProviderAdapter.ProviderAdapterV2Event,
+                  { readonly type: "provider_turn.updated" }
+                >["providerTurn"]["id"]
+              | undefined;
+            while (activeProviderTurnId === undefined) {
+              const event = yield* Queue.take(events);
+              if (event.type === "provider_turn.updated") {
+                activeProviderTurnId = event.providerTurn.id;
+              }
+            }
+
+            const spawnSetsidTerminal = Effect.gen(function* () {
+              stdout = "";
+              pidsReady = yield* Deferred.make<{
+                readonly leaderPid: number;
+                readonly childPid: number;
+              }>();
+              yield* createTerminalHandler!(
+                { sessionId, command: SETSID_DEVIN_COMMAND },
+                { requestId: `req-devin-term-${nextUnit}`, method: "terminal/create" },
+              );
+              return yield* Deferred.await(pidsReady);
+            });
+
+            return {
+              session,
+              threadId,
+              providerThread,
+              providerTurnId: activeProviderTurnId,
+              turnFiber,
+              promptGate,
+              agentScopeSpy,
+              wrapCalls,
+              terminatedUnits,
+              killedThreads,
+              spawnSetsidTerminal,
+            };
+          });
+
+          yield* Effect.gen(function* () {
+            // 1) Stop (interruptTurn with requestRuntimeRestart: true) kills leader + setsid child
+            //    and calls terminateUnit for the auxiliary AgentScope unit.
+            yield* Effect.gen(function* () {
+              const harness = yield* openDevinHarness("stop");
+              const pids = yield* harness.spawnSetsidTerminal;
+              assert.isTrue(isPosixProcessAlive(pids.leaderPid, platform));
+              assert.isTrue(isPosixProcessAlive(pids.childPid, platform));
+              assert.equal(harness.wrapCalls.length, 1);
+              assert.equal(harness.wrapCalls[0]!.command, "/bin/sh");
+              assert.equal(harness.wrapCalls[0]!.name, "acp-terminal");
+              assert.equal(harness.wrapCalls[0]!.threadId, harness.threadId);
+              assert.equal(harness.wrapCalls[0]!.auxiliary, true);
+
+              yield* harness.session.interruptTurn({
+                providerThread: harness.providerThread,
+                providerTurnId: harness.providerTurnId,
+                requestRuntimeRestart: true,
+              });
+              yield* Fiber.join(harness.turnFiber).pipe(Effect.ignore);
+
+              assert.isFalse(isPosixProcessAlive(pids.leaderPid, platform));
+              assert.isFalse(isPosixProcessAlive(pids.childPid, platform));
+              assert.deepEqual(harness.terminatedUnits, [harness.wrapCalls[0]!.unit]);
+            }).pipe(Effect.scoped);
+
+            // 2) Force Stop (agentScope.kill(threadId)) targets the auxiliary terminal scope.
+            yield* Effect.gen(function* () {
+              const harness = yield* openDevinHarness("force-stop");
+              const pids = yield* harness.spawnSetsidTerminal;
+              assert.isTrue(isPosixProcessAlive(pids.leaderPid, platform));
+              assert.isTrue(isPosixProcessAlive(pids.childPid, platform));
+
+              const killed = yield* harness.agentScopeSpy.kill(harness.threadId);
+              assert.isTrue(killed);
+              assert.deepEqual(harness.killedThreads, [
+                { threadId: harness.threadId, units: [harness.wrapCalls[0]!.unit] },
+              ]);
+              yield* Effect.promise(() =>
+                expect.poll(() => isPosixProcessAlive(pids.leaderPid, platform)).toBe(false),
+              );
+              yield* Effect.promise(() =>
+                expect.poll(() => isPosixProcessAlive(pids.childPid, platform)).toBe(false),
+              );
+
+              yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" }).pipe(
+                Effect.ignore,
+              );
+              yield* Fiber.join(harness.turnFiber).pipe(Effect.ignore);
+            }).pipe(Effect.scoped);
+
+            // 3) Session scope close kills leader + setsid child and calls terminateUnit.
+            let closePids: { readonly leaderPid: number; readonly childPid: number } | undefined;
+            let closeTerminatedUnits: ReadonlyArray<string> = [];
+            let closeExpectedUnit = "";
+            yield* Effect.gen(function* () {
+              const harness = yield* openDevinHarness("session-close");
+              closePids = yield* harness.spawnSetsidTerminal;
+              closeTerminatedUnits = harness.terminatedUnits;
+              closeExpectedUnit = harness.wrapCalls[0]!.unit;
+              assert.isTrue(isPosixProcessAlive(closePids.leaderPid, platform));
+              assert.isTrue(isPosixProcessAlive(closePids.childPid, platform));
+            }).pipe(Effect.scoped);
+
+            assert.isFalse(isPosixProcessAlive(closePids!.leaderPid, platform));
+            assert.isFalse(isPosixProcessAlive(closePids!.childPid, platform));
+            assert.deepEqual(closeTerminatedUnits, [closeExpectedUnit]);
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                for (const pid of trackedPids) {
+                  forceKillPid(pid);
+                }
+              }),
+            ),
+          );
+        }).pipe(Effect.scoped, Effect.provide(layerTest)),
     );
   });
 });
