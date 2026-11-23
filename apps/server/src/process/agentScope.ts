@@ -4,15 +4,19 @@ import * as NodeOS from "node:os";
 
 import {
   AgentScope,
+  AgentScopeTerminationError,
   agentScopeCommand,
   type AgentScopeShape,
   type AgentSystemdScope,
 } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveCommandPath } from "@t3tools/shared/shell";
+import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Semaphore from "effect/Semaphore";
 
@@ -95,9 +99,14 @@ function parseCgroupCounter(text: string, key: string): number | undefined {
 const SCOPE_OPTIONS = ["--property=TimeoutStopSec=10s", "--property=Delegate=yes"];
 const STOPPING_POLL_INTERVAL = "100 millis";
 const STOPPING_POLL_ATTEMPTS = 20;
+const TERMINATE_POLL_INTERVAL_MS = 20;
+const TERMINATE_POLL_ATTEMPTS = 100;
+const TERMINATE_UNIT_DEADLINE_MS = 5_000;
+const TERMINATE_UNIT_STEP_TIMEOUT_MS = 2_000;
 const CLEAR_FAILED_INTERVAL = "1 second";
 const CLEAR_FAILED_ATTEMPTS = 120;
 const MAX_TRACKED_THREADS = 500;
+const wallClock = Clock.Clock.defaultValue();
 
 export const make = Effect.gen(function* () {
   const platform = yield* HostProcess.Platform;
@@ -375,6 +384,97 @@ export const make = Effect.gen(function* () {
     }
   });
 
+  const terminateUnit: AgentScopeShape["terminateUnit"] = Effect.fn("AgentScope.terminateUnit")(
+    function* (unit: string, options?: { readonly preserveOomDiagnosis?: boolean | undefined }) {
+      if (!unit.startsWith("t3code-") || !unit.endsWith(".scope")) return;
+      const scope = yield* systemd;
+      if (scope === undefined) return;
+      const deadlineMs = (yield* Clock.currentTimeMillis) + TERMINATE_UNIT_DEADLINE_MS;
+      const remainingMs = Effect.map(Clock.currentTimeMillis, (now) => deadlineMs - now);
+      const runBounded = Effect.fn("agentScope.terminateUnit.runBounded")(function* (
+        args: ReadonlyArray<string>,
+      ) {
+        const remaining = yield* remainingMs;
+        if (remaining <= 0) return Option.none();
+        return yield* runner
+          .run({
+            command: scope.systemctl,
+            args,
+            timeout: Duration.millis(
+              Math.max(1, Math.min(TERMINATE_UNIT_STEP_TIMEOUT_MS, remaining)),
+            ),
+          })
+          .pipe(Effect.option);
+      });
+      for (let attempt = 0; attempt < TERMINATE_POLL_ATTEMPTS; attempt += 1) {
+        if ((yield* remainingMs) <= 0) break;
+        const shown = yield* runBounded([
+          "--user",
+          "show",
+          unit,
+          "--property=LoadState,ActiveState,Result,ControlGroup",
+        ]);
+        if (shown._tag === "None" || shown.value.code !== 0) {
+          return yield* new AgentScopeTerminationError({
+            unit,
+            detail: `Failed to inspect ACP scope ${unit}`,
+          });
+        }
+        const values = parseKeyValues(shown.value.stdout);
+        const loadState = values.get("LoadState") ?? "";
+        const activeState = values.get("ActiveState") ?? "";
+        if (loadState !== "loaded" || activeState === "inactive" || activeState === "failed") {
+          return;
+        }
+        const result = values.get("Result") ?? "";
+        const controlGroup = values.get("ControlGroup") ?? "";
+        const events = controlGroup ? yield* readCgroupFile(controlGroup, "cgroup.events") : "";
+        if (parseCgroupCounter(events, "populated") === 0) {
+          return;
+        }
+        if (
+          options?.preserveOomDiagnosis === true &&
+          scope.supportsOomPolicy &&
+          result !== "oom-kill"
+        ) {
+          const memoryEvents = controlGroup
+            ? yield* readCgroupFile(controlGroup, "memory.events")
+            : "";
+          const oomKills = parseCgroupCounter(memoryEvents, "oom_kill");
+          if (oomKills !== undefined && oomKills > 0) {
+            const remaining = yield* remainingMs;
+            if (remaining <= 0) break;
+            yield* Effect.sleep(Duration.millis(Math.min(TERMINATE_POLL_INTERVAL_MS, remaining)));
+            continue;
+          }
+        }
+        const killedByCgroup =
+          controlGroup.length > 0 &&
+          (yield* fileSystem
+            .writeFileString(path.join("/sys/fs/cgroup", controlGroup, "cgroup.kill"), "1\n")
+            .pipe(
+              Effect.as(true),
+              Effect.orElseSucceed(() => false),
+            ));
+        if (!killedByCgroup) {
+          yield* runBounded(["--user", "kill", "--signal=SIGKILL", unit]);
+          // Never issue manual `systemctl stop` if systemd already recorded `Result=oom-kill`.
+          if (!(options?.preserveOomDiagnosis === true && result === "oom-kill")) {
+            yield* runBounded(["--user", "stop", unit]);
+          }
+        }
+        const remaining = yield* remainingMs;
+        if (remaining <= 0) break;
+        yield* Effect.sleep(Duration.millis(Math.min(TERMINATE_POLL_INTERVAL_MS, remaining)));
+      }
+      return yield* new AgentScopeTerminationError({
+        unit,
+        detail: `ACP scope ${unit} remained populated after forced termination`,
+      });
+    },
+    Effect.provideService(Clock.Clock, wallClock),
+  );
+
   const kill: AgentScopeShape["kill"] = Effect.fn("AgentScope.kill")(function* (threadId) {
     const tracked = scopeByThread.get(threadId);
     if (tracked === undefined || tracked.shared) return false;
@@ -456,6 +556,7 @@ export const make = Effect.gen(function* () {
     }),
     oomKilled,
     stop,
+    terminateUnit,
     kill,
     clear,
   } satisfies AgentScopeShape;

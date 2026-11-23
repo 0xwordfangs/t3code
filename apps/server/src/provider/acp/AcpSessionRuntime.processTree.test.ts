@@ -1225,4 +1225,288 @@ describe("terminatePosixOwnedProcessTree", () => {
       });
     }
   });
+
+  it.live(
+    "uses async snapshots with zero sync ps reads and skips zombies across large Darwin trees (R3-CF-10)",
+    () =>
+      Effect.gen(function* () {
+        const currentPid = process.pid;
+        for (const childCount of [20, 50]) {
+          for (const mode of ["cooperative-zombie", "ignore-term"] as const) {
+            const rootPid = currentPid + 20_000;
+            const liveRows = new Map<
+              number,
+              { pid: number; ppid: number; pgid: number; sid: number; state: string; start: string }
+            >([
+              [
+                currentPid,
+                {
+                  pid: currentPid,
+                  ppid: 1,
+                  pgid: currentPid,
+                  sid: 0,
+                  state: "S+",
+                  start: "Mon Nov 23 10:50:00 2026",
+                },
+              ],
+              [
+                rootPid,
+                {
+                  pid: rootPid,
+                  ppid: currentPid,
+                  pgid: rootPid,
+                  sid: 0,
+                  state: "SN",
+                  start: "Mon Nov 23 10:50:01 2026",
+                },
+              ],
+            ]);
+            for (let i = 1; i <= childCount; i += 1) {
+              const pid = rootPid + i;
+              liveRows.set(pid, {
+                pid,
+                ppid: rootPid,
+                pgid: pid,
+                sid: 0,
+                state: "S",
+                start: "Mon Nov 23 10:50:02 2026",
+              });
+            }
+            const formatTable = () =>
+              [...liveRows.values()]
+                .map((r) => `${r.pid} ${r.ppid} ${r.pgid} ${r.sid} ${r.state} ${r.start}`)
+                .join("\n");
+            let syncReads = 0;
+            let asyncReads = 0;
+            const signals: Array<string> = [];
+            const controller = AcpSessionRuntime.makeDarwinProcessTreeController({
+              readPsTable: () => {
+                syncReads += 1;
+                return formatTable();
+              },
+              readPsTableAsync: () =>
+                Effect.sync(() => {
+                  asyncReads += 1;
+                  return formatTable();
+                }),
+              signalProcess: (pid, signal) => {
+                signals.push(`${pid}:${signal}`);
+                const row = liveRows.get(pid);
+                if (row === undefined) return;
+                if (mode === "cooperative-zombie") {
+                  if (pid === rootPid) {
+                    liveRows.delete(rootPid);
+                    for (const [id, entry] of liveRows.entries()) {
+                      if (entry.state.startsWith("Z")) liveRows.delete(id);
+                    }
+                  } else {
+                    liveRows.set(pid, { ...row, state: "Z+" });
+                  }
+                } else if (signal === "SIGKILL") {
+                  liveRows.delete(pid);
+                }
+              },
+            });
+
+            yield* AcpSessionRuntime.terminatePosixOwnedProcessTree({
+              controller,
+              grace: 0,
+              rootPid,
+            });
+
+            expect(syncReads).toBe(0);
+            expect(asyncReads).toBeLessThanOrEqual(10);
+            expect(liveRows.has(rootPid)).toBe(false);
+            for (let i = 1; i <= childCount; i += 1) {
+              expect(liveRows.has(rootPid + i)).toBe(false);
+            }
+            if (mode === "cooperative-zombie") {
+              // Each cooperative child becomes Z+ on pass 1 and must not be re-signaled on passes 2-5.
+              for (let i = 1; i <= childCount; i += 1) {
+                const pidSignals = signals.filter((entry) => entry.startsWith(`${rootPid + i}:`));
+                expect(pidSignals).toEqual([`${rootPid + i}:SIGTERM`]);
+              }
+            }
+          }
+        }
+      }),
+  );
+
+  it.live("wraps final snapshot failures as typed AcpProcessGroupTerminationError (R3-CF-10)", () =>
+    Effect.gen(function* () {
+      const fixture = makeController({
+        processes: [server(), identity(100, process.pid, 100, 100)],
+      });
+      let snapshotCalls = 0;
+      const controller: AcpSessionRuntime.AcpPosixProcessTreeController = {
+        ...fixture.controller,
+        snapshot: () => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 6) {
+            throw new Error("final snapshot boom");
+          }
+          return fixture.controller.snapshot();
+        },
+      };
+
+      const error = yield* Effect.flip(
+        AcpSessionRuntime.terminatePosixOwnedProcessTree({
+          controller,
+          discoveryPasses: 2,
+          grace: 0,
+          rootPid: 100,
+        }),
+      );
+
+      expect(error).toBeInstanceOf(AcpSessionRuntime.AcpProcessGroupTerminationError);
+      expect(error.detail).toContain("Failed to snapshot ACP process tree 100");
+    }),
+  );
+
+  it.live(
+    "admits and terminates same-PGID reparented orphans on Darwin with masked sess=0 while protecting current group/session (R3-CF-12)",
+    () =>
+      Effect.gen(function* () {
+        const currentPid = process.pid;
+        const rootPid = currentPid + 30_000;
+        const plainOrphanPid = rootPid + 1;
+        const trapTermOrphanPid = rootPid + 2;
+        const orphanGrandchildPid = rootPid + 3;
+        const sameCurrentPgidPid = rootPid + 4;
+        const liveRows = new Map<number, string>([
+          [1, "1 0 1 0 S Mon Nov 23 10:50:00 2026"],
+          [currentPid, `${currentPid} 1 ${currentPid} 0 S+ Mon Nov 23 10:50:00 2026`],
+          [rootPid, `${rootPid} ${currentPid} ${rootPid} 0 SN Mon Nov 23 10:50:01 2026`],
+          // Reparented to PID 1, still in rootPid's detached PGID, with masked sess=0.
+          [plainOrphanPid, `${plainOrphanPid} 1 ${rootPid} 0 S Mon Nov 23 10:50:02 2026`],
+          [trapTermOrphanPid, `${trapTermOrphanPid} 1 ${rootPid} 0 S Mon Nov 23 10:50:03 2026`],
+          // Detached grandchild spawned by the reparented orphan.
+          [
+            orphanGrandchildPid,
+            `${orphanGrandchildPid} ${trapTermOrphanPid} ${orphanGrandchildPid} 0 S Mon Nov 23 10:50:04 2026`,
+          ],
+          // Unrelated process sharing current T3 PGID must never be admitted or signaled.
+          [
+            sameCurrentPgidPid,
+            `${sameCurrentPgidPid} 1 ${currentPid} 0 S Mon Nov 23 10:50:05 2026`,
+          ],
+        ]);
+        let syncReads = 0;
+        let asyncReads = 0;
+        const signals: Array<string> = [];
+        const controller = AcpSessionRuntime.makeDarwinProcessTreeController({
+          readPsTable: () => {
+            syncReads += 1;
+            return [...liveRows.values()].join("\n");
+          },
+          readPsTableAsync: () =>
+            Effect.sync(() => {
+              asyncReads += 1;
+              return [...liveRows.values()].join("\n");
+            }),
+          signalProcess: (pid, signal) => {
+            signals.push(`${pid}:${signal}`);
+            if (pid === trapTermOrphanPid && signal === "SIGTERM") return;
+            liveRows.delete(pid);
+          },
+        });
+
+        // Continuous observer with cached Darwin snapshot discovers reparented orphans without sync ps.
+        const frontier = new Map<number, AcpSessionRuntime.AcpOwnedPosixProcess>();
+        const childQueues = new Map<number, Array<number>>();
+        const ledger = new Map<string, AcpSessionRuntime.AcpOwnedPosixProcess>();
+        const root: AcpSessionRuntime.AcpPosixOwnershipRoot = { value: undefined };
+        yield* controller.refreshAsync!();
+        AcpSessionRuntime.observePosixOwnershipLedger({
+          childQueues,
+          controller,
+          frontier,
+          ledger,
+          root,
+          rootPid,
+        });
+        expect([...ledger.values()].map((entry) => entry.pid)).toContain(plainOrphanPid);
+        expect([...ledger.values()].map((entry) => entry.pid)).toContain(trapTermOrphanPid);
+        expect([...ledger.values()].map((entry) => entry.pid)).toContain(orphanGrandchildPid);
+        expect([...ledger.values()].map((entry) => entry.pid)).not.toContain(1);
+        expect([...ledger.values()].map((entry) => entry.pid)).not.toContain(currentPid);
+        expect([...ledger.values()].map((entry) => entry.pid)).not.toContain(sameCurrentPgidPid);
+        expect(syncReads).toBe(0);
+
+        yield* AcpSessionRuntime.terminatePosixOwnedProcessTree({
+          controller,
+          grace: 0,
+          ledger,
+          root,
+          rootPid,
+        });
+
+        expect(syncReads).toBe(0);
+        expect(asyncReads).toBeLessThanOrEqual(11);
+        expect(signals).toContain(`${plainOrphanPid}:SIGTERM`);
+        expect(signals).toContain(`${trapTermOrphanPid}:SIGTERM`);
+        expect(signals).toContain(`${trapTermOrphanPid}:SIGKILL`);
+        expect(signals).toContain(`${orphanGrandchildPid}:SIGTERM`);
+        expect(signals.some((entry) => entry.startsWith("1:"))).toBe(false);
+        expect(signals.some((entry) => entry.startsWith(`${currentPid}:`))).toBe(false);
+        expect(signals.some((entry) => entry.startsWith(`${sameCurrentPgidPid}:`))).toBe(false);
+        expect(liveRows.has(plainOrphanPid)).toBe(false);
+        expect(liveRows.has(trapTermOrphanPid)).toBe(false);
+        expect(liveRows.has(orphanGrandchildPid)).toBe(false);
+        expect(liveRows.has(sameCurrentPgidPid)).toBe(true);
+      }),
+  );
+
+  it("admits same-PGID orphans after root exit unless root PID was reused and guards current SID (R3-CF-12)", () => {
+    const rootIdentity = identity(40_100, process.pid, 40_100, 40_100, "root-orig");
+    const orphan = identity(40_101, 1, 40_100, 40_100, "orphan");
+    const sameCurrentSid = identity(40_102, 1, 40_100, process.pid, "current-sid");
+
+    // Root exited (not in table), PID not reused -> orphan admitted, current-SID entry rejected.
+    const ledgerAfterExit = new Map<string, AcpSessionRuntime.AcpOwnedPosixProcess>();
+    const rootAfterExit: AcpSessionRuntime.AcpPosixOwnershipRoot = {
+      captureAttempted: true,
+      value: {
+        ...rootIdentity,
+        parentExecutable: server().executable,
+        parentStartTime: server().startTime,
+      },
+    };
+    const fixtureAfterExit = makeController({
+      processes: [server(), orphan, sameCurrentSid],
+    });
+    AcpSessionRuntime.capturePosixOwnershipLedger({
+      controller: fixtureAfterExit.controller,
+      ledger: ledgerAfterExit,
+      root: rootAfterExit,
+      rootPid: rootIdentity.pid,
+    });
+    expect([...ledgerAfterExit.values()].map((entry) => entry.pid)).toContain(orphan.pid);
+    expect([...ledgerAfterExit.values()].map((entry) => entry.pid)).not.toContain(
+      sameCurrentSid.pid,
+    );
+
+    // Root PID reused with a different startTime -> same-PGID entries must NOT be admitted.
+    const reusedRoot = identity(40_100, 1, 40_100, 40_100, "root-reused");
+    const unrelatedChild = identity(40_103, 1, 40_100, 40_100, "unrelated-reused-pgid");
+    const ledgerReused = new Map<string, AcpSessionRuntime.AcpOwnedPosixProcess>();
+    const rootReused: AcpSessionRuntime.AcpPosixOwnershipRoot = {
+      captureAttempted: true,
+      value: {
+        ...rootIdentity,
+        parentExecutable: server().executable,
+        parentStartTime: server().startTime,
+      },
+    };
+    const fixtureReused = makeController({
+      processes: [server(), reusedRoot, unrelatedChild],
+    });
+    AcpSessionRuntime.capturePosixOwnershipLedger({
+      controller: fixtureReused.controller,
+      ledger: ledgerReused,
+      root: rootReused,
+      rootPid: rootIdentity.pid,
+    });
+    expect([...ledgerReused.values()].map((entry) => entry.pid)).not.toContain(unrelatedChild.pid);
+  });
 });

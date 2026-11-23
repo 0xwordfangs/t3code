@@ -5,8 +5,9 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
-import { AgentScope } from "@t3tools/shared/AgentScope";
+import { AgentScope, AgentScopeTerminationError } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -57,6 +58,10 @@ const withFakeSystemd = <A, E>(
     readonly scope: Effect.Success<typeof make>;
     readonly units: Map<string, FakeUnit>;
     readonly calls: ReadonlyArray<ReadonlyArray<string>>;
+    readonly callTimeouts: ReadonlyArray<{
+      readonly args: ReadonlyArray<string>;
+      readonly timeoutMs: number | undefined;
+    }>;
     readonly failingVerbs: Set<string>;
     readonly stateDir: string;
     readonly cgroupRoot: string;
@@ -67,11 +72,29 @@ const withFakeSystemd = <A, E>(
     stopFails = false,
     leftovers = false,
     liveOwner = false,
+    failCgroupKill = false,
+    onWriteCgroupKill,
+    onStopOrKill,
+    onShow,
   }: {
     readonly oomPolicy?: boolean;
     readonly stopFails?: boolean;
     readonly leftovers?: boolean;
     readonly liveOwner?: boolean;
+    readonly failCgroupKill?: boolean;
+    readonly onWriteCgroupKill?: (
+      path: string,
+      data: string,
+      units: Map<string, FakeUnit>,
+      cgroupRoot: string,
+    ) => void;
+    readonly onStopOrKill?: (
+      verb: string,
+      unit: string,
+      units: Map<string, FakeUnit>,
+      cgroupRoot: string,
+    ) => void;
+    readonly onShow?: (unit: string, units: Map<string, FakeUnit>, cgroupRoot: string) => void;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -82,6 +105,10 @@ const withFakeSystemd = <A, E>(
     const cgroupRoot = NodePath.join(bin, "cgroup");
     const units = new Map<string, FakeUnit>();
     const calls: Array<ReadonlyArray<string>> = [];
+    const callTimeouts: Array<{
+      readonly args: ReadonlyArray<string>;
+      readonly timeoutMs: number | undefined;
+    }> = [];
     const failingVerbs = new Set<string>();
     const output = (stdout: string, code = 0): ProcessRunner.ProcessRunOutput => ({
       stdout,
@@ -94,9 +121,16 @@ const withFakeSystemd = <A, E>(
       stderrInvalidUtf8: false,
     });
     const runner = ProcessRunner.ProcessRunner.of({
-      run: ({ args }) =>
+      run: ({ args, timeout }) =>
         Effect.sync(() => {
           calls.push(args);
+          callTimeouts.push({
+            args,
+            timeoutMs:
+              timeout === undefined
+                ? undefined
+                : Duration.toMillis(Duration.fromInputUnsafe(timeout)),
+          });
           if (!oomPolicy && args.some((arg) => arg.startsWith("--property=OOMPolicy="))) {
             return output("", 1);
           }
@@ -110,7 +144,11 @@ const withFakeSystemd = <A, E>(
             };
           }
           if (verb === "reset-failed") units.delete(unit);
+          if (verb === "kill" || verb === "stop") {
+            onStopOrKill?.(verb, args.at(-1) ?? "", units, cgroupRoot);
+          }
           if (verb !== "show") return output("");
+          onShow?.(unit, units, cgroupRoot);
           const state = units.get(unit);
           return output(
             state === undefined
@@ -134,11 +172,37 @@ const withFakeSystemd = <A, E>(
         ...fileSystem,
         readFileString: (path, encoding) =>
           fileSystem.readFileString(path.replace("/sys/fs/cgroup", cgroupRoot), encoding),
-        writeFileString: (path, data, options) =>
-          fileSystem.writeFileString(path.replace("/sys/fs/cgroup", cgroupRoot), data, options),
+        writeFileString: (path, data, options) => {
+          if (failCgroupKill && path.endsWith("/cgroup.kill")) {
+            return fileSystem.writeFileString(
+              NodePath.join(cgroupRoot, "nonexistent-dir", "cgroup.kill"),
+              data,
+              options,
+            );
+          }
+          return fileSystem
+            .writeFileString(path.replace("/sys/fs/cgroup", cgroupRoot), data, options)
+            .pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (path.endsWith("/cgroup.kill")) {
+                    onWriteCgroupKill?.(path, data, units, cgroupRoot);
+                  }
+                }),
+              ),
+            );
+        },
       }),
     );
-    return yield* body({ scope, units, calls, failingVerbs, stateDir, cgroupRoot }).pipe(
+    return yield* body({
+      scope,
+      units,
+      calls,
+      callTimeouts,
+      failingVerbs,
+      stateDir,
+      cgroupRoot,
+    }).pipe(
       Effect.ensuring(Effect.sync(() => NodeFS.rmSync(bin, { recursive: true, force: true }))),
     );
   }).pipe(
@@ -477,5 +541,195 @@ describe("AgentScope service", () => {
         expect(calls.filter(([, verb]) => verb === "stop")).toEqual([]);
       }),
     ),
+  );
+
+  it.effect(
+    "terminateUnit kills via cgroup.kill regardless of OOM-diagnosis state and ignores non-t3code units",
+    () =>
+      withFakeSystemd(
+        ({ scope, units, calls, cgroupRoot }) =>
+          Effect.gen(function* () {
+            yield* scope.terminateUnit("session-2.scope");
+            expect(calls.some((args) => args.includes("session-2.scope"))).toBe(false);
+
+            const agent = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "acp",
+              threadId: "a",
+            });
+            const unit = unitOf(agent);
+
+            // Already unloaded or empty scope returns cleanly without writing cgroup.kill.
+            yield* scope.terminateUnit(unit);
+            exitedAgent(units, cgroupRoot, unit, { populated: false, oomKills: 0 });
+            yield* scope.terminateUnit(unit);
+            expect(NodeFS.existsSync(NodePath.join(cgroupRoot, unit, "cgroup.kill"))).toBe(false);
+
+            // Bypass OOM-policy skip when memory.events is absent (oomKills: undefined).
+            exitedAgent(units, cgroupRoot, unit, { populated: true, oomKills: undefined });
+            yield* scope.terminateUnit(unit);
+            expect(
+              NodeFS.readFileSync(NodePath.join(cgroupRoot, unit, "cgroup.kill"), "utf8"),
+            ).toBe("1\n");
+
+            // Bypass OOM-policy skip when oom_kill > 0.
+            NodeFS.rmSync(NodePath.join(cgroupRoot, unit, "cgroup.kill"));
+            exitedAgent(units, cgroupRoot, unit, { populated: true, oomKills: 1 });
+            yield* scope.terminateUnit(unit);
+            expect(
+              NodeFS.readFileSync(NodePath.join(cgroupRoot, unit, "cgroup.kill"), "utf8"),
+            ).toBe("1\n");
+            expect(calls.filter(([, verb]) => verb === "kill" || verb === "stop")).toEqual([]);
+          }),
+        {
+          oomPolicy: true,
+          onWriteCgroupKill: (writePath, _data, _units, cgroupRoot) => {
+            const eventsPath = NodePath.join(
+              NodePath.dirname(writePath.replace("/sys/fs/cgroup", cgroupRoot)),
+              "cgroup.events",
+            );
+            NodeFS.writeFileSync(eventsPath, "populated 0\nfrozen 0\n");
+          },
+        },
+      ),
+  );
+
+  it.effect(
+    "terminateUnit falls back to blocking systemctl kill and stop when cgroup.kill is unavailable",
+    () =>
+      withFakeSystemd(
+        ({ scope, units, calls, cgroupRoot }) =>
+          Effect.gen(function* () {
+            const agent = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "acp",
+              threadId: "a",
+            });
+            const unit = unitOf(agent);
+            exitedAgent(units, cgroupRoot, unit, { populated: true, oomKills: 1 });
+
+            yield* scope.terminateUnit(unit);
+
+            expect(calls.filter(([, verb]) => verb === "kill")).toEqual([
+              ["--user", "kill", "--signal=SIGKILL", unit],
+            ]);
+            expect(calls.filter(([, verb]) => verb === "stop")).toEqual([["--user", "stop", unit]]);
+          }),
+        {
+          oomPolicy: true,
+          failCgroupKill: true,
+          onStopOrKill: (verb, unit, units) => {
+            if (verb === "stop") {
+              const entry = units.get(unit);
+              if (entry !== undefined) entry.activeState = "inactive";
+            }
+          },
+        },
+      ),
+  );
+
+  it.effect("terminateUnit fails closed when systemctl show fails or scope remains populated", () =>
+    withFakeSystemd(({ scope, units, failingVerbs, cgroupRoot }) =>
+      Effect.gen(function* () {
+        const agent = yield* scope.wrap({
+          command: "agent",
+          args: [],
+          name: "acp",
+          threadId: "a",
+        });
+        const unit = unitOf(agent);
+        exitedAgent(units, cgroupRoot, unit, { populated: true, oomKills: 0 });
+
+        failingVerbs.add("show");
+        const showError = yield* Effect.flip(scope.terminateUnit(unit));
+        expect(showError).toBeInstanceOf(Error);
+        expect(showError).toBeInstanceOf(AgentScopeTerminationError);
+        expect(showError.message).toContain(`Failed to inspect ACP scope ${unit}`);
+
+        failingVerbs.delete("show");
+        // cgroup.kill writes to disk but nothing clears populated 1 -> must fail closed.
+        const populatedError = yield* Effect.flip(scope.terminateUnit(unit));
+        expect(populatedError).toBeInstanceOf(Error);
+        expect(populatedError).toBeInstanceOf(AgentScopeTerminationError);
+        expect(populatedError.message).toContain(
+          `ACP scope ${unit} remained populated after forced termination`,
+        );
+      }),
+    ),
+  );
+
+  it.effect(
+    "terminateUnit bounds per-step systemctl timeouts within the overall wall-clock budget and preserves OOM diagnosis on unplanned exit",
+    () => {
+      let oomShowCount = 0;
+      return withFakeSystemd(
+        ({ scope, units, calls, callTimeouts, cgroupRoot }) =>
+          Effect.gen(function* () {
+            const oomAgent = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "acp",
+              threadId: "oom-thread",
+            });
+            const oomUnit = unitOf(oomAgent);
+            exitedAgent(units, cgroupRoot, oomUnit, { populated: true, oomKills: 1 });
+
+            // Unplanned exit with oom_kill > 0 waits for systemd to record Result=oom-kill
+            // without issuing cgroup.kill or manual systemctl stop.
+            yield* scope.terminateUnit(oomUnit, { preserveOomDiagnosis: true });
+            expect(NodeFS.existsSync(NodePath.join(cgroupRoot, oomUnit, "cgroup.kill"))).toBe(
+              false,
+            );
+            expect(calls.filter((args) => args.includes(oomUnit) && args[1] === "stop")).toEqual(
+              [],
+            );
+            expect(yield* scope.oomKilled("oom-thread")).toBe(true);
+
+            // Unplanned self-exit with oom_kill === 0 still terminates lingering orphans via fallback
+            // with bounded per-step timeouts (<= 2000 ms, never 15 s).
+            const selfExitAgent = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "acp",
+              threadId: "self-exit-thread",
+            });
+            const selfExitUnit = unitOf(selfExitAgent);
+            exitedAgent(units, cgroupRoot, selfExitUnit, { populated: true, oomKills: 0 });
+            yield* scope.terminateUnit(selfExitUnit, { preserveOomDiagnosis: true });
+
+            const selfExitTimeouts = callTimeouts.filter((entry) =>
+              entry.args.includes(selfExitUnit),
+            );
+            expect(selfExitTimeouts.length).toBeGreaterThan(0);
+            for (const entry of selfExitTimeouts) {
+              expect(entry.timeoutMs).toBeDefined();
+              expect(entry.timeoutMs!).toBeLessThanOrEqual(2_000);
+            }
+          }),
+        {
+          oomPolicy: true,
+          failCgroupKill: true,
+          onShow: (unit, units) => {
+            const entry = units.get(unit);
+            if (entry === undefined || entry.result === "oom-kill") return;
+            if (unit.startsWith("t3code-acp-") && oomShowCount < 2) {
+              oomShowCount += 1;
+              if (oomShowCount === 2) {
+                entry.result = "oom-kill";
+                entry.activeState = "failed";
+              }
+            }
+          },
+          onStopOrKill: (verb, unit, units) => {
+            if (verb === "stop") {
+              const entry = units.get(unit);
+              if (entry !== undefined) entry.activeState = "inactive";
+            }
+          },
+        },
+      );
+    },
   );
 });

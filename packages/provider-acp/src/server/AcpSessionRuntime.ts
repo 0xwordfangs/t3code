@@ -200,6 +200,11 @@ export interface AcpPosixProcessTreeController {
   readonly childrenOf: (pid: number) => ReadonlyArray<AcpPosixProcessIdentity>;
   readonly identity: (pid: number) => AcpPosixProcessIdentity | undefined;
   readonly snapshot: () => ReadonlyArray<AcpPosixProcessIdentity>;
+  readonly snapshotAsync?: () => Effect.Effect<
+    ReadonlyArray<AcpPosixProcessIdentity>,
+    AcpProcessGroupTerminationError
+  >;
+  readonly cachedSnapshot?: () => ReadonlyArray<AcpPosixProcessIdentity> | undefined;
   readonly signalProcess: (pid: number, signal: NodeJS.Signals) => void;
   readonly refreshAsync?: () => Effect.Effect<void, AcpProcessGroupTerminationError>;
   readonly observeIntervalMs?: (frontierSize: number) => number;
@@ -756,7 +761,6 @@ export function makeDarwinProcessTreeController(options?: {
         maxBuffer: DARWIN_PS_MAX_BUFFER_BYTES,
         timeout: DARWIN_PS_TIMEOUT_MS,
       }));
-  const readPsTableAsync = options?.readPsTableAsync ?? readDarwinPsTableAsync;
   const sendSignal =
     options?.signalProcess ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
   const cacheTtlMs = options?.cacheTtlMs ?? DEFAULT_DARWIN_PS_CACHE_TTL_MS;
@@ -772,6 +776,16 @@ export function makeDarwinProcessTreeController(options?: {
           cause,
           detail: "Failed to query Darwin process table via ps",
         });
+
+  const readPsTableAsync =
+    options?.readPsTableAsync ??
+    (options?.readPsTable !== undefined
+      ? () =>
+          Effect.try({
+            try: readPsTable,
+            catch: toQueryError,
+          })
+      : readDarwinPsTableAsync);
 
   const buildCache = (stdout: string, ttlMs: number): DarwinPsTableCache => {
     const table = parseDarwinPsProcessTable(stdout);
@@ -816,6 +830,8 @@ export function makeDarwinProcessTreeController(options?: {
   };
 
   return {
+    cachedSnapshot: () =>
+      cache !== undefined && now() < cache.expiresAtMs ? cache.table : undefined,
     childPidsOf: (pid) =>
       (getCachedOrRefresh().childrenByPpid.get(pid) ?? []).map((entry) => entry.pid),
     childrenOf: (pid) => getCachedOrRefresh().childrenByPpid.get(pid) ?? [],
@@ -835,6 +851,28 @@ export function makeDarwinProcessTreeController(options?: {
         );
       }),
     snapshot: () => refresh().table,
+    snapshotAsync: () =>
+      Effect.suspend(() => {
+        cacheGeneration += 1;
+        const generation = cacheGeneration;
+        return readPsTableAsync().pipe(
+          Effect.map((stdout) => {
+            const next = buildCache(stdout, Math.max(cacheTtlMs, DARWIN_PS_ASYNC_CACHE_TTL_MS));
+            if (generation === cacheGeneration) {
+              cache = next;
+            }
+            return next.table;
+          }),
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              if (generation === cacheGeneration) {
+                cache = undefined;
+              }
+            }),
+          ),
+          Effect.mapError(toQueryError),
+        );
+      }),
     signalProcess: (pid, signal) => {
       cacheGeneration += 1;
       cache = undefined;
@@ -852,6 +890,49 @@ export function makeDarwinProcessTreeController(options?: {
   };
 }
 
+function collectSameGroupOrSessionSeeds(input: {
+  readonly byPid: ReadonlyMap<number, AcpPosixProcessIdentity>;
+  readonly rootIdentity: AcpPosixProcessIdentity;
+  readonly table: ReadonlyArray<AcpPosixProcessIdentity>;
+}): ReadonlyArray<AcpPosixProcessIdentity> {
+  const currentSelf = input.byPid.get(process.pid);
+  if (currentSelf === undefined) return [];
+  const liveRoot = input.byPid.get(input.rootIdentity.pid);
+  const rootPidUnreused =
+    liveRoot === undefined || samePosixProcessIdentity(input.rootIdentity, liveRoot);
+  const ownsRootPgid =
+    rootPidUnreused &&
+    input.rootIdentity.pgid > 1 &&
+    input.rootIdentity.pgid === input.rootIdentity.pid &&
+    input.rootIdentity.pgid !== currentSelf.pgid;
+  const ownsRootSid =
+    rootPidUnreused &&
+    input.rootIdentity.sid > 1 &&
+    input.rootIdentity.sid === input.rootIdentity.pid &&
+    (currentSelf.sid <= 0 || input.rootIdentity.sid !== currentSelf.sid);
+  if (!ownsRootPgid && !ownsRootSid) return [];
+  const seeds: Array<AcpPosixProcessIdentity> = [];
+  for (const processEntry of input.table) {
+    if (
+      processEntry.pid <= 1 ||
+      processEntry.pid === process.pid ||
+      processEntry.pid === input.rootIdentity.pid ||
+      processEntry.pgid === currentSelf.pgid ||
+      (currentSelf.sid > 0 && processEntry.sid > 0 && processEntry.sid === currentSelf.sid)
+    ) {
+      continue;
+    }
+    if (
+      !(ownsRootPgid && processEntry.pgid === input.rootIdentity.pgid) &&
+      !(ownsRootSid && processEntry.sid === input.rootIdentity.sid)
+    ) {
+      continue;
+    }
+    seeds.push(processEntry);
+  }
+  return seeds;
+}
+
 export function observePosixOwnershipLedger(input: {
   readonly childQueues: Map<number, Array<number>>;
   readonly controller: AcpPosixProcessTreeController;
@@ -860,6 +941,7 @@ export function observePosixOwnershipLedger(input: {
   readonly maxProcesses?: number;
   readonly root: AcpPosixOwnershipRoot;
   readonly rootPid: number;
+  readonly table?: ReadonlyArray<AcpPosixProcessIdentity>;
 }): void {
   let rootIdentity: AcpPosixProcessIdentity | undefined = input.root.value;
   if (rootIdentity === undefined) {
@@ -884,6 +966,34 @@ export function observePosixOwnershipLedger(input: {
     input.ledger.set(processIdentityKey(rootIdentity), ownedRoot);
     input.frontier.set(rootIdentity.pid, ownedRoot);
     input.root.value = ownedRoot;
+  }
+  const snapshotTable = input.table ?? input.controller.cachedSnapshot?.();
+  if (snapshotTable !== undefined) {
+    const byPid = new Map(snapshotTable.map((entry) => [entry.pid, entry]));
+    for (const processEntry of collectSameGroupOrSessionSeeds({
+      byPid,
+      rootIdentity,
+      table: snapshotTable,
+    })) {
+      let reservedPid = input.frontier.get(processEntry.pid);
+      if (reservedPid !== undefined && !samePosixProcessIdentity(reservedPid, processEntry)) {
+        input.frontier.delete(processEntry.pid);
+        for (const [key, owned] of input.ledger.entries()) {
+          if (owned.pid === processEntry.pid) input.ledger.delete(key);
+        }
+        reservedPid = undefined;
+      }
+      const owned =
+        reservedPid === undefined
+          ? {
+              ...processEntry,
+              parentExecutable: rootIdentity.executable,
+              parentStartTime: rootIdentity.startTime,
+            }
+          : { ...reservedPid, ...processEntry };
+      input.ledger.set(processIdentityKey(processEntry), owned);
+      input.frontier.set(processEntry.pid, owned);
+    }
   }
   const maxProcesses = Math.max(1, input.maxProcesses ?? Number.POSITIVE_INFINITY);
   let remainingBudget = maxProcesses;
@@ -1085,6 +1195,25 @@ export function capturePosixOwnershipLedger(input: {
   const pending = [...input.ledger.values()].filter((owned) =>
     samePosixProcessIdentity(owned, byPid.get(owned.pid)),
   );
+  for (const processEntry of collectSameGroupOrSessionSeeds({ byPid, rootIdentity, table })) {
+    const reservedPid = retainedByPid.get(processEntry.pid);
+    if (reservedPid !== undefined && !samePosixProcessIdentity(reservedPid, processEntry)) {
+      continue;
+    }
+    const owned =
+      reservedPid === undefined
+        ? {
+            ...processEntry,
+            parentExecutable: rootIdentity.executable,
+            parentStartTime: rootIdentity.startTime,
+          }
+        : { ...reservedPid, ...processEntry };
+    input.ledger.set(processIdentityKey(processEntry), owned);
+    retainedByPid.set(processEntry.pid, owned);
+    if (reservedPid === undefined) {
+      pending.push(owned);
+    }
+  }
   const visited = new Set<number>();
   while (pending.length > 0) {
     const parent = pending.shift();
@@ -1126,27 +1255,72 @@ export function terminatePosixOwnedProcessTree(input: {
 
   const fail = (detail: string, cause?: unknown) =>
     new AcpProcessGroupTerminationError({ detail, ...(cause === undefined ? {} : { cause }) });
-  const snapshot = () => {
-    try {
-      return input.controller.snapshot();
-    } catch (cause) {
-      throw fail(`Failed to snapshot ACP process tree ${input.rootPid}`, cause);
-    }
-  };
-  const discover = (table: ReadonlyArray<AcpPosixProcessIdentity>) =>
-    capturePosixOwnershipLedger({
-      controller: input.controller,
-      ledger,
-      ...(input.root === undefined ? {} : { root: input.root }),
-      rootPid: input.rootPid,
-      table,
+  const toTerminationError = (detail: string) => (cause: unknown) =>
+    isAcpProcessGroupTerminationError(cause) ? cause : fail(detail, cause);
+  const takePassSnapshot = (): Effect.Effect<
+    ReadonlyArray<AcpPosixProcessIdentity>,
+    AcpProcessGroupTerminationError
+  > =>
+    input.controller.snapshotAsync !== undefined
+      ? input.controller
+          .snapshotAsync()
+          .pipe(
+            Effect.mapError(
+              toTerminationError(`Failed to snapshot ACP process tree ${input.rootPid}`),
+            ),
+          )
+      : Effect.try({
+          try: () => input.controller.snapshot(),
+          catch: toTerminationError(`Failed to snapshot ACP process tree ${input.rootPid}`),
+        });
+  const discover = (
+    table: ReadonlyArray<AcpPosixProcessIdentity>,
+  ): Effect.Effect<ReadonlyArray<AcpPosixProcessIdentity>, AcpProcessGroupTerminationError> =>
+    Effect.try({
+      try: () =>
+        capturePosixOwnershipLedger({
+          controller: input.controller,
+          ledger,
+          ...(input.root === undefined ? {} : { root: input.root }),
+          rootPid: input.rootPid,
+          table,
+        }),
+      catch: toTerminationError(`Failed to capture ACP process tree ${input.rootPid}`),
     });
-  const signalPhase = (signal: NodeJS.Signals, includeRoot: boolean) => {
-    const table = snapshot();
-    discover(table);
-    const byPid = new Map(table.map((entry) => [entry.pid, entry]));
-    const current = input.controller.identity(process.pid);
-    if (current === undefined) throw fail("Cannot identify the current T3 process group");
+  const usePassSnapshotOnly = input.controller.snapshotAsync !== undefined;
+  const readIdentity = (pid: number) =>
+    Effect.try({
+      try: () => input.controller.identity(pid),
+      catch: toTerminationError(`Failed to inspect ACP process ${pid}`),
+    });
+  const readChildren = (pid: number) =>
+    Effect.try({
+      try: () => input.controller.childrenOf(pid),
+      catch: toTerminationError(`Failed to inspect children of ACP process ${pid}`),
+    });
+  const signalPhase = Effect.fn("AcpSessionRuntime.signalPhase")(function* (
+    signal: NodeJS.Signals,
+    includeRoot: boolean,
+  ): Effect.fn.Return<void, AcpProcessGroupTerminationError> {
+    const table = yield* takePassSnapshot();
+    yield* discover(table);
+    const byPid = new Map<number, AcpPosixProcessIdentity>();
+    const childrenByPpid = new Map<number, Array<AcpPosixProcessIdentity>>();
+    for (const entry of table) {
+      byPid.set(entry.pid, entry);
+      const siblings = childrenByPpid.get(entry.ppid);
+      if (siblings === undefined) {
+        childrenByPpid.set(entry.ppid, [entry]);
+      } else {
+        siblings.push(entry);
+      }
+    }
+    const current = usePassSnapshotOnly
+      ? byPid.get(process.pid)
+      : (byPid.get(process.pid) ?? (yield* readIdentity(process.pid)));
+    if (current === undefined) {
+      return yield* fail("Cannot identify the current T3 process group");
+    }
     const ledgerByPid = new Map(
       [...ledger.values()].map((process) => [process.pid, process] as const),
     );
@@ -1155,6 +1329,12 @@ export function terminatePosixOwnedProcessTree(input: {
         (includeRoot || candidate.pid !== input.rootPid) &&
         samePosixProcessIdentity(candidate, byPid.get(candidate.pid)),
     );
+    const sortPending = () => {
+      pending.sort(
+        (left, right) => processDepth(right, ledgerByPid) - processDepth(left, ledgerByPid),
+      );
+    };
+    sortPending();
     const retainedByPid = new Map(
       [...ledger.values()]
         .filter((owned) => samePosixProcessIdentity(owned, byPid.get(owned.pid)))
@@ -1162,23 +1342,27 @@ export function terminatePosixOwnedProcessTree(input: {
     );
     const signalled = new Set<number>();
     while (pending.length > 0) {
-      pending.sort(
-        (left, right) => processDepth(right, ledgerByPid) - processDepth(left, ledgerByPid),
-      );
       const candidate = pending.shift();
       if (candidate === undefined || signalled.has(candidate.pid)) continue;
-      const observed = input.controller.identity(candidate.pid);
+      const observed = usePassSnapshotOnly
+        ? byPid.get(candidate.pid)
+        : yield* readIdentity(candidate.pid);
       if (
         candidate.pid <= 1 ||
         candidate.pid === process.pid ||
         observed === undefined ||
+        posixProcessIsZombie(observed) ||
         observed.pgid === current.pgid ||
         (current.sid > 0 && observed.sid > 0 && observed.sid === current.sid) ||
         !samePosixProcessIdentity(candidate, observed)
       ) {
         continue;
       }
-      for (const child of input.controller.childrenOf(candidate.pid)) {
+      const candidateChildren = usePassSnapshotOnly
+        ? (childrenByPpid.get(candidate.pid) ?? [])
+        : yield* readChildren(candidate.pid);
+      let appended = false;
+      for (const child of candidateChildren) {
         if (child.ppid !== candidate.pid) continue;
         const reservedPid = retainedByPid.get(child.pid);
         if (reservedPid !== undefined && !samePosixProcessIdentity(reservedPid, child)) continue;
@@ -1194,50 +1378,57 @@ export function terminatePosixOwnedProcessTree(input: {
         ledgerByPid.set(child.pid, owned);
         retainedByPid.set(child.pid, owned);
         // Signal newly discovered children in this same pass (fork-during-kill).
+        const observedChild = usePassSnapshotOnly
+          ? byPid.get(child.pid)
+          : yield* readIdentity(child.pid);
         if (
+          reservedPid === undefined &&
           (includeRoot || child.pid !== input.rootPid) &&
           !signalled.has(child.pid) &&
-          samePosixProcessIdentity(owned, input.controller.identity(child.pid))
+          observedChild !== undefined &&
+          !posixProcessIsZombie(observedChild) &&
+          samePosixProcessIdentity(owned, observedChild)
         ) {
           pending.push(owned);
+          appended = true;
         }
       }
-      try {
+      if (appended) sortPending();
+      const signalResult = Result.try(() =>
         // Node lacks pidfd_send_signal, so starttime checks still leave a read-to-kill race.
-        input.controller.signalProcess(candidate.pid, signal);
+        input.controller.signalProcess(candidate.pid, signal),
+      );
+      if (Result.isSuccess(signalResult)) {
         signalled.add(candidate.pid);
-      } catch (cause) {
-        if (samePosixProcessIdentity(candidate, input.controller.identity(candidate.pid))) {
-          throw fail(`Failed to signal ACP process ${candidate.pid}`, cause);
+      } else {
+        const cause = signalResult.failure;
+        if ((cause as NodeJS.ErrnoException | undefined)?.code !== "ESRCH") {
+          const freshObserved = usePassSnapshotOnly
+            ? (yield* takePassSnapshot()).find((entry) => entry.pid === candidate.pid)
+            : yield* readIdentity(candidate.pid);
+          if (samePosixProcessIdentity(candidate, freshObserved)) {
+            return yield* fail(`Failed to signal ACP process ${candidate.pid}`, cause);
+          }
         }
       }
     }
-  };
+  });
 
   return Effect.gen(function* () {
     const passes = Math.max(2, Math.min(input.discoveryPasses ?? 4, 8));
     for (let pass = 0; pass < passes; pass += 1) {
-      yield* Effect.try({
-        try: () => signalPhase("SIGTERM", false),
-        catch: (cause) => cause as AcpProcessGroupTerminationError,
-      });
+      yield* signalPhase("SIGTERM", false);
       yield* Effect.sleep("10 millis");
     }
-    yield* Effect.try({
-      try: () => signalPhase("SIGTERM", true),
-      catch: (cause) => cause as AcpProcessGroupTerminationError,
-    });
+    yield* signalPhase("SIGTERM", true);
     const grace = input.grace ?? "1 second";
     if (grace !== 0) yield* Effect.sleep(grace);
     for (let pass = 0; pass < passes; pass += 1) {
-      yield* Effect.try({
-        try: () => signalPhase("SIGKILL", true),
-        catch: (cause) => cause as AcpProcessGroupTerminationError,
-      });
+      yield* signalPhase("SIGKILL", true);
       yield* Effect.sleep("10 millis");
     }
-    const finalTable = snapshot();
-    discover(finalTable);
+    const finalTable = yield* takePassSnapshot();
+    yield* discover(finalTable);
     const survivors = new Map(finalTable.map((entry) => [entry.pid, entry]));
     const residual = [...ledger.values()].filter((owned) => {
       const observed = survivors.get(owned.pid);
@@ -1681,8 +1872,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
     scopedLaunch === undefined ? spawnCommand : { ...scopedLaunch, shell: false };
   // Finalizers run in reverse order: reap detached work after terminating the agent.
   const scopeUnit = scopedLaunch?.unit;
-  const stopScope =
-    scopeUnit === undefined ? Effect.void : yield* Effect.cached(agentScope.stop(scopeUnit));
+  const stopScope = scopeUnit === undefined ? Effect.void : agentScope.stop(scopeUnit);
   yield* Scope.addFinalizer(runtimeScope, stopScope);
   const containedSpawnCommand =
     linuxCgroupLease === undefined
@@ -1705,6 +1895,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         ...(options.spawn.cwd ? { cwd: options.spawn.cwd } : {}),
         ...(spawnEnvironment ? { env: spawnEnvironment } : {}),
         extendEnv: options.spawn.extendEnv ?? true,
+        forceKillAfter: options.processGroupTerminationGrace ?? "1 second",
         // Windows `detached` gives the child its own console, which breaks stdio pipes through
         // `.cmd` shims; taskkill /T cleans up the tree there without it.
         ...(options.ownDetachedProcessGroup === undefined
@@ -1832,7 +2023,25 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       });
     },
   );
+  let explicitStopRequested = false;
+  let runtimeExitedUnplanned = false;
+  const terminateScopeUnit = (
+    unit: string,
+    terminateOptions?: { readonly preserveOomDiagnosis?: boolean | undefined },
+  ): Effect.Effect<void, AcpProcessGroupTerminationError> =>
+    agentScope.terminateUnit(unit, terminateOptions).pipe(
+      Effect.mapError((cause) =>
+        isAcpProcessGroupTerminationError(cause)
+          ? cause
+          : new AcpProcessGroupTerminationError({
+              cause,
+              detail: `Failed to terminate ACP systemd scope ${unit}`,
+            }),
+      ),
+      withWallClock,
+    );
   const terminateOwnedProcessGroupImpl = Effect.gen(function* () {
+    explicitStopRequested = true;
     if (options.ownDetachedProcessGroup !== true) return;
     if (options.processGroupPlatform === undefined) {
       return yield* new AcpProcessGroupTerminationError({
@@ -1857,30 +2066,65 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       return yield* terminateLinuxCgroupLease(linuxCgroupLease);
     }
     if (options.ownDescendantProcessGroups === true) {
-      return yield* terminatePosixProcessTree(options.processGroupTerminationGrace ?? "1 second");
+      const treeExit = yield* Effect.exit(
+        terminatePosixProcessTree(options.processGroupTerminationGrace ?? "1 second"),
+      );
+      if (scopeUnit !== undefined) {
+        yield* terminateScopeUnit(scopeUnit);
+      }
+      if (Exit.isFailure(treeExit)) {
+        return yield* Effect.failCause(treeExit.cause);
+      }
+      return;
     }
-    const groupExisted = yield* signalOwnedProcessGroup("SIGTERM");
-    if (!groupExisted) return;
-    const grace = options.processGroupTerminationGrace ?? "1 second";
-    if (grace !== 0) {
-      yield* Effect.sleep(grace);
+    const groupExit = yield* Effect.exit(
+      Effect.gen(function* () {
+        const groupExisted = yield* signalOwnedProcessGroup("SIGTERM");
+        if (groupExisted) {
+          const grace = options.processGroupTerminationGrace ?? "1 second";
+          if (grace !== 0) {
+            yield* Effect.sleep(grace);
+          }
+          yield* signalOwnedProcessGroup("SIGKILL");
+        }
+      }),
+    );
+    if (scopeUnit !== undefined) {
+      yield* terminateScopeUnit(scopeUnit);
     }
-    yield* signalOwnedProcessGroup("SIGKILL");
+    if (Exit.isFailure(groupExit)) {
+      return yield* Effect.failCause(groupExit.cause);
+    }
   }).pipe(withWallClock);
   const terminateProcessGroup = yield* Effect.cached(
     Effect.uninterruptible(terminateOwnedProcessGroupImpl),
   );
   if (options.ownDetachedProcessGroup === true) {
+    const forceProcessGroupPlatform = options.processGroupPlatform ?? hostPlatform;
+    const forceTerminateScope =
+      scopeUnit === undefined
+        ? Effect.void
+        : Effect.suspend(() =>
+            terminateScopeUnit(
+              scopeUnit,
+              runtimeExitedUnplanned ? { preserveOomDiagnosis: true } : undefined,
+            ),
+          ).pipe(Effect.ignoreCause({ log: true }));
     const forceTerminateOwnedProcessGroup =
-      hostPlatform === "win32"
+      forceProcessGroupPlatform === "win32"
         ? terminateWindowsProcessTreeWithTaskkill(Number(child.pid)).pipe(
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           )
         : linuxCgroupLease !== undefined
           ? terminateLinuxCgroupLease(linuxCgroupLease)
           : options.ownDescendantProcessGroups === true
-            ? terminatePosixProcessTree(0, hostPlatform)
-            : signalOwnedProcessGroup("SIGKILL").pipe(Effect.asVoid);
+            ? terminatePosixProcessTree(0, forceProcessGroupPlatform).pipe(
+                Effect.ensuring(forceTerminateScope),
+              )
+            : signalOwnedProcessGroup("SIGKILL").pipe(
+                Effect.asVoid,
+                Effect.ensuring(forceTerminateScope),
+              );
     yield* Scope.addFinalizer(
       runtimeScope,
       Effect.uninterruptible(forceTerminateOwnedProcessGroup).pipe(
@@ -1927,7 +2171,15 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         recordTermination(error).pipe(
           Effect.andThen(options.onTermination?.(error) ?? Effect.void),
           Effect.ensuring(
-            Scope.close(runtimeScope, Exit.fail(error)).pipe(Effect.forkDetach, Effect.asVoid),
+            Effect.sync(() => {
+              if (!explicitStopRequested) {
+                runtimeExitedUnplanned = true;
+              }
+            }).pipe(
+              Effect.andThen(Scope.close(runtimeScope, Exit.fail(error))),
+              Effect.forkDetach,
+              Effect.asVoid,
+            ),
           ),
         ),
       ...(options.onOutgoingResponseFailure
@@ -2041,17 +2293,35 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       Effect.andThen(Deferred.succeed(runtimeClosed, undefined)),
       Effect.andThen(
         posixController !== undefined && linuxCgroupLease === undefined
-          ? Effect.sync(() => {
-              // Snapshot before the ACP transport closes stdin so fast-exiting agents cannot reparent descendants unseen.
-              try {
-                capturePosixOwnershipLedger({
-                  controller: posixController,
-                  ledger: posixOwnershipLedger,
-                  root: posixOwnershipRoot,
-                  rootPid: Number(child.pid),
-                });
-              } catch {}
-            })
+          ? posixController.snapshotAsync !== undefined
+            ? posixController.snapshotAsync().pipe(
+                Effect.flatMap((table) =>
+                  Effect.sync(() => {
+                    // Snapshot before the ACP transport closes stdin so fast-exiting agents cannot reparent descendants unseen.
+                    try {
+                      capturePosixOwnershipLedger({
+                        controller: posixController,
+                        ledger: posixOwnershipLedger,
+                        root: posixOwnershipRoot,
+                        rootPid: Number(child.pid),
+                        table,
+                      });
+                    } catch {}
+                  }),
+                ),
+                Effect.ignore,
+              )
+            : Effect.sync(() => {
+                // Snapshot before the ACP transport closes stdin so fast-exiting agents cannot reparent descendants unseen.
+                try {
+                  capturePosixOwnershipLedger({
+                    controller: posixController,
+                    ledger: posixOwnershipLedger,
+                    root: posixOwnershipRoot,
+                    rootPid: Number(child.pid),
+                  });
+                } catch {}
+              })
           : Effect.void,
       ),
     ),

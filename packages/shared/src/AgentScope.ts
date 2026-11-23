@@ -1,5 +1,18 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+
+export class AgentScopeTerminationError extends Schema.TaggedError<AgentScopeTerminationError>()(
+  "AgentScopeTerminationError",
+  {
+    unit: Schema.String,
+    detail: Schema.String,
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
 
 export interface AgentScopeShape {
   readonly wrap: (input: {
@@ -22,6 +35,16 @@ export interface AgentScopeShape {
    * descendants outside its process group. Preserves systemd OOM diagnosis.
    */
   readonly stop: (unit: string) => Effect.Effect<void>;
+  /**
+   * Deterministically SIGKILLs every process in a specific `t3code-*.scope`
+   * unit regardless of OOM-diagnosis state and verifies the scope is empty.
+   * When `preserveOomDiagnosis` is set (unplanned runtime exit), waits for
+   * systemd's `OOMPolicy=stop` to record `Result=oom-kill` before intervening.
+   */
+  readonly terminateUnit: (
+    unit: string,
+    options?: { readonly preserveOomDiagnosis?: boolean | undefined },
+  ) => Effect.Effect<void, Error>;
   /**
    * SIGKILLs every process in the thread's own scope, which works even while
    * the kernel throttles them. Shared scopes serve other threads and are never
@@ -48,6 +71,7 @@ export const AgentScope = Context.Reference<AgentScopeShape>("@t3tools/shared/Ag
     wrap: ({ command, args }) => Effect.succeed({ command, args }),
     oomKilled: () => Effect.succeed(false),
     stop: () => Effect.void,
+    terminateUnit: () => Effect.void,
     kill: () => Effect.succeed(false),
     clear: () => Effect.void,
   }),

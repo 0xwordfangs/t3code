@@ -6,8 +6,9 @@ import {
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   type ChatAttachment,
 } from "@t3tools/contracts";
-import { AgentScope } from "@t3tools/shared/AgentScope";
+import { AgentScope, AgentScopeTerminationError } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -947,6 +948,302 @@ describe("makeAntigravityAcpRuntime process teardown (CF-03)", () => {
             ),
           ),
         );
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  const MOCK_ORPHAN_AGENT_SCRIPT = [
+    'import { spawnSync } from "node:child_process";',
+    'import { writeFileSync } from "node:fs";',
+    'import { createInterface } from "node:readline";',
+    "const orphanPidFile = process.env.T3_TEST_ORPHAN_PID_FILE;",
+    "const agentPidFile = process.env.T3_TEST_AGENT_PID_FILE;",
+    "const trapTerm = process.env.T3_TEST_TRAP_TERM === '1';",
+    'if (agentPidFile) writeFileSync(agentPidFile, String(process.pid), "utf8");',
+    "const keepAlive = setInterval(() => {}, 60_000);",
+    "const reply = (id, result) => {",
+    '  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\\n`);',
+    "};",
+    "const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });",
+    'rl.on("line", (line) => {',
+    "  if (!line.trim()) return;",
+    "  const msg = JSON.parse(line);",
+    '  if (msg.method === "initialize") {',
+    "    reply(msg.id, {",
+    "      protocolVersion: 1,",
+    "      agentCapabilities: {},",
+    '      authMethods: [{ id: "oauth-personal", name: "OAuth" }],',
+    "    });",
+    '  } else if (msg.method === "authenticate") {',
+    "    reply(msg.id, {});",
+    '  } else if (msg.method === "session/new") {',
+    '    reply(msg.id, { sessionId: "mock-ag-orphan-1" });',
+    '  } else if (msg.method === "session/prompt") {',
+    "    const cmd = trapTerm",
+    "      ? `trap '' TERM; sleep 30 </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > \"${orphanPidFile}\"`",
+    '      : `sleep 30 </dev/null >/dev/null 2>&1 & printf \'%s\' "$!" > "${orphanPidFile}"`;',
+    '    spawnSync("/bin/sh", ["-c", cmd], { stdio: "ignore" });',
+    '    reply(msg.id, { stopReason: "end_turn" });',
+    '  } else if (msg.method === "_test/exit") {',
+    "    process.exit(0);",
+    "  } else if (msg.id !== undefined) {",
+    "    reply(msg.id, {});",
+    "  }",
+    "});",
+    'rl.on("close", () => clearInterval(keepAlive));',
+  ].join("\n");
+
+  it.live.each([
+    { platform: "darwin" as const, trapTerm: true, teardown: "stop" as const },
+    { platform: "darwin" as const, trapTerm: false, teardown: "stop" as const },
+    { platform: "darwin" as const, trapTerm: true, teardown: "scope-close" as const },
+    { platform: "linux" as const, trapTerm: true, teardown: "stop" as const },
+    { platform: "linux" as const, trapTerm: true, teardown: "scope-close" as const },
+  ])(
+    "kills reparented same-PGID orphans on $platform (trapTerm=$trapTerm, teardown=$teardown) (R3-CF-12)",
+    ({ platform, trapTerm, teardown }) =>
+      Effect.gen(function* () {
+        if ((yield* HostProcess.Platform) === "win32") return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-r3cf12-" });
+        const mockAgentPath = path.join(tempDir, "mock-orphan-agent.mjs");
+        const orphanPidFile = path.join(tempDir, "orphan.pid");
+        const agentPidFile = path.join(tempDir, "agent.pid");
+
+        yield* fs.writeFileString(mockAgentPath, MOCK_ORPHAN_AGENT_SCRIPT);
+
+        let orphanPid: number | undefined;
+        let agentPid: number | undefined;
+        const runtimeScope = yield* Scope.make();
+
+        yield* Effect.gen(function* () {
+          const runtime = yield* makeAntigravityAcpRuntime({
+            childProcessSpawner,
+            cwd: tempDir,
+            linuxCgroupController: null,
+            processGroupTerminationGrace: "50 millis",
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: tempDir,
+              env: {
+                T3_TEST_ORPHAN_PID_FILE: orphanPidFile,
+                T3_TEST_AGENT_PID_FILE: agentPidFile,
+                T3_TEST_TRAP_TERM: trapTerm ? "1" : "0",
+              },
+            },
+          }).pipe(
+            Effect.provideService(HostProcess.Platform, platform),
+            Effect.provideService(Scope.Scope, runtimeScope),
+            Effect.provideService(AgentScope, AgentScope.defaultValue()),
+          );
+
+          yield* runtime.start();
+          yield* runtime.prompt({
+            prompt: [{ type: "text", text: "spawn reparented orphan" }],
+          });
+
+          orphanPid = Number((yield* fs.readFileString(orphanPidFile)).trim());
+          agentPid = Number((yield* fs.readFileString(agentPidFile)).trim());
+          expect(Number.isInteger(agentPid) && agentPid > 0).toBe(true);
+          expect(Number.isInteger(orphanPid) && orphanPid > 0).toBe(true);
+          expect(isProcessAlive(orphanPid, platform)).toBe(true);
+
+          if (teardown === "stop") {
+            expect(runtime.terminateProcessGroup).toBeDefined();
+            yield* runtime.terminateProcessGroup!;
+            expect(isProcessAlive(agentPid, platform)).toBe(false);
+            expect(isProcessAlive(orphanPid, platform)).toBe(false);
+          }
+
+          yield* Scope.close(runtimeScope, Exit.void);
+          expect(isProcessAlive(agentPid, platform)).toBe(false);
+          expect(isProcessAlive(orphanPid, platform)).toBe(false);
+        }).pipe(
+          Effect.ensuring(
+            Scope.close(runtimeScope, Exit.void).pipe(
+              Effect.ignore,
+              Effect.andThen(
+                Effect.sync(() => {
+                  forceKillPid(orphanPid);
+                  forceKillPid(agentPid);
+                }),
+              ),
+            ),
+          ),
+        );
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.live(
+    "invokes AgentScope.terminateUnit on Linux non-cgroup Stop and Scope.close, fails closed on error, and does not cache skipped stopScope (R3-CF-11)",
+    () =>
+      Effect.gen(function* () {
+        if ((yield* HostProcess.Platform) !== "linux") return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-r3cf11-" });
+        const mockAgentPath = path.join(tempDir, "mock-scope-agent.mjs");
+        yield* fs.writeFileString(mockAgentPath, MOCK_ORPHAN_AGENT_SCRIPT);
+
+        // 1a) Stop calls terminateUnit(scopeUnit) and fails closed if terminateUnit fails.
+        {
+          const terminatedUnits: Array<string> = [];
+          const runtimeScope = yield* Scope.make();
+          yield* Effect.gen(function* () {
+            const runtime = yield* makeAntigravityAcpRuntime({
+              childProcessSpawner,
+              cwd: tempDir,
+              linuxCgroupController: null,
+              processGroupTerminationGrace: 0,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: tempDir,
+              },
+            }).pipe(
+              Effect.provideService(HostProcess.Platform, "linux"),
+              Effect.provideService(Scope.Scope, runtimeScope),
+              Effect.provideService(AgentScope, {
+                ...AgentScope.defaultValue(),
+                wrap: ({ command, args }) =>
+                  Effect.succeed({ command, args, unit: "t3code-acp-failclosed.scope" }),
+                terminateUnit: (unit) =>
+                  Effect.suspend(() => {
+                    terminatedUnits.push(unit);
+                    return Effect.fail(
+                      new AgentScopeTerminationError({
+                        unit,
+                        detail: `scope ${unit} stayed populated`,
+                      }),
+                    );
+                  }),
+              }),
+            );
+            yield* runtime.start();
+            const error = yield* Effect.flip(runtime.terminateProcessGroup!);
+            expect(error).toBeInstanceOf(AcpSessionRuntime.AcpProcessGroupTerminationError);
+            expect(error.detail).toContain("t3code-acp-failclosed.scope");
+            expect(terminatedUnits).toContain("t3code-acp-failclosed.scope");
+          }).pipe(Effect.ensuring(Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore)));
+        }
+
+        // 1b) Direct Scope.close invokes terminateUnit(scopeUnit) via forceTerminateOwnedProcessGroup.
+        {
+          const terminatedUnits: Array<string> = [];
+          const runtimeScope = yield* Scope.make();
+          yield* Effect.gen(function* () {
+            const runtime = yield* makeAntigravityAcpRuntime({
+              childProcessSpawner,
+              cwd: tempDir,
+              linuxCgroupController: null,
+              processGroupTerminationGrace: 0,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: tempDir,
+              },
+            }).pipe(
+              Effect.provideService(HostProcess.Platform, "linux"),
+              Effect.provideService(Scope.Scope, runtimeScope),
+              Effect.provideService(AgentScope, {
+                ...AgentScope.defaultValue(),
+                wrap: ({ command, args }) =>
+                  Effect.succeed({ command, args, unit: "t3code-acp-scopeclose.scope" }),
+                terminateUnit: (unit) =>
+                  Effect.sync(() => {
+                    terminatedUnits.push(unit);
+                  }),
+              }),
+            );
+            yield* runtime.start();
+            yield* Scope.close(runtimeScope, Exit.void);
+            expect(terminatedUnits).toEqual(["t3code-acp-scopeclose.scope"]);
+          }).pipe(Effect.ensuring(Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore)));
+        }
+
+        // 2) stopScope is NOT cached: child.exitCode watcher call does not prevent Scope.close retry.
+        {
+          let stopCalls = 0;
+          const secondStopCalled = yield* Deferred.make<void>();
+          const runtimeScope = yield* Scope.make();
+          yield* Effect.gen(function* () {
+            const runtime = yield* makeAntigravityAcpRuntime({
+              childProcessSpawner,
+              cwd: tempDir,
+              linuxCgroupController: null,
+              processGroupTerminationGrace: 0,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: tempDir,
+              },
+            }).pipe(
+              Effect.provideService(HostProcess.Platform, "linux"),
+              Effect.provideService(Scope.Scope, runtimeScope),
+              Effect.provideService(AgentScope, {
+                ...AgentScope.defaultValue(),
+                wrap: ({ command, args }) =>
+                  Effect.succeed({ command, args, unit: "t3code-acp-retry.scope" }),
+                stop: () =>
+                  Effect.sync(() => {
+                    stopCalls += 1;
+                    return stopCalls;
+                  }).pipe(
+                    Effect.flatMap((count) =>
+                      count >= 2
+                        ? Deferred.succeed(secondStopCalled, undefined).pipe(Effect.asVoid)
+                        : Effect.void,
+                    ),
+                  ),
+              }),
+            );
+            yield* runtime.start();
+            yield* runtime.notify("_test/exit", {});
+            yield* Deferred.await(secondStopCalled);
+            expect(stopCalls).toBeGreaterThanOrEqual(2);
+          }).pipe(Effect.ensuring(Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore)));
+        }
+
+        // 3) ownDescendantProcessGroups: false also invokes terminateUnit(scopeUnit) on Stop.
+        {
+          const terminatedUnits: Array<string> = [];
+          const runtimeScope = yield* Scope.make();
+          yield* Effect.gen(function* () {
+            const runtime = yield* AcpSessionRuntime.make({
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: tempDir,
+              },
+              cwd: tempDir,
+              clientInfo: antigravityClientInfo(undefined),
+              ownDetachedProcessGroup: true,
+              ownDescendantProcessGroups: false,
+              processGroupPlatform: "linux",
+              processGroupTerminationGrace: 0,
+              linuxCgroupController: null,
+            }).pipe(
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+              Effect.provideService(HostProcess.Platform, "linux"),
+              Effect.provideService(Scope.Scope, runtimeScope),
+              Effect.provideService(AgentScope, {
+                ...AgentScope.defaultValue(),
+                wrap: ({ command, args }) =>
+                  Effect.succeed({ command, args, unit: "t3code-acp-pgid-only.scope" }),
+                terminateUnit: (unit) =>
+                  Effect.sync(() => {
+                    terminatedUnits.push(unit);
+                  }),
+              }),
+            );
+            yield* runtime.start();
+            yield* runtime.terminateProcessGroup!;
+            expect(terminatedUnits).toEqual(["t3code-acp-pgid-only.scope"]);
+          }).pipe(Effect.ensuring(Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore)));
+        }
       }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 });
