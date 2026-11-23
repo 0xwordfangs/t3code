@@ -1312,6 +1312,49 @@ describe("MessagesTimeline verification action", () => {
       .element(allowed.getByRole("link", { name: "Verify account" }))
       .toHaveAttribute("href", verificationUrl);
   });
+
+  it("shows the compact continue destination without query parameters only when providers:manage is granted", async () => {
+    setup();
+    using _resetScopes = {
+      [Symbol.dispose]: () => {
+        sessionScopeState.grantedScopes = null;
+      },
+    };
+    const continueVerificationUrl = GoogleAccountVerificationUrl.make(
+      "https://accounts.google.com/v3/signin/continue?plt=chat-secret&continue=https%3A%2F%2Fcodeassist.google.com%2Fauth%3Ftoken%3Dhidden",
+    );
+    const entries = verificationFailureEntries(continueVerificationUrl);
+
+    sessionScopeState.grantedScopes = new Set();
+    {
+      await using denied = await renderTimeline(entries);
+      await expect
+        .element(denied.getByText("Verify your Google account to continue."))
+        .toBeVisible();
+      await expect
+        .element(denied.getByRole("link", { name: "Verify account" }))
+        .not.toBeInTheDocument();
+      expect(denied.text()).not.toContain("accounts.google.com");
+      expect(denied.text()).not.toContain("codeassist.google.com");
+      expect(denied.text()).not.toContain("plt=chat-secret");
+      expect(denied.text()).not.toContain("token=hidden");
+    }
+
+    sessionScopeState.grantedScopes = new Set([AuthProvidersManageScope]);
+    await using allowed = await renderTimeline(entries);
+    await expect
+      .element(
+        allowed.getByText(
+          "https://accounts.google.com/v3/signin/continue → https://codeassist.google.com/auth",
+        ),
+      )
+      .toBeVisible();
+    expect(allowed.text()).not.toContain("plt=chat-secret");
+    expect(allowed.text()).not.toContain("token=hidden");
+    await expect
+      .element(allowed.getByRole("link", { name: "Verify account" }))
+      .toHaveAttribute("href", continueVerificationUrl);
+  });
 });
 
 const CITATION_REQUEST = {

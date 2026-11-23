@@ -213,12 +213,21 @@ describe("ProviderInstanceCard verification action", () => {
     skills: [],
   };
 
-  const renderCard = (readOnly: boolean) => (
+  const renderCard = (
+    readOnly: boolean,
+    targetVerificationUrl: GoogleAccountVerificationUrl = verificationUrl,
+  ) => (
     <ProviderInstanceCard
       instanceId={instanceId}
       instance={instance}
       driverOption={undefined}
-      liveProvider={liveProvider}
+      liveProvider={{
+        ...liveProvider,
+        auth: {
+          ...liveProvider.auth,
+          verificationUrl: targetVerificationUrl,
+        },
+      }}
       mode="editor"
       readOnly={readOnly}
       onUpdate={async () => true}
@@ -252,6 +261,41 @@ describe("ProviderInstanceCard verification action", () => {
       .not.toBeInTheDocument();
     await expect
       .element(screen.getByText("https://accounts.google.com/v3/signin/continue"))
+      .not.toBeInTheDocument();
+  });
+
+  it("shows the compact continue destination without query parameters when editable and hides it when read-only", async () => {
+    const continueVerificationUrl = GoogleAccountVerificationUrl.make(
+      "https://accounts.google.com/v3/signin/continue?plt=secret-token&continue=https%3A%2F%2Fantigravity.google%2F%3Fstep%3Dverify",
+    );
+    await using screen = await render(renderCard(false, continueVerificationUrl));
+
+    await expect.element(screen.getByText("Verification required")).toBeVisible();
+    await expect
+      .element(
+        screen.getByText(
+          "https://accounts.google.com/v3/signin/continue → https://antigravity.google/",
+        ),
+      )
+      .toBeVisible();
+    expect(screen.container.textContent).not.toContain("plt=secret-token");
+    expect(screen.container.textContent).not.toContain("step=verify");
+    await expect
+      .element(screen.getByRole("link", { name: "Verify account" }))
+      .toHaveAttribute("href", continueVerificationUrl);
+
+    await screen.rerender(renderCard(true, continueVerificationUrl));
+
+    await expect.element(screen.getByText("Verification required")).toBeVisible();
+    await expect
+      .element(screen.getByRole("link", { name: "Verify account" }))
+      .not.toBeInTheDocument();
+    await expect
+      .element(
+        screen.getByText(
+          "https://accounts.google.com/v3/signin/continue → https://antigravity.google/",
+        ),
+      )
       .not.toBeInTheDocument();
   });
 });
