@@ -18,6 +18,7 @@ import { resolveSelfInvocation, selfInvocationArgs } from "@t3tools/shared/nodeR
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -30,6 +31,7 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
@@ -3557,4 +3559,414 @@ describe("AcpRegistryAdapterV2", () => {
       assert.equal(spawned, restarts ? 2 : 1);
     }).pipe(Effect.provide(layerTest)),
   );
+
+  describe("post-settle Stop quarantine (R3-CF-01)", () => {
+    const makeProductionPostSettleStopHarness = Effect.fnUntraced(function* (options: {
+      readonly name: string;
+      readonly settings: Record<string, unknown>;
+      readonly runtimeMode: "full-access" | "approval-required";
+    }) {
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      const sessionId = `sess-${options.name}`;
+      let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+      let permissionHandler: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+      let elicitationHandler: Parameters<RuntimeService["handleElicitation"]>[0] | undefined;
+      const extNotificationHandlers = new Map<
+        string,
+        (params: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>
+      >();
+      let onOutgoingResponse: ((requestId: string) => Effect.Effect<void>) | undefined;
+      let promptStarted = yield* Deferred.make<void>();
+      let promptGate = yield* Deferred.make<
+        EffectAcpSchema.PromptResponse,
+        EffectAcpErrors.AcpError
+      >();
+      let cancelCount = 0;
+      let runtimeCreateCount = 0;
+      const continuationOffered = yield* Queue.unbounded<ProviderContinuationRequest>();
+
+      const startResult: AcpSessionRuntime.AcpSessionRuntimeStartResult = {
+        sessionId,
+        initializeResult: {
+          protocolVersion: 1,
+          agentCapabilities: { loadSession: true },
+        },
+        sessionSetupResult: {},
+        modelConfigId: undefined,
+      };
+      const unsupported = (method: string) =>
+        Effect.fail(EffectAcpErrors.AcpRequestError.methodNotFound(method));
+
+      const instanceId = ProviderInstanceId.make(`acp-registry-r3-cf01-${options.name}`);
+      const coordinator = yield* AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator;
+      const adapter = yield* makeAcpRegistryAdapterV2({
+        selfInvocation: yield* resolveSelfInvocation(),
+        instanceId,
+        settings: yield* decodeAcpRegistryAdapterSettings(options.settings),
+        environment: {},
+        continuationRequests: {
+          offer: (request) => Queue.offer(continuationOffered, request).pipe(Effect.asVoid),
+        },
+        makeRuntime: (runtimeInput) => {
+          runtimeCreateCount += 1;
+          onOutgoingResponse = runtimeInput.onOutgoingResponse;
+          return Effect.succeed({
+            handleRequestPermission: (handler) =>
+              Effect.sync(() => {
+                permissionHandler = handler;
+              }),
+            handleElicitation: (handler) =>
+              Effect.sync(() => {
+                elicitationHandler = handler;
+              }),
+            handleMcpConnect: () => Effect.void,
+            handleMcpMessage: () => Effect.void,
+            handleMcpDisconnect: () => Effect.void,
+            handleMcpNotification: () => Effect.void,
+            handleReadTextFile: () => Effect.void,
+            handleWriteTextFile: () => Effect.void,
+            handleCreateTerminal: () => Effect.void,
+            handleTerminalOutput: () => Effect.void,
+            handleTerminalWaitForExit: () => Effect.void,
+            handleTerminalKill: () => Effect.void,
+            handleTerminalRelease: () => Effect.void,
+            handleSessionUpdate: (handler) =>
+              Effect.sync(() => {
+                sessionUpdateHandler = handler;
+              }),
+            handleElicitationComplete: () => Effect.void,
+            handleUnknownExtRequest: () => Effect.void,
+            handleUnknownExtNotification: () => Effect.void,
+            handleExtRequest: () => Effect.void,
+            handleExtNotification: (method, _schema, handler) =>
+              Effect.sync(() => {
+                extNotificationHandlers.set(
+                  method,
+                  handler as (params: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>,
+                );
+              }),
+            initialize: () => Effect.succeed(startResult.initializeResult),
+            start: () => Effect.succeed(startResult),
+            getEvents: () => Stream.empty,
+            drainEvents: Effect.void,
+            getModeState: Effect.undefined,
+            getConfigOptions: Effect.succeed([]),
+            configOptionChanges: Stream.empty,
+            loadSession: (requestedSessionId) =>
+              Effect.succeed({ ...startResult, sessionId: requestedSessionId }),
+            resumeSession: () => Effect.succeed(startResult),
+            forkSession: () => Effect.succeed(startResult),
+            listSessions: () => unsupported("session/list"),
+            closeSession: () => Effect.succeed({}),
+            deleteSession: () => unsupported("session/delete"),
+            listProviders: unsupported("provider/list"),
+            setProvider: () => unsupported("provider/set"),
+            disableProvider: () => unsupported("provider/disable"),
+            logout: unsupported("logout"),
+            prompt: (_payload, promptOptions) =>
+              Effect.gen(function* () {
+                if (promptOptions?.dispatched !== undefined) {
+                  yield* Deferred.succeed(promptOptions.dispatched, undefined);
+                }
+                yield* Deferred.succeed(promptStarted, undefined);
+                return yield* Deferred.await(promptGate);
+              }),
+            cancel: Effect.sync(() => {
+              cancelCount += 1;
+            }),
+            setMode: () => Effect.succeed({}),
+            setSessionModel: () => Effect.succeed({}),
+            setConfigOption: () => Effect.succeed({ configOptions: [] }),
+            setModel: () => Effect.void,
+            request: (method) => unsupported(method),
+            notify: () => Effect.void,
+          } satisfies RuntimeService);
+        },
+      }).pipe(Effect.provide(layerInjectedRuntimeCatalog));
+
+      const threadId = ThreadId.make(`thread-r3-cf01-${options.name}`);
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: options.runtimeMode,
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make(`provider-session-r3-cf01-${options.name}`),
+        modelSelection,
+        runtimePolicy,
+      });
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* session.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const now = yield* DateTime.now;
+      const makeTurn = (ordinal: number) =>
+        makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now, ordinal });
+      const awaitTurnTerminal = Effect.gen(function* () {
+        while (true) {
+          const event = yield* Queue.take(events);
+          if (event.type === "turn.terminal") return event;
+        }
+      });
+
+      return {
+        instanceId,
+        sessionId,
+        coordinator,
+        session,
+        providerThread,
+        events,
+        continuationOffered,
+        makeTurn,
+        awaitTurnTerminal,
+        emitUpdate: (update: EffectAcpSchema.SessionUpdate) =>
+          sessionUpdateHandler!({ sessionId, update }),
+        emitExtNotification: (method: string, params: Record<string, unknown>) =>
+          extNotificationHandlers.get(method)!({ sessionId, ...params }),
+        requestPermission: (toolCallId: string, requestId: string) =>
+          permissionHandler!(
+            {
+              sessionId,
+              toolCall: { toolCallId, kind: "execute", title: "Run shell command" },
+              options: [
+                { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+                { optionId: "deny", name: "Deny", kind: "reject_once" },
+              ],
+            },
+            { requestId, method: "session/request_permission" },
+          ).pipe(Effect.tap(() => onOutgoingResponse?.(requestId) ?? Effect.void)),
+        elicitUrl: (elicitationId: string, url: string, message: string, requestId: string) =>
+          elicitationHandler!(
+            {
+              sessionId,
+              mode: "url",
+              elicitationId,
+              url,
+              message,
+            },
+            { requestId, method: "elicitation/create" },
+          ).pipe(Effect.tap(() => onOutgoingResponse?.(requestId) ?? Effect.void)),
+        get promptStarted() {
+          return promptStarted;
+        },
+        get promptGate() {
+          return promptGate;
+        },
+        get cancelCount() {
+          return cancelCount;
+        },
+        get runtimeCreateCount() {
+          return runtimeCreateCount;
+        },
+        resetPrompt: Effect.gen(function* () {
+          promptStarted = yield* Deferred.make<void>();
+          promptGate = yield* Deferred.make<
+            EffectAcpSchema.PromptResponse,
+            EffectAcpErrors.AcpError
+          >();
+        }),
+      };
+    });
+
+    const layerCoordinatorTest = Layer.mergeAll(layerTest, AcpRegistryRuntimeCoordinator.layer);
+
+    it.effect(
+      "quarantines post-settle Stop on production Hermes before any wake or agent request arrives",
+      () =>
+        Effect.gen(function* () {
+          const harness = yield* makeProductionPostSettleStopHarness({
+            name: "hermes-pre-wake",
+            settings: { source: "local", commandPath: "hermes" },
+            runtimeMode: "full-access",
+          });
+
+          yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          const turn1Terminal = yield* harness.awaitTurnTerminal;
+          assert.equal(turn1Terminal.status, "completed");
+
+          // Stop reaches the settled session before any post-settle wake or agent request arrives.
+          yield* harness.session.interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Terminal.providerTurnId,
+            requestRuntimeRestart: true,
+          });
+          assert.equal(harness.cancelCount, 1);
+
+          // Post-Stop session/update must be quarantined (no continuation offered).
+          yield* harness.emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "post-stop hermes wake" },
+          });
+          assert.equal(yield* Queue.size(harness.continuationOffered), 0);
+
+          // Post-Stop session/request_permission must cancel even in full-access mode.
+          assert.deepEqual(
+            yield* harness.requestPermission("tool-after-stop", "req-perm-after-stop"),
+            { outcome: { outcome: "cancelled" } },
+          );
+          assert.equal(yield* Queue.size(harness.continuationOffered), 0);
+
+          // Post-Stop elicitation/create mode:'url' must cancel and never publish a URL auth prompt.
+          assert.deepEqual(
+            yield* harness.elicitUrl(
+              "elicit-hermes-after-stop",
+              "https://example.test/auth",
+              "Sign in after stop",
+              "req-hermes-url-after-stop",
+            ),
+            { action: "cancel" },
+          );
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+          assert.equal(yield* Queue.size(harness.continuationOffered), 0);
+
+          // Next explicit user turn restarts the runtime cleanly.
+          yield* harness.resetPrompt;
+          yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          assert.equal(harness.runtimeCreateCount, 2);
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          assert.equal((yield* harness.awaitTurnTerminal).status, "completed");
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+
+    it.effect(
+      "quarantines post-settle Stop on production GitHub Copilot CLI with carryover subagents and in-flight continuation offers",
+      () =>
+        Effect.gen(function* () {
+          // 1. Carryover background subagent + post-Stop updates, permission, URL elicitation, and restart.
+          const carryoverHarness = yield* makeProductionPostSettleStopHarness({
+            name: "copilot-carryover",
+            settings: { agentId: "github-copilot-cli" },
+            runtimeMode: "full-access",
+          });
+
+          yield* carryoverHarness.session
+            .startTurn(carryoverHarness.makeTurn(1))
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(carryoverHarness.promptStarted);
+          yield* carryoverHarness.emitUpdate({
+            sessionUpdate: "tool_call",
+            toolCallId: "copilot-bg-subagent-1",
+            kind: "other",
+            title: "Explore repository",
+            status: "in_progress",
+            rawInput: {
+              agent_type: "explore",
+              prompt: "Inspect repo in background",
+              mode: "background",
+            },
+          });
+          yield* Deferred.succeed(carryoverHarness.promptGate, { stopReason: "end_turn" });
+          const turn1Terminal = yield* carryoverHarness.awaitTurnTerminal;
+          assert.equal(turn1Terminal.status, "completed");
+          assert.isTrue(yield* carryoverHarness.session.hasPendingBackgroundWork!);
+
+          yield* carryoverHarness.session.interruptTurn({
+            providerThread: carryoverHarness.providerThread,
+            providerTurnId: turn1Terminal.providerTurnId,
+            requestRuntimeRestart: true,
+          });
+          assert.equal(carryoverHarness.cancelCount, 1);
+          assert.isFalse(yield* carryoverHarness.session.hasPendingBackgroundWork!);
+          const afterStopEvents = yield* Queue.takeAll(carryoverHarness.events);
+          assert.isDefined(
+            afterStopEvents.find(
+              (event) =>
+                event.type === "subagent.updated" && event.subagent.status === "interrupted",
+            ),
+          );
+
+          // Post-Stop Copilot sessionEvent + session/update must not offer a continuation.
+          yield* carryoverHarness.emitExtNotification("github.com/copilot/sessionEvent", {
+            type: "assistant.turn_start",
+            data: {},
+          });
+          yield* carryoverHarness.emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "post-stop copilot wake" },
+          });
+          assert.equal(yield* Queue.size(carryoverHarness.continuationOffered), 0);
+
+          // Post-Stop permission and URL elicitation must be cancelled without prompting.
+          assert.deepEqual(
+            yield* carryoverHarness.requestPermission(
+              "copilot-tool-after-stop",
+              "req-copilot-perm-after-stop",
+            ),
+            { outcome: { outcome: "cancelled" } },
+          );
+          assert.deepEqual(
+            yield* carryoverHarness.elicitUrl(
+              "elicit-copilot-after-stop",
+              "https://example.test/copilot-auth",
+              "Copilot sign in after stop",
+              "req-copilot-url-after-stop",
+            ),
+            { action: "cancel" },
+          );
+          assert.isTrue(
+            Option.isNone(
+              yield* carryoverHarness.coordinator.getUrlAuthAction(carryoverHarness.instanceId),
+            ),
+          );
+
+          // Next explicit user turn restarts the runtime cleanly.
+          yield* carryoverHarness.resetPrompt;
+          yield* carryoverHarness.session
+            .startTurn(carryoverHarness.makeTurn(2))
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(carryoverHarness.promptStarted);
+          assert.equal(carryoverHarness.runtimeCreateCount, 2);
+          yield* Deferred.succeed(carryoverHarness.promptGate, { stopReason: "end_turn" });
+          assert.equal((yield* carryoverHarness.awaitTurnTerminal).status, "completed");
+
+          // 2. An already in-flight Copilot continuation offer created before Stop must be invalidated.
+          const inflightHarness = yield* makeProductionPostSettleStopHarness({
+            name: "copilot-inflight-offer",
+            settings: { agentId: "github-copilot-cli" },
+            runtimeMode: "full-access",
+          });
+          yield* inflightHarness.session
+            .startTurn(inflightHarness.makeTurn(1))
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(inflightHarness.promptStarted);
+          yield* Deferred.succeed(inflightHarness.promptGate, { stopReason: "end_turn" });
+          const inflightTurn1 = yield* inflightHarness.awaitTurnTerminal;
+
+          yield* inflightHarness.emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "in-flight copilot wake before stop" },
+          });
+          const offeredBeforeStop = yield* Queue.take(inflightHarness.continuationOffered);
+
+          yield* inflightHarness.session.interruptTurn({
+            providerThread: inflightHarness.providerThread,
+            providerTurnId: inflightTurn1.providerTurnId,
+            requestRuntimeRestart: true,
+          });
+          assert.equal(inflightHarness.cancelCount, 1);
+
+          let dispatchedAfterStop = false;
+          const allowedAfterStop = yield* offeredBeforeStop.dispatchIfCurrent!(
+            Effect.sync(() => {
+              dispatchedAfterStop = true;
+            }),
+          );
+          assert.isTrue(Option.isNone(allowedAfterStop));
+          assert.isFalse(dispatchedAfterStop);
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+  });
 });

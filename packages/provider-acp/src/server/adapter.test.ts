@@ -85,6 +85,7 @@ const makeHarness = Effect.fnUntraced(function* (options: {
   readonly deferFinalizeForBackgroundWork?: boolean;
   readonly detachOpenBackgroundCommandsOnSettle?: boolean;
   readonly isBackgroundCommandTool?: AcpAdapterV2Flavor["isBackgroundCommandTool"];
+  readonly extractSubagentUpdate?: AcpAdapterV2Flavor["extractSubagentUpdate"];
   readonly cancelEffect?: Effect.Effect<void, EffectAcpErrors.AcpError>;
   readonly cancelResolvesPrompt?: boolean;
   readonly loadSession?: boolean;
@@ -279,6 +280,9 @@ const makeHarness = Effect.fnUntraced(function* (options: {
       ...(options.isBackgroundCommandTool === undefined
         ? {}
         : { isBackgroundCommandTool: options.isBackgroundCommandTool }),
+      ...(options.extractSubagentUpdate === undefined
+        ? {}
+        : { extractSubagentUpdate: options.extractSubagentUpdate }),
       ...(options.restartRuntimeAfterInterrupt === undefined
         ? {}
         : { restartRuntimeAfterInterrupt: options.restartRuntimeAfterInterrupt }),
@@ -2209,5 +2213,113 @@ describe("AcpAdapterV2 URL elicitation admission and permit release (R2-CF-02)",
         ),
       );
     }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "terminalizes carryover subagents when post-settle Stop hits stopPostSettleContinuation",
+    () =>
+      Effect.gen(function* () {
+        let urlCalls = 0;
+        const harness = yield* makeHarness({
+          name: "r3-cf01-stop-post-settle-continuation-carryover",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+          loadSession: true,
+          extractSubagentUpdate: (tool) => {
+            const rawInput = tool.data.rawInput as Record<string, unknown> | undefined;
+            if (typeof rawInput?.prompt !== "string") return undefined;
+            return {
+              nativeTaskId: tool.toolCallId,
+              childSessionId: `child:${tool.toolCallId}`,
+              prompt: rawInput.prompt,
+              title: tool.title ?? "Subagent",
+              model: null,
+              status: tool.status === "failed" ? "failed" : "running",
+              result: null,
+              suppressNormalTool: true,
+            };
+          },
+          onUrlElicitation: () =>
+            Effect.sync(() => {
+              urlCalls += 1;
+              return true;
+            }),
+        });
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        // Launch a background subagent during Turn 1 that outlives Turn 1 settlement
+        // (an idle refusal settles the turn while preserving carryoverSubagents).
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call",
+          toolCallId: "subagent-carryover-1",
+          kind: "other",
+          title: "Background subagent",
+          status: "in_progress",
+          rawInput: { prompt: "Check logs in background" },
+        });
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "refusal" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1 events
+        }
+        assert.isTrue(yield* harness.session.hasPendingBackgroundWork!);
+
+        // Post-settle update triggers continuationRequested = true (so Stop hits stopPostSettleContinuation).
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Background wake before Stop" },
+        });
+        const offeredBeforeStop = yield* Queue.take(harness.continuationOffered);
+
+        // User clicks Stop while post-settle continuation is pending and carryover subagent is live.
+        yield* harness.session.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn1Id,
+          requestRuntimeRestart: true,
+        });
+
+        assert.isTrue(yield* Deferred.isDone(harness.cancelCalled));
+        assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+
+        const drained = yield* Queue.takeAll(harness.events);
+        const interruptedSubagent = drained.find(
+          (event) => event.type === "subagent.updated" && event.subagent.status === "interrupted",
+        );
+        assert.isDefined(interruptedSubagent);
+
+        let dispatchedBeforeStop = false;
+        const allowed = yield* offeredBeforeStop.dispatchIfCurrent!(
+          Effect.sync(() => {
+            dispatchedBeforeStop = true;
+          }),
+        );
+        assert.isTrue(Option.isNone(allowed));
+        assert.isFalse(dispatchedBeforeStop);
+
+        // Post-Stop updates, permission requests, and URL elicitations must all be quarantined.
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Late post-stop wake" },
+        });
+        assert.equal(yield* Queue.size(harness.continuationOffered), 0);
+        assert.deepEqual(yield* harness.requestPermission("perm-after-stop"), {
+          outcome: { outcome: "cancelled" },
+        });
+        assert.deepEqual(yield* harness.elicitUrl("url-after-stop"), { action: "cancel" });
+        assert.equal(urlCalls, 0);
+
+        // Subsequent explicit user turn restarts the runtime cleanly.
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2));
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2 events
+        }
+      }).pipe(Effect.provide(layerTest)),
   );
 });

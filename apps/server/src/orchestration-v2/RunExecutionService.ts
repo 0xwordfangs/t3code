@@ -1907,6 +1907,7 @@ export const layer: Layer.Layer<
                   input.session.interruptTurn({
                     providerThread,
                     providerTurnId: startedRootTurn.id,
+                    requestRuntimeRestart: true,
                   }),
                 ),
                 Effect.catchCauseIf(

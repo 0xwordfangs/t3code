@@ -10946,9 +10946,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                               ) {
                                 return false;
                               }
+                              const carryover = yield* Ref.get(carryoverSubagents);
                               yield* quarantineStoppedRun();
                               yield* cancelPendingRuntimeRequests();
                               agentRequests.clear();
+                              yield* terminalizeCarryoverSubagents(carryover);
                               yield* Ref.set(runtimeRestartRequired, true);
                               return true;
                             }),
@@ -10980,9 +10982,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         if (stopPostSettleBackgroundWork) {
                           yield* runtimeCallbackPermit.withPermit(
                             Effect.gen(function* () {
+                              const carryover = yield* Ref.get(carryoverSubagents);
                               yield* terminalizeDetachedBackgroundCommands("interrupted");
                               yield* quarantineStoppedRun();
                               yield* cancelPendingRuntimeRequests();
+                              yield* terminalizeCarryoverSubagents(carryover);
                               yield* Ref.set(runtimeRestartRequired, true);
                             }),
                           );
@@ -11058,8 +11062,26 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           yield* Ref.set(runtimeTeardownState, { _tag: "Idle" });
                           yield* Deferred.succeed(teardownBarrier, undefined).pipe(Effect.ignore);
                         } else if (context === null && turnInput.requestRuntimeRestart === true) {
-                          yield* Effect.sync(clientPolicyGrants.reset);
-                          yield* cancelPendingUrlElicitations;
+                          yield* runtimeCallbackPermit.withPermit(
+                            Effect.gen(function* () {
+                              const carryover = yield* Ref.get(carryoverSubagents);
+                              yield* quarantineStoppedRun();
+                              yield* cancelPendingRuntimeRequests();
+                              agentRequests.clear();
+                              yield* terminalizeCarryoverSubagents(carryover);
+                              if (
+                                postSettleContinuationEnabled ||
+                                flavor.restartRuntimeAfterInterrupt === true
+                              ) {
+                                yield* Ref.set(runtimeRestartRequired, true);
+                              }
+                            }),
+                          );
+                          if (postSettleContinuationEnabled) {
+                            yield* restore(
+                              runtime.cancel.pipe(Effect.timeoutOption("1 second"), Effect.ignore),
+                            );
+                          }
                           yield* clientTerminals?.disposeAll ?? Effect.void;
                         }
                         return undefined;
