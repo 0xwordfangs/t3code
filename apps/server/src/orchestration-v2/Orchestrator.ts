@@ -8084,9 +8084,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .map((candidate) => candidate.queuePosition ?? candidate.ordinal),
           ) + 1;
       }
+      let effectiveBasePinned: boolean | undefined = projection.thread.antigravityFailoverPinned;
+      if (inheritedQueueTail !== undefined) {
+        let effectiveInstanceId = projection.thread.providerInstanceId;
+        for (const queuedRun of queuedRunsInDeliveryOrder(projection)) {
+          if (
+            followsCurrentConversation(
+              projection.messages.find((message) => message.id === queuedRun.userMessageId),
+            )
+          ) {
+            continue;
+          }
+          effectiveBasePinned =
+            queuedRun.antigravityFailoverPinned === true ||
+            (queuedRun.antigravityFailoverPinned === undefined &&
+              effectiveBasePinned === true &&
+              queuedRun.modelSelection.instanceId === effectiveInstanceId)
+              ? true
+              : queuedRun.antigravityFailoverPinned === false
+                ? false
+                : undefined;
+          effectiveInstanceId = queuedRun.modelSelection.instanceId;
+          if (queuedRun.id === inheritedQueueTail.id) break;
+        }
+      }
       const explicitQueuedUnpin =
         command.antigravityFailoverPinned === false ||
-        (command.modelSelection !== undefined &&
+        (effectiveBasePinned === false && antigravityFailoverPinned !== true) ||
+        (effectiveBasePinned === true &&
+          command.modelSelection !== undefined &&
           !modelSelectionsEqual(baseSelection, command.modelSelection) &&
           antigravityFailoverPinned !== true);
       const run: OrchestrationV2Run = {
@@ -15123,9 +15149,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ) {
         return;
       }
+      const childRunStillMatches = () =>
+        projectionStore.getThreadRecords(childThreadId, ["runs"]).pipe(
+          Effect.map(({ runs }) => {
+            const refreshedRun = runs.find((candidate) => candidate.id === childRun.id);
+            return (
+              runs.length === childControls.runs.length &&
+              refreshedRun !== undefined &&
+              refreshedRun.status === childRun.status &&
+              refreshedRun.activeAttemptId === childRun.activeAttemptId
+            );
+          }),
+        );
       if (options.task.cancelledRunId !== childRun.id) {
         const failoverState = yield* inspectAntigravityFailoverState(childThreadId, childRun);
         if (failoverState === "pending" || failoverState === "superseded") {
+          return;
+        }
+        if (!(yield* childRunStillMatches())) {
           return;
         }
       }
@@ -15313,6 +15354,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           payload: resultTransfer,
         },
       ];
+      if (!(yield* childRunStillMatches())) {
+        return;
+      }
       yield* writeSystemEvents(completionEvents, [], { updateDelegatedCompletionOnly: true });
       yield* releaseFinishedDelegateSessions(childThreadId, childRun.id);
 
@@ -15417,7 +15461,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         request.responseCapability.type === "message",
     );
     if (pendingQuestions.length === 0) return;
-    const { nodes } = yield* projectionStore.getThreadRecords(childThreadId, ["nodes"]);
+    const { nodes, runs: latestChildRuns } = yield* projectionStore.getThreadRecords(
+      childThreadId,
+      ["nodes", "runs"],
+    );
+    const refreshedResultRun = latestChildRuns.find((candidate) => candidate.id === resultRun.id);
+    if (
+      latestChildRuns.length !== childControls.runs.length ||
+      refreshedResultRun === undefined ||
+      refreshedResultRun.status !== resultRun.status ||
+      refreshedResultRun.activeAttemptId !== resultRun.activeAttemptId
+    ) {
+      return;
+    }
     const resultRunIds = new Set<RunId>();
     let run: OrchestrationV2Run | undefined = resultRun;
     while (run !== undefined && !resultRunIds.has(run.id)) {
@@ -16560,8 +16616,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (run.status !== "failed") return "settled";
       if (run.antigravityFailoverPinned === true) return "settled";
       const requestedKey = failoverAttemptKey(run);
-      const committing = committingAntigravityFailoverAttempts.has(requestedKey);
-      const projection = yield* projectionStore
+      const committingBeforeRead = committingAntigravityFailoverAttempts.has(requestedKey);
+      const projectionResult = yield* projectionStore
         .getThreadRecords(
           threadId,
           [
@@ -16577,15 +16633,63 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             turnItemRunIds: [run.id],
           },
         )
-        .pipe(Effect.orElseSucceed(() => null));
-      if (projection === null) return "settled";
+        .pipe(
+          Effect.map((value) => ({ _tag: "ok" as const, value })),
+          Effect.catchTags({
+            ProjectionStoreThreadNotFoundError: () =>
+              Effect.succeed({ _tag: "not_found" as const }),
+          }),
+          Effect.orElseSucceed(() => ({ _tag: "read_error" as const })),
+        );
+      if (projectionResult._tag === "not_found") return "settled";
+      if (projectionResult._tag === "read_error") return "pending";
+      const projection = projectionResult.value;
       const liveRun = projection.runs.find((candidate) => candidate.id === run.id);
       if (liveRun === undefined) return "settled";
       if (liveRun.status !== "failed" || liveRun.activeAttemptId !== run.activeAttemptId) {
         return "superseded";
       }
-      if (!committing && options?.ignorePendingStop !== true && pendingStopThreads.has(threadId)) {
-        return "settled";
+      const key = failoverAttemptKey(liveRun);
+      const committingNow = committingBeforeRead || committingAntigravityFailoverAttempts.has(key);
+      // An unlocked WAL read can capture a pre-commit Attempt 1 snapshot while failover
+      // selects/commits Attempt 2 and clears its in-memory tracking sets before this fiber resumes.
+      const recheckSupersededInStore = (checkOptions?: {
+        readonly includeSelected?: boolean;
+      }): Effect.Effect<"pending" | "superseded" | "settled"> => {
+        const hasLiveCommitOrSelection = () =>
+          committingAntigravityFailoverAttempts.has(key) ||
+          (checkOptions?.includeSelected !== false &&
+            selectedAntigravityFailoverAttempts.has(key) &&
+            !(options?.ignorePendingStop !== true && pendingStopThreads.has(threadId)));
+        if (hasLiveCommitOrSelection()) {
+          return Effect.succeed("pending" as const);
+        }
+        return projectionStore.getThreadRecords(threadId, ["runs"]).pipe(
+          Effect.map((latest) => {
+            const latestRun = latest.runs.find((candidate) => candidate.id === run.id);
+            if (
+              latestRun !== undefined &&
+              (latestRun.status !== "failed" || latestRun.activeAttemptId !== run.activeAttemptId)
+            ) {
+              return "superseded" as const;
+            }
+            if (hasLiveCommitOrSelection()) {
+              return "pending" as const;
+            }
+            return "settled" as const;
+          }),
+          Effect.catchTags({
+            ProjectionStoreThreadNotFoundError: () => Effect.succeed("settled" as const),
+          }),
+          Effect.orElseSucceed(() => "pending" as const),
+        );
+      };
+      if (
+        !committingNow &&
+        options?.ignorePendingStop !== true &&
+        pendingStopThreads.has(threadId)
+      ) {
+        return yield* recheckSupersededInStore({ includeSelected: false });
       }
       if (
         projection.thread.antigravityFailoverPinned === true ||
@@ -16596,16 +16700,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         latestExecutedRun(projection.runs)?.id !== run.id ||
         projection.runtimeRequests.some((request) => request.status === "pending")
       ) {
-        return "settled";
+        return yield* recheckSupersededInStore();
       }
       if (projection.turnItems.some((item) => item.type === "run_interrupt_request")) {
         return "settled";
       }
-      const key = failoverAttemptKey(liveRun);
-      if (
-        committingAntigravityFailoverAttempts.has(key) ||
-        selectedAntigravityFailoverAttempts.has(key)
-      ) {
+      if (committingNow || selectedAntigravityFailoverAttempts.has(key)) {
         return "pending";
       }
       if (
@@ -16618,7 +16718,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         activeAntigravityFailoverAttempts.has(key) ||
         (pendingAntigravityFailoverAttempts.get(key) ?? 0) > 0;
       if (!inFlight && !(yield* hasUnconsumedFailedRunUpdate(threadId, liveRun))) {
-        return "settled";
+        return yield* recheckSupersededInStore();
       }
       if (!(yield* antigravityFailover.isAntigravityInstance(liveRun.providerInstanceId))) {
         return "settled";
@@ -16633,7 +16733,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       for (const session of currentSessions) {
         if (yield* sessionHasBackgroundWork(session, projection.providerThreads)) {
-          return "settled";
+          return yield* recheckSupersededInStore();
         }
       }
       const excluded = new Set<ProviderInstanceId>([
@@ -16648,7 +16748,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           selection: liveRun.modelSelection,
           triedInstanceIds: excluded,
         });
-        if (candidate === null) return "settled";
+        if (candidate === null) return yield* recheckSupersededInStore();
         const adapterExit = yield* Effect.exit(
           providerAdapters.get(candidate.modelSelection.instanceId),
         );
