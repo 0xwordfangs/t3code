@@ -19,6 +19,7 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -91,11 +92,15 @@ const makeHarness = Effect.fnUntraced(function* (options: {
   readonly loadSession?: boolean;
   readonly canReadThreadSnapshot?: boolean;
   readonly restartRuntimeAfterInterrupt?: boolean;
+  readonly restartRuntimeOnEveryInterrupt?: boolean;
   readonly clientFileSystem?: AcpAdapterV2Flavor["clientFileSystem"];
   readonly clientTerminals?: {
     readonly environment?: NodeJS.ProcessEnv;
     readonly shellCommands?: boolean;
+    readonly linuxCgroupController?: AcpSessionRuntime.AcpLinuxCgroupController | null;
   };
+  readonly onRuntimeScopeClose?: (runtimeNumber: number) => void;
+  readonly onRuntimeCreate?: (runtimeNumber: number) => void;
   readonly loadSessionStarted?: Deferred.Deferred<void>;
   readonly loadSessionGate?: Deferred.Deferred<void>;
   readonly loadSessionError?: EffectAcpErrors.AcpError;
@@ -119,6 +124,11 @@ const makeHarness = Effect.fnUntraced(function* (options: {
     | Parameters<RuntimeService["handleTerminalWaitForExit"]>[0]
     | undefined;
   let onOutgoingResponse: ((requestId: string) => Effect.Effect<void>) | undefined;
+  let onTermination:
+    | Parameters<
+        Parameters<typeof makeAcpAdapterV2>[0]["flavor"]["makeRuntime"]
+      >[0]["onTermination"]
+    | undefined;
   let promptStarted = yield* Deferred.make<void>();
   let promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>();
   let cancelCalled = yield* Deferred.make<void>();
@@ -141,7 +151,10 @@ const makeHarness = Effect.fnUntraced(function* (options: {
     runtimeInput: Parameters<Parameters<typeof makeAcpAdapterV2>[0]["flavor"]["makeRuntime"]>[0],
   ) => {
     runtimeCreateCount += 1;
+    const runtimeNumber = runtimeCreateCount;
+    options.onRuntimeCreate?.(runtimeNumber);
     onOutgoingResponse = runtimeInput.onOutgoingResponse;
+    onTermination = runtimeInput.onTermination;
     const unsupported = (method: string) =>
       Effect.fail(EffectAcpErrors.AcpRequestError.methodNotFound(method));
     return Effect.acquireRelease(
@@ -246,6 +259,7 @@ const makeHarness = Effect.fnUntraced(function* (options: {
       () =>
         Effect.sync(() => {
           runtimeScopeCloseCount += 1;
+          options.onRuntimeScopeClose?.(runtimeNumber);
         }),
     );
   };
@@ -286,6 +300,9 @@ const makeHarness = Effect.fnUntraced(function* (options: {
       ...(options.restartRuntimeAfterInterrupt === undefined
         ? {}
         : { restartRuntimeAfterInterrupt: options.restartRuntimeAfterInterrupt }),
+      ...(options.restartRuntimeOnEveryInterrupt === undefined
+        ? {}
+        : { restartRuntimeOnEveryInterrupt: options.restartRuntimeOnEveryInterrupt }),
       ...(options.clientFileSystem === undefined
         ? {}
         : { clientFileSystem: options.clientFileSystem }),
@@ -551,6 +568,9 @@ const makeHarness = Effect.fnUntraced(function* (options: {
     },
     get createTerminalHandler() {
       return createTerminalHandler;
+    },
+    get onTermination() {
+      return onTermination;
     },
     emitUpdate: (update: EffectAcpSchema.SessionUpdate) =>
       sessionUpdateHandler!({ sessionId, update }),
@@ -2767,6 +2787,409 @@ describe("AcpAdapterV2 active-turn Stop runtime restart for post-settle continua
           }
         }
         assert.isTrue(sawTurn1Interrupted);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+});
+
+describe("AcpAdapterV2 client terminal lifecycle fencing and atomic orphan handoff (R4-CF-11)", () => {
+  it.effect(
+    "releases an orphaned terminal when handleCreateTerminal is interrupted during create()'s post-spawn uninterruptible region",
+    () =>
+      Effect.gen(function* () {
+        const spawnEnteredUninterruptible = yield* Deferred.make<void>();
+        const interruptDelivered = yield* Deferred.make<void>();
+        const terminatedUnits: Array<string> = [];
+        let childDisposedCount = 0;
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.uninterruptible(
+              Effect.gen(function* () {
+                const exitDeferred = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+                const handle = ChildProcessSpawner.makeHandle({
+                  pid: ChildProcessSpawner.ProcessId(1),
+                  exitCode: Deferred.await(exitDeferred),
+                  isRunning: Deferred.isDone(exitDeferred).pipe(Effect.map((done) => !done)),
+                  kill: () =>
+                    Deferred.succeed(exitDeferred, ChildProcessSpawner.ExitCode(143)).pipe(
+                      Effect.asVoid,
+                    ),
+                  stdin: Sink.drain,
+                  stdout: Stream.empty,
+                  stderr: Stream.empty,
+                  all: Stream.empty,
+                  getInputFd: () => Sink.drain,
+                  getOutputFd: () => Stream.empty,
+                  unref: Effect.succeed(Effect.void),
+                });
+                yield* Effect.addFinalizer(() =>
+                  Effect.sync(() => {
+                    childDisposedCount += 1;
+                  }).pipe(
+                    Effect.andThen(
+                      Deferred.succeed(exitDeferred, ChildProcessSpawner.ExitCode(143)).pipe(
+                        Effect.ignore,
+                      ),
+                    ),
+                  ),
+                );
+                // Hold until the test delivers an interrupt while this fiber is uninterruptible,
+                // then return the live handle so create()'s post-spawn uninterruptibleMask registers
+                // the terminal and invokes onCreated before the interrupt fires at the exit boundary.
+                yield* Deferred.succeed(spawnEnteredUninterruptible, undefined);
+                yield* Deferred.await(interruptDelivered);
+                return handle;
+              }),
+            ),
+          ),
+        );
+
+        let nextUnit = 1;
+        const scopeLayer = Layer.succeed(AgentScope, {
+          ...AgentScope.defaultValue(),
+          wrap: ({ command, args, name }) =>
+            Effect.sync(() => {
+              const unit = `t3code-${name}-${nextUnit}.scope`;
+              nextUnit += 1;
+              return { command, args, unit };
+            }),
+          terminateUnit: (unit) =>
+            Effect.sync(() => {
+              terminatedUnits.push(unit);
+            }),
+        });
+
+        const harness = yield* makeHarness({
+          name: "r4-cf11-atomic-orphan-handoff",
+          runtimeMode: "full-access",
+          clientTerminals: { linuxCgroupController: null },
+        }).pipe(Effect.provide(Layer.merge(spawnerLayer, scopeLayer)));
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        const createFiber = yield* harness.createTerminal(process.execPath).pipe(Effect.forkScoped);
+        yield* Deferred.await(spawnEnteredUninterruptible);
+
+        // Queue interruption (simulating Scope.close(runtimeScope)) before create() finishes registering.
+        const interruptWaiter = yield* Fiber.interrupt(createFiber).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(interruptDelivered, undefined);
+        yield* Fiber.join(interruptWaiter);
+
+        // Outer Effect.onExit must have released the terminal atomically via onCreated.
+        assert.equal(childDisposedCount, 1);
+        assert.deepEqual(terminatedUnits, ["t3code-acp-terminal-1.scope"]);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("closes runtimeScope before disposing client terminals in restartAcpRuntime", () =>
+    Effect.gen(function* () {
+      const order: Array<string> = [];
+      const spawnerLayer = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() =>
+          Effect.gen(function* () {
+            const exitDeferred = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+            const handle = ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(1),
+              exitCode: Deferred.await(exitDeferred),
+              isRunning: Deferred.isDone(exitDeferred).pipe(Effect.map((done) => !done)),
+              kill: () =>
+                Deferred.succeed(exitDeferred, ChildProcessSpawner.ExitCode(143)).pipe(
+                  Effect.asVoid,
+                ),
+              stdin: Sink.drain,
+              stdout: Stream.empty,
+              stderr: Stream.empty,
+              all: Stream.empty,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+              unref: Effect.succeed(Effect.void),
+            });
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                order.push("terminal.dispose");
+              }).pipe(
+                Effect.andThen(
+                  Deferred.succeed(exitDeferred, ChildProcessSpawner.ExitCode(143)).pipe(
+                    Effect.ignore,
+                  ),
+                ),
+              ),
+            );
+            return handle;
+          }),
+        ),
+      );
+
+      const harness = yield* makeHarness({
+        name: "r4-cf11-restart-order",
+        runtimeMode: "full-access",
+        loadSession: true,
+        cancelResolvesPrompt: true,
+        restartRuntimeAfterInterrupt: true,
+        restartRuntimeOnEveryInterrupt: true,
+        clientTerminals: { linuxCgroupController: null },
+        onRuntimeCreate: (runtimeNumber) => {
+          if (runtimeNumber > 1) {
+            order.push(`runtime.spawn.${runtimeNumber}`);
+          }
+        },
+        onRuntimeScopeClose: (runtimeNumber) => {
+          order.push(`runtimeScope.close.${runtimeNumber}`);
+        },
+      }).pipe(Effect.provide(spawnerLayer));
+
+      yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+      yield* Deferred.await(harness.promptStarted);
+      const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+      // Spawn a live client terminal during Turn 1.
+      yield* harness.createTerminal("still-running");
+
+      // Soft interrupt with restartRuntimeOnEveryInterrupt + restartRuntimeAfterInterrupt marks
+      // runtimeRestartRequired without disposing terminals yet, so restartAcpRuntime performs teardown.
+      yield* harness.session.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: turn1Id,
+      });
+      while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+        // drain Turn 1
+      }
+      assert.deepEqual(order, []);
+
+      // Next turn triggers restartAcpRuntime: runtimeScope.close MUST precede terminal.dispose and spawn.
+      yield* harness.resetPrompt;
+      yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+      yield* Deferred.await(harness.promptStarted);
+      assert.deepEqual(order, ["runtimeScope.close.1", "terminal.dispose", "runtime.spawn.2"]);
+      assert.equal(harness.runtimeScopeCloseCount, 1);
+
+      yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+      while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+        // drain Turn 2
+      }
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "disposes live client terminals on unplanned runtime termination without holding runtimeCallbackPermit",
+    () =>
+      Effect.gen(function* () {
+        const disposeStarted = yield* Deferred.make<void>();
+        const allowTerminalExit = yield* Deferred.make<void>();
+        let childDisposedCount = 0;
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.gen(function* () {
+              const exitDeferred = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+              const handle = ChildProcessSpawner.makeHandle({
+                pid: ChildProcessSpawner.ProcessId(1),
+                exitCode: Deferred.await(exitDeferred),
+                isRunning: Deferred.isDone(exitDeferred).pipe(Effect.map((done) => !done)),
+                kill: () => Effect.void,
+                stdin: Sink.drain,
+                stdout: Stream.empty,
+                stderr: Stream.empty,
+                all: Stream.empty,
+                getInputFd: () => Sink.drain,
+                getOutputFd: () => Stream.empty,
+                unref: Effect.succeed(Effect.void),
+              });
+              yield* Effect.addFinalizer(() =>
+                Effect.gen(function* () {
+                  childDisposedCount += 1;
+                  yield* Deferred.succeed(disposeStarted, undefined);
+                  yield* Deferred.await(allowTerminalExit);
+                  yield* Deferred.succeed(exitDeferred, ChildProcessSpawner.ExitCode(143)).pipe(
+                    Effect.ignore,
+                  );
+                }),
+              );
+              return handle;
+            }),
+          ),
+        );
+
+        const harness = yield* makeHarness({
+          name: "r4-cf11-unplanned-termination-dispose",
+          runtimeMode: "full-access",
+          loadSession: true,
+          clientTerminals: { linuxCgroupController: null },
+        }).pipe(Effect.provide(spawnerLayer));
+
+        const runtime1Termination = harness.onTermination!;
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const created = yield* harness.createTerminal("crash-orphan");
+        assert.equal(childDisposedCount, 0);
+
+        // Trigger unplanned termination in the background; wait until disposeAll begins disposing the child.
+        const termFiber = yield* runtime1Termination(
+          EffectAcpErrors.AcpRequestError.internalError("agent process crashed"),
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(disposeStarted);
+
+        // While disposeAll is suspended waiting for child exit, runtimeCallbackPermit MUST NOT be held,
+        // so a concurrent callback acquiring runtimeCallbackPermit (emitUpdate) completes immediately.
+        const updateFiber = yield* harness
+          .emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "permit-is-free" },
+          })
+          .pipe(Effect.forkScoped);
+        yield* Fiber.join(updateFiber);
+
+        yield* Deferred.succeed(allowTerminalExit, undefined);
+        yield* Fiber.join(termFiber);
+        assert.equal(childDisposedCount, 1);
+
+        // Released terminal handle is now rejected.
+        const outputExit = yield* harness.terminalOutput(created.terminalId).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(outputExit));
+
+        // Finish Turn 1 and start Turn 2 (which restarts onto Runtime #2).
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+
+        // Create a live terminal on Runtime #2 and verify a late stale Runtime #1 onTermination does NOT dispose it.
+        const runtime2Terminal = yield* harness.createTerminal("fresh-runtime-2");
+        yield* runtime1Termination(
+          EffectAcpErrors.AcpRequestError.internalError("late stale runtime 1 exit"),
+        );
+        assert.equal(childDisposedCount, 1);
+        const stillAlive = yield* harness.terminalOutput(runtime2Terminal.terminalId);
+        assert.equal(stillAlive.output, "");
+
+        // Clean up Turn 2.
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "rejects in-flight terminal/create once unplanned termination sets runtimeRestartRequired and does not let delayed generation-1 disposal kill generation-2 terminals",
+    () =>
+      Effect.gen(function* () {
+        const spawnEntered = yield* Deferred.make<void>();
+        const releaseSpawn = yield* Deferred.make<void>();
+        let spawnCount = 0;
+        const disposedIds: Array<number> = [];
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.gen(function* () {
+              const id = (spawnCount += 1);
+              if (id === 1) {
+                yield* Deferred.succeed(spawnEntered, undefined);
+                yield* Deferred.await(releaseSpawn);
+              }
+              const exitDeferred = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+              const handle = ChildProcessSpawner.makeHandle({
+                pid: ChildProcessSpawner.ProcessId(id),
+                exitCode: Deferred.await(exitDeferred),
+                isRunning: Deferred.isDone(exitDeferred).pipe(Effect.map((done) => !done)),
+                kill: () => Effect.void,
+                stdin: Sink.drain,
+                stdout: Stream.empty,
+                stderr: Stream.empty,
+                all: Stream.empty,
+                getInputFd: () => Sink.drain,
+                getOutputFd: () => Stream.empty,
+                unref: Effect.succeed(Effect.void),
+              });
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  disposedIds.push(id);
+                }).pipe(
+                  Effect.andThen(
+                    Deferred.succeed(exitDeferred, ChildProcessSpawner.ExitCode(143)).pipe(
+                      Effect.ignore,
+                    ),
+                  ),
+                ),
+              );
+              return handle;
+            }),
+          ),
+        );
+
+        const harness = yield* makeHarness({
+          name: "r4-cf11-termination-race-and-generation-scoping",
+          runtimeMode: "full-access",
+          loadSession: true,
+          clientTerminals: { linuxCgroupController: null },
+        }).pipe(Effect.provide(spawnerLayer));
+
+        const runtime1Termination = harness.onTermination!;
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+
+        // Start a terminal/create on Runtime #1 and pause it inside spawner.spawn.
+        const inFlightCreate = yield* harness
+          .createTerminal("in-flight-on-crash")
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(spawnEntered);
+
+        // Runtime #1 crashes while terminal/create #1 is suspended in spawner.spawn.
+        const termFiber = yield* runtime1Termination(
+          EffectAcpErrors.AcpRequestError.internalError("crash mid-create"),
+        ).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+
+        // A brand-new terminal/create arriving after runtimeRestartRequired=true is rejected immediately.
+        const lateCreateExit = yield* harness.createTerminal("late-after-crash").pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(lateCreateExit));
+        assert.equal(spawnCount, 1);
+
+        // Release spawn #1: post-create admission MUST reject because runtimeRestartRequired=true
+        // and releaseOrphan + disposeGeneration(1) MUST dispose terminal #1.
+        yield* Deferred.succeed(releaseSpawn, undefined);
+        const inFlightExit = yield* Fiber.join(inFlightCreate);
+        yield* Fiber.join(termFiber);
+        assert.isTrue(Exit.isFailure(inFlightExit));
+        assert.deepEqual(disposedIds, [1]);
+
+        // Finish Turn 1, start Turn 2 (Runtime #2), and verify Runtime #2's terminal stays alive.
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+
+        const runtime2Term = yield* harness.createTerminal("runtime-2-live");
+        assert.equal(spawnCount, 2);
+        const out = yield* harness.terminalOutput(runtime2Term.terminalId);
+        assert.equal(out.output, "");
+        assert.deepEqual(disposedIds, [1]);
 
         yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
         while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {

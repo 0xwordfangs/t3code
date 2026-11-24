@@ -97,8 +97,9 @@ const LAUNCH_SCRIPT = [RAISE_OOM_SCORE_LINE, 'exec "$@"'].join("\n");
 // systemd-run needs XDG_RUNTIME_DIR to reach this user's manager.
 const SCOPED_LAUNCH_SCRIPT = [
   RAISE_OOM_SCORE_LINE,
-  ': "${XDG_RUNTIME_DIR:=$1}"',
+  "XDG_RUNTIME_DIR=$1",
   "export XDG_RUNTIME_DIR",
+  "unset DBUS_SESSION_BUS_ADDRESS",
   "shift",
   'exec "$@"',
 ].join("\n");

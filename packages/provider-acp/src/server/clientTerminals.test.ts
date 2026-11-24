@@ -1,15 +1,17 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
-import { AgentScope } from "@t3tools/shared/AgentScope";
+import { AgentScope, agentScopeCommand } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -871,6 +873,615 @@ describe("AcpClientTerminals", () => {
         yield* terminals.disposeAll;
         expect(terminatedPids).toHaveLength(1);
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "isolates AgentScope pre-containment wrappers from untrusted request.env while delivering request.env post-containment (R4-CF-10)",
+    () =>
+      Effect.gen(function* () {
+        const platform = yield* HostProcess.Platform;
+        if (platform !== "linux") return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-r4-cf10-scope-" });
+        const hostRuntimeDir = path.join(workDir, "host-xdg");
+        yield* fs.makeDirectory(hostRuntimeDir, { recursive: true });
+        const customBinDir = path.join(workDir, "custom-bin");
+        yield* fs.makeDirectory(customBinDir, { recursive: true });
+        const systemdEnvFile = path.join(workDir, "systemd-run-env.json");
+        const targetEnvFile = path.join(workDir, "target-env.json");
+        const poisonedEnvRanFile = path.join(workDir, "poisoned-env-ran");
+
+        // Malicious `env` inside request.env PATH must NEVER be selected as envBin.
+        const poisonedEnvBin = path.join(customBinDir, "env");
+        yield* fs.writeFileString(
+          poisonedEnvBin,
+          `#!/bin/sh\necho poisoned > ${shellQuote(poisonedEnvRanFile)}\nexit 99\n`,
+        );
+        yield* fs.chmod(poisonedEnvBin, 0o755);
+
+        const stubSystemdRun = path.join(workDir, "stub-systemd-run");
+        yield* fs.writeFileString(
+          stubSystemdRun,
+          [
+            "#!/bin/sh",
+            `${shellQuote(process.execPath)} -e 'const fs=require("node:fs"); fs.writeFileSync(process.argv[1], JSON.stringify(process.env));' ${shellQuote(systemdEnvFile)}`,
+            'while [ "$#" -gt 0 ]; do',
+            '  if [ "$1" = "--" ]; then shift; break; fi',
+            "  shift",
+            "done",
+            'exec "$@"',
+          ].join("\n") + "\n",
+        );
+        yield* fs.chmod(stubSystemdRun, 0o755);
+
+        const targetScript =
+          [
+            "#!/bin/sh",
+            `${shellQuote(process.execPath)} -e 'const fs=require("node:fs"); fs.writeFileSync(process.argv[1], JSON.stringify({ env: process.env, args: process.argv.slice(2) }));' ${shellQuote(targetEnvFile)} "$@"`,
+          ].join("\n") + "\n";
+        const myTool = path.join(customBinDir, "my-tool");
+        yield* fs.writeFileString(myTool, targetScript);
+        yield* fs.chmod(myTool, 0o755);
+
+        const eqTool = path.join(customBinDir, "eq=tool");
+        yield* fs.writeFileString(eqTool, targetScript);
+        yield* fs.chmod(eqTool, 0o755);
+
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const hostEnv = yield* HostProcess.Environment;
+        const hostPath = hostEnv.PATH ?? "/usr/bin:/bin";
+        const spawnEnvs: Array<Record<string, unknown>> = [];
+        const wrapEnvs: Array<NodeJS.ProcessEnv | undefined> = [];
+        let nextUnit = 1;
+
+        const terminals = yield* makeAcpClientTerminals({
+          defaultCwd: workDir,
+          forceKillAfter: "250 millis",
+          environment: {
+            PATH: hostPath,
+            XDG_RUNTIME_DIR: hostRuntimeDir,
+            DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/host-dbus",
+            LD_PRELOAD: "/tmp/host-preload.so",
+            LD_AUDIT: "/tmp/host-audit.so",
+            GCONV_PATH: "/tmp/host-gconv",
+            BASH_ENV: "/tmp/host-bash-env",
+            ENV: "/tmp/host-env",
+            IFS: ":",
+            HOST_KEPT: "yes",
+          },
+        }).pipe(
+          Effect.provideService(AgentScope, {
+            ...AgentScope.defaultValue(),
+            wrap: ({ command, args, name, env }) =>
+              Effect.sync(() => {
+                wrapEnvs.push(env);
+                const unit = `t3code-${name}-${nextUnit}.scope`;
+                nextUnit += 1;
+                return {
+                  ...agentScopeCommand({
+                    command,
+                    args,
+                    scope: {
+                      systemdRun: stubSystemdRun,
+                      slice: "app-t3code-agents-test.slice",
+                      unit,
+                      runtimeDir: hostRuntimeDir,
+                      options: ["--collect"],
+                    },
+                  }),
+                  unit,
+                };
+              }),
+            terminateUnit: () => Effect.void,
+          }),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, {
+            ...spawner,
+            spawn: (command) => {
+              if (ChildProcess.isStandardCommand(command)) {
+                spawnEnvs.push({ ...command.options.env });
+              }
+              return spawner.spawn(command);
+            },
+          }),
+        );
+        yield* Effect.addFinalizer(() => terminals.disposeAll);
+
+        // 1) Invalid request.env entries are rejected cleanly.
+        for (const badEnv of [
+          [{ name: "", value: "x" }],
+          [{ name: "BAD=NAME", value: "x" }],
+          [{ name: "BAD\0NAME", value: "x" }],
+          [{ name: "GOOD", value: "bad\0val" }],
+        ]) {
+          const rejected = yield* Effect.exit(
+            terminals.create({
+              sessionId: "session",
+              command: "/bin/true",
+              env: badEnv,
+            }),
+          );
+          expect(Exit.isFailure(rejected)).toBe(true);
+        }
+
+        // 2) Command resolved via request.env PATH runs post-containment with request.env,
+        //    while wrapper spawn env and systemd-run NEVER see request.env or stripped vars.
+        const created = yield* terminals.create({
+          sessionId: "session",
+          command: "my-tool",
+          args: ["arg-one", "arg-two"],
+          env: [
+            { name: "XDG_RUNTIME_DIR", value: "/tmp/attacker-xdg" },
+            { name: "DBUS_SESSION_BUS_ADDRESS", value: "unix:path=/tmp/attacker-bus" },
+            { name: "LD_PRELOAD", value: "/tmp/nonexistent-attacker-preload.so" },
+            { name: "LD_AUDIT", value: "/tmp/nonexistent-attacker-audit.so" },
+            { name: "BASH_ENV", value: "/tmp/attacker-bash-env" },
+            { name: "ENV", value: "/tmp/attacker-sh-env" },
+            { name: "IFS", value: ";" },
+            { name: "GCONV_PATH", value: "/tmp/attacker-gconv" },
+            { name: "PATH", value: customBinDir },
+            { name: "SAFE_VAR", value: "first" },
+            { name: "SAFE_VAR", value: "last-wins" },
+          ],
+        });
+        const exit = yield* terminals.waitForExit({
+          sessionId: "session",
+          terminalId: created.terminalId,
+        });
+        expect(exit.exitCode).toBe(0);
+        expect(yield* fs.exists(poisonedEnvRanFile)).toBe(false);
+
+        const wrapEnv = wrapEnvs[0]!;
+        const spawnEnv = spawnEnvs[0]!;
+        const systemdRunEnv = JSON.parse(yield* fs.readFileString(systemdEnvFile)) as Record<
+          string,
+          string | undefined
+        >;
+        for (const preEnv of [wrapEnv, spawnEnv, systemdRunEnv]) {
+          expect(preEnv.XDG_RUNTIME_DIR).toBe(hostRuntimeDir);
+          expect(preEnv.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+          expect(preEnv.LD_PRELOAD).toBeUndefined();
+          expect(preEnv.LD_AUDIT).toBeUndefined();
+          expect(preEnv.BASH_ENV).toBeUndefined();
+          expect(preEnv.ENV).toBeUndefined();
+          expect(preEnv.IFS).toBeUndefined();
+          expect(preEnv.GCONV_PATH).toBeUndefined();
+          expect(preEnv.SAFE_VAR).toBeUndefined();
+          expect(preEnv.PATH).not.toBe(customBinDir);
+          expect(preEnv.HOST_KEPT).toBe("yes");
+        }
+
+        const targetResult = JSON.parse(yield* fs.readFileString(targetEnvFile)) as {
+          readonly env: Record<string, string | undefined>;
+          readonly args: ReadonlyArray<string>;
+        };
+        expect(targetResult.args).toEqual(["arg-one", "arg-two"]);
+        expect(targetResult.env.SAFE_VAR).toBe("last-wins");
+        expect(targetResult.env.XDG_RUNTIME_DIR).toBe("/tmp/attacker-xdg");
+        expect(targetResult.env.DBUS_SESSION_BUS_ADDRESS).toBe("unix:path=/tmp/attacker-bus");
+        expect(targetResult.env.BASH_ENV).toBe("/tmp/attacker-bash-env");
+        expect(targetResult.env.GCONV_PATH).toBe("/tmp/attacker-gconv");
+        expect(targetResult.env.PATH).toBe(customBinDir);
+        expect(targetResult.env.HOST_KEPT).toBe("yes");
+
+        // 3) Executable path containing '=' is invoked safely past `env` assignments.
+        const eqCreated = yield* terminals.create({
+          sessionId: "session",
+          command: "eq=tool",
+          args: ["eq-arg"],
+          env: [
+            { name: "PATH", value: customBinDir },
+            { name: "EQ_TEST", value: "ok" },
+          ],
+        });
+        const eqExit = yield* terminals.waitForExit({
+          sessionId: "session",
+          terminalId: eqCreated.terminalId,
+        });
+        expect(eqExit.exitCode).toBe(0);
+        const eqResult = JSON.parse(yield* fs.readFileString(targetEnvFile)) as {
+          readonly env: Record<string, string | undefined>;
+          readonly args: ReadonlyArray<string>;
+        };
+        expect(eqResult.args).toEqual(["eq-arg"]);
+        expect(eqResult.env.EQ_TEST).toBe("ok");
+
+        // 4) Unresolved command under request.env.PATH does NOT fall back to host PATH via AgentScope
+        // (prevents running wrong host binary and dropping request.env).
+        const emptyPathDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-r4-cf10-empty-path-",
+        });
+        let unresolvedWrapCalls = 0;
+        const unresolvedTerminals = yield* makeAcpClientTerminals({
+          defaultCwd: workDir,
+          environment: {
+            PATH: hostPath,
+            XDG_RUNTIME_DIR: hostRuntimeDir,
+          },
+          agentScope: {
+            ...AgentScope.defaultValue(),
+            wrap: ({ command, args }) =>
+              Effect.sync(() => {
+                unresolvedWrapCalls += 1;
+                return {
+                  command,
+                  args,
+                  unit: "t3code-acp-terminal-unresolved.scope",
+                };
+              }),
+            terminateUnit: () => Effect.void,
+          },
+        });
+        yield* Effect.addFinalizer(() => unresolvedTerminals.disposeAll);
+        const unresolvedExit = yield* unresolvedTerminals
+          .create({
+            sessionId: "session",
+            command: "true",
+            env: [
+              { name: "PATH", value: emptyPathDir },
+              { name: "LD_PRELOAD", value: "/tmp/evil.so" },
+            ],
+          })
+          .pipe(Effect.exit);
+        expect(Exit.isFailure(unresolvedExit)).toBe(true);
+        expect(unresolvedWrapCalls).toBe(0);
+
+        // 5) Fallback when explicitCgroupController.create() returns undefined preserves request.env.
+        const fallbackTerminals = yield* makeAcpClientTerminals({
+          defaultCwd: workDir,
+          environment: {
+            PATH: hostPath,
+            XDG_RUNTIME_DIR: hostRuntimeDir,
+          },
+          linuxCgroupController: {
+            create: () => undefined,
+          },
+        });
+        yield* Effect.addFinalizer(() => fallbackTerminals.disposeAll);
+        const fallbackTerm = yield* fallbackTerminals.create({
+          sessionId: "session",
+          command: myTool,
+          args: ["fallback-arg"],
+          env: [{ name: "FALLBACK_KEPT", value: "yes" }],
+        });
+        const fallbackExit = yield* fallbackTerminals.waitForExit({
+          sessionId: "session",
+          terminalId: fallbackTerm.terminalId,
+        });
+        expect(fallbackExit.exitCode).toBe(0);
+        const fallbackResult = JSON.parse(yield* fs.readFileString(targetEnvFile)) as {
+          readonly env: Record<string, string | undefined>;
+          readonly args: ReadonlyArray<string>;
+        };
+        expect(fallbackResult.args).toEqual(["fallback-arg"]);
+        expect(fallbackResult.env.FALLBACK_KEPT).toBe("yes");
+
+        // 6) Trusted host LD_LIBRARY_PATH is stripped from wrapperEnvironment and restored post-containment,
+        // and an executable `./env` inside request.cwd cannot hijack host env resolution when PATH has an empty segment.
+        const fakeCwdEnv = path.join(workDir, "env");
+        yield* fs.writeFileString(fakeCwdEnv, "#!/bin/sh\necho HIJACKED >&2\nexit 99\n");
+        yield* fs.chmod(fakeCwdEnv, 0o755);
+        const hostLdTerminals = yield* makeAcpClientTerminals({
+          defaultCwd: workDir,
+          environment: {
+            PATH: `:${hostPath}`,
+            XDG_RUNTIME_DIR: hostRuntimeDir,
+            LD_LIBRARY_PATH: "/opt/trusted-host/lib",
+          },
+          agentScope: {
+            ...AgentScope.defaultValue(),
+            wrap: ({ command, args }) =>
+              Effect.succeed({
+                ...agentScopeCommand({
+                  command,
+                  args,
+                  scope: {
+                    systemdRun: stubSystemdRun,
+                    slice: "t3code-test.slice",
+                    unit: "t3code-acp-terminal-host-ld.scope",
+                    runtimeDir: hostRuntimeDir,
+                    options: [],
+                  },
+                }),
+                unit: "t3code-acp-terminal-host-ld.scope",
+              }),
+            terminateUnit: () => Effect.void,
+          },
+        });
+        yield* Effect.addFinalizer(() => hostLdTerminals.disposeAll);
+        const hostLdTerm = yield* hostLdTerminals.create({
+          sessionId: "session",
+          command: myTool,
+          args: ["host-ld-arg"],
+        });
+        const hostLdExit = yield* hostLdTerminals.waitForExit({
+          sessionId: "session",
+          terminalId: hostLdTerm.terminalId,
+        });
+        expect(hostLdExit.exitCode).toBe(0);
+        const hostLdWrapperEnv = JSON.parse(yield* fs.readFileString(systemdEnvFile)) as Record<
+          string,
+          string | undefined
+        >;
+        const hostLdTargetResult = JSON.parse(yield* fs.readFileString(targetEnvFile)) as {
+          readonly env: Record<string, string | undefined>;
+        };
+        expect(hostLdWrapperEnv.LD_LIBRARY_PATH).toBeUndefined();
+        expect(hostLdTargetResult.env.LD_LIBRARY_PATH).toBe("/opt/trusted-host/lib");
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "isolates Linux cgroup /bin/sh wrapper from request.env on both migration failure (exit 125) and success (R4-CF-10)",
+    () =>
+      Effect.gen(function* () {
+        const platform = yield* HostProcess.Platform;
+        if (platform !== "linux") return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-r4-cf10-cgroup-" });
+        const hookSentinel = path.join(workDir, "hook-executed");
+        const hookScript = path.join(workDir, "hook.sh");
+        yield* fs.writeFileString(hookScript, `echo ran > ${shellQuote(hookSentinel)}\n`);
+        yield* fs.chmod(hookScript, 0o755);
+
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const spawnEnvs: Array<Record<string, unknown>> = [];
+        const recordingSpawner = {
+          ...spawner,
+          spawn: (command: ChildProcess.Command) => {
+            if (ChildProcess.isStandardCommand(command)) {
+              spawnEnvs.push({ ...command.options.env });
+            }
+            return spawner.spawn(command);
+          },
+        };
+
+        const hostileEnv = [
+          { name: "LD_PRELOAD", value: "/tmp/nonexistent-cgroup-preload.so" },
+          { name: "BASH_ENV", value: hookScript },
+          { name: "ENV", value: hookScript },
+          { name: "IFS", value: ":" },
+          { name: "DBUS_SESSION_BUS_ADDRESS", value: "unix:path=/tmp/attacker-bus" },
+          { name: "TARGET_ONLY_SECRET", value: "delivered-after-cgroup" },
+        ];
+
+        // 1) Migration fails with exit 125 before exec: wrapper env has none of request.env, and hook never runs.
+        const failingController: AcpLinuxCgroupController = {
+          create: () => ({
+            path: path.join(workDir, "missing-cgroup-dir"),
+            relativePath: "/missing",
+            contains: () => false,
+            exists: () => false,
+            kill: () => {},
+            populated: () => false,
+            remove: () => {},
+          }),
+        };
+        const failingTerminals = yield* makeAcpClientTerminals({
+          defaultCwd: workDir,
+          linuxCgroupController: failingController,
+          forceKillAfter: "250 millis",
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, recordingSpawner));
+        yield* Effect.addFinalizer(() => failingTerminals.disposeAll);
+
+        const failedTerm = yield* failingTerminals.create({
+          sessionId: "session",
+          command: "/bin/true",
+          env: hostileEnv,
+        });
+        const failedExit = yield* failingTerminals.waitForExit({
+          sessionId: "session",
+          terminalId: failedTerm.terminalId,
+        });
+        expect(failedExit.exitCode).toBe(125);
+        expect(yield* fs.exists(hookSentinel)).toBe(false);
+        expect(spawnEnvs[0]!.LD_PRELOAD).toBeUndefined();
+        expect(spawnEnvs[0]!.BASH_ENV).toBeUndefined();
+        expect(spawnEnvs[0]!.ENV).toBeUndefined();
+        expect(spawnEnvs[0]!.IFS).toBeUndefined();
+        expect(spawnEnvs[0]!.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+        expect(spawnEnvs[0]!.TARGET_ONLY_SECRET).toBeUndefined();
+
+        // 2) Migration succeeds: wrapper env stays clean, while target receives request.env after cgroup migration.
+        const procSelfCgroup = yield* fs
+          .readFileString("/proc/self/cgroup")
+          .pipe(Effect.orElseSucceed(() => ""));
+        const cgroupV2Line = procSelfCgroup.split("\n").find((line) => line.startsWith("0::"));
+        if (cgroupV2Line === undefined) return;
+        const currentRelativePath = cgroupV2Line.slice("0::".length);
+        const fakeCgroupDir = path.join(workDir, "fake-cgroup");
+        yield* fs.makeDirectory(fakeCgroupDir, { recursive: true });
+        yield* fs.writeFileString(path.join(fakeCgroupDir, "cgroup.procs"), "");
+
+        const succeedingController: AcpLinuxCgroupController = {
+          create: () => ({
+            path: fakeCgroupDir,
+            relativePath: currentRelativePath,
+            contains: () => false,
+            exists: () => false,
+            kill: () => {},
+            populated: () => false,
+            remove: () => {},
+          }),
+        };
+        const targetEnvFile = path.join(workDir, "cgroup-target-env.json");
+        const succeedingTerminals = yield* makeAcpClientTerminals({
+          defaultCwd: workDir,
+          linuxCgroupController: succeedingController,
+          forceKillAfter: "250 millis",
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, recordingSpawner));
+        yield* Effect.addFinalizer(() => succeedingTerminals.disposeAll);
+
+        const okTerm = yield* succeedingTerminals.create({
+          sessionId: "session",
+          command: process.execPath,
+          args: [
+            "-e",
+            `require("node:fs").writeFileSync(${JSON.stringify(targetEnvFile)}, JSON.stringify(process.env))`,
+          ],
+          env: hostileEnv,
+        });
+        const okExit = yield* succeedingTerminals.waitForExit({
+          sessionId: "session",
+          terminalId: okTerm.terminalId,
+        });
+        expect(okExit.exitCode).toBe(0);
+        expect(yield* fs.exists(hookSentinel)).toBe(false);
+        expect(spawnEnvs[1]!.LD_PRELOAD).toBeUndefined();
+        expect(spawnEnvs[1]!.BASH_ENV).toBeUndefined();
+        expect(spawnEnvs[1]!.ENV).toBeUndefined();
+        expect(spawnEnvs[1]!.IFS).toBeUndefined();
+        expect(spawnEnvs[1]!.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+        expect(spawnEnvs[1]!.TARGET_ONLY_SECRET).toBeUndefined();
+
+        const deliveredEnv = JSON.parse(yield* fs.readFileString(targetEnvFile)) as Record<
+          string,
+          string | undefined
+        >;
+        expect(deliveredEnv.TARGET_ONLY_SECRET).toBe("delivered-after-cgroup");
+        expect(deliveredEnv.DBUS_SESSION_BUS_ADDRESS).toBe("unix:path=/tmp/attacker-bus");
+        expect(deliveredEnv.BASH_ENV).toBe(hookScript);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "fences disposeAll against in-flight create() suspended in agentScope.wrap, cleans up scopeUnit, and never spawns after disposeAll (R4-CF-11)",
+    () =>
+      Effect.gen(function* () {
+        const wrapEntered = yield* Deferred.make<void>();
+        const releaseWrap = yield* Deferred.make<void>();
+        const terminatedUnits: Array<string> = [];
+        let spawnCount = 0;
+
+        const makeHandle = () =>
+          ChildProcessSpawner.makeHandle({
+            pid: ChildProcessSpawner.ProcessId(1),
+            exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+            isRunning: Effect.succeed(false),
+            kill: () => Effect.void,
+            stdin: Sink.drain,
+            stdout: Stream.empty,
+            stderr: Stream.empty,
+            all: Stream.empty,
+            getInputFd: () => Sink.drain,
+            getOutputFd: () => Stream.empty,
+            unref: Effect.succeed(Effect.void),
+          });
+
+        let wrapOrdinal = 0;
+        const terminals = yield* makeAcpClientTerminals({
+          defaultCwd: process.cwd(),
+          linuxCgroupController: null,
+          agentScope: {
+            ...AgentScope.defaultValue(),
+            wrap: ({ command, args, name }) =>
+              Effect.gen(function* () {
+                wrapOrdinal += 1;
+                const unit = `t3code-${name}-${wrapOrdinal}.scope`;
+                if (wrapOrdinal === 1) {
+                  yield* Deferred.succeed(wrapEntered, undefined);
+                  yield* Deferred.await(releaseWrap);
+                }
+                return { command, args, unit };
+              }),
+            terminateUnit: (unit) =>
+              Effect.sync(() => {
+                terminatedUnits.push(unit);
+              }),
+          },
+        }).pipe(
+          Effect.provideService(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() =>
+              Effect.sync(() => {
+                spawnCount += 1;
+                return makeHandle();
+              }),
+            ),
+          ),
+        );
+
+        const createdIds: Array<string> = [];
+        const createFiber = yield* terminals
+          .create(
+            { sessionId: "session", command: process.execPath },
+            {
+              onCreated: (terminalId) => {
+                createdIds.push(terminalId);
+              },
+            },
+          )
+          .pipe(Effect.forkChild);
+
+        yield* Deferred.await(wrapEntered);
+
+        // disposeAll advances disposalGeneration immediately, then waits for creationPermit.
+        const disposeFiber = yield* terminals.disposeAll.pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        expect(disposeFiber.pollUnsafe()).toBeUndefined();
+
+        // Letting wrap finish must see the bumped disposalGeneration, clean up its scopeUnit,
+        // abort before spawner.spawn, and let disposeAll complete cleanly.
+        yield* Deferred.succeed(releaseWrap, undefined);
+        const createExit = yield* Fiber.await(createFiber);
+        yield* Fiber.join(disposeFiber);
+
+        expect(Exit.isFailure(createExit)).toBe(true);
+        expect(spawnCount).toBe(0);
+        expect(createdIds).toEqual([]);
+        expect(terminatedUnits).toEqual(["t3code-acp-terminal-1.scope"]);
+
+        // A new create() started AFTER disposeAll succeeds and invokes onCreated synchronously upon registration.
+        let callbackTerminalId: string | undefined;
+        let sawCallbackBeforeResolve = false;
+        const gen1Created = yield* terminals
+          .create(
+            { sessionId: "session", command: process.execPath },
+            {
+              ownerGeneration: 1,
+              onCreated: (terminalId) => {
+                callbackTerminalId = terminalId;
+              },
+            },
+          )
+          .pipe(
+            Effect.tap((response) =>
+              Effect.sync(() => {
+                sawCallbackBeforeResolve = callbackTerminalId === response.terminalId;
+              }),
+            ),
+          );
+        expect(spawnCount).toBe(1);
+        expect(callbackTerminalId).toBe(gen1Created.terminalId);
+        expect(sawCallbackBeforeResolve).toBe(true);
+
+        // disposeGeneration(1) disposes generation 1 without touching generation 2's terminals.
+        const gen2Created = yield* terminals.create(
+          { sessionId: "session", command: process.execPath },
+          { ownerGeneration: 2 },
+        );
+        yield* terminals.disposeGeneration(1);
+        const gen1Out = yield* terminals
+          .output({ sessionId: "session", terminalId: gen1Created.terminalId })
+          .pipe(Effect.exit);
+        expect(Exit.isFailure(gen1Out)).toBe(true);
+        const gen2Out = yield* terminals.output({
+          sessionId: "session",
+          terminalId: gen2Created.terminalId,
+        });
+        expect(gen2Out.output).toBe("");
+        expect(terminatedUnits).toEqual([
+          "t3code-acp-terminal-1.scope",
+          "t3code-acp-terminal-2.scope",
+        ]);
+        yield* terminals.disposeAll;
+        expect(terminatedUnits).toEqual([
+          "t3code-acp-terminal-1.scope",
+          "t3code-acp-terminal-2.scope",
+          "t3code-acp-terminal-3.scope",
+        ]);
+      }),
   );
 });
 

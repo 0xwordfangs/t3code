@@ -3104,7 +3104,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 );
               }
             }),
-          ).pipe(Effect.asVoid);
+          ).pipe(
+            Effect.flatMap((ran) =>
+              Option.isSome(ran)
+                ? (clientTerminals?.disposeGeneration(runtimeGeneration) ?? Effect.void)
+                : Effect.void,
+            ),
+          );
         const makeRuntimeInput = (
           runtimeGeneration: number,
           agentRequests: Set<string>,
@@ -7654,7 +7660,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     turnKey: null,
                   };
                 }
-                if (yield* Ref.get(stoppedRunQuarantine)) {
+                if (
+                  (yield* Ref.get(stoppedRunQuarantine)) ||
+                  (yield* Ref.get(runtimeRestartRequired))
+                ) {
                   return { _tag: "Deny" as const };
                 }
                 if (rawContext !== null && !rawContext.finalized) {
@@ -7712,32 +7721,49 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           yield* targetRuntime.handleCreateTerminal((request) =>
             requireClientPolicyContext(handlerGeneration, "terminal/create").pipe(
               Effect.flatMap(({ policy, turnKey }) =>
-                guardClientTerminalCreate(policy, turnKey).pipe(
-                  Effect.andThen(clientTerminals.create(request)),
-                  Effect.flatMap((created) => {
-                    const releaseOrphan = clientTerminals
+                Effect.suspend(() => {
+                  let createdTerminalId: string | undefined;
+                  let orphanReleased = false;
+                  const releaseOrphan = Effect.suspend(() => {
+                    if (createdTerminalId === undefined || orphanReleased) {
+                      return Effect.void;
+                    }
+                    orphanReleased = true;
+                    return clientTerminals
                       .release({
                         sessionId: request.sessionId,
-                        terminalId: created.terminalId,
+                        terminalId: createdTerminalId,
                       })
                       .pipe(Effect.ignore);
-                    return Effect.uninterruptibleMask((restore) =>
-                      restore(
-                        runRuntimeCallbackAtGeneration(
-                          handlerGeneration,
-                          Effect.gen(function* () {
-                            if (yield* Ref.get(stoppedRunQuarantine)) return false;
-                            const rawContext = yield* Ref.get(activeTurn);
-                            return (
-                              rawContext !== null &&
-                              !rawContext.finalized &&
-                              rawContext.interrupted !== true &&
-                              String(rawContext.providerTurnId) === turnKey
-                            );
-                          }),
-                        ),
+                  });
+                  return guardClientTerminalCreate(policy, turnKey).pipe(
+                    Effect.andThen(
+                      clientTerminals.create(request, {
+                        ownerGeneration: handlerGeneration,
+                        onCreated: (terminalId) => {
+                          createdTerminalId = terminalId;
+                        },
+                      }),
+                    ),
+                    Effect.flatMap((created) =>
+                      runRuntimeCallbackAtGeneration(
+                        handlerGeneration,
+                        Effect.gen(function* () {
+                          if (
+                            (yield* Ref.get(stoppedRunQuarantine)) ||
+                            (yield* Ref.get(runtimeRestartRequired))
+                          ) {
+                            return false;
+                          }
+                          const rawContext = yield* Ref.get(activeTurn);
+                          return (
+                            rawContext !== null &&
+                            !rawContext.finalized &&
+                            rawContext.interrupted !== true &&
+                            String(rawContext.providerTurnId) === turnKey
+                          );
+                        }),
                       ).pipe(
-                        Effect.onInterrupt(() => releaseOrphan),
                         Effect.flatMap((admitted) =>
                           Option.isSome(admitted) && admitted.value
                             ? Effect.succeed(created)
@@ -7746,9 +7772,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                               ),
                         ),
                       ),
-                    );
-                  }),
-                ),
+                    ),
+                    Effect.onExit((exit) => (Exit.isFailure(exit) ? releaseOrphan : Effect.void)),
+                  );
+                }),
               ),
             ),
           );
@@ -8630,6 +8657,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             }),
           );
           yield* Effect.sync(clientPolicyGrants.reset);
+          if (runtimeScope !== undefined) {
+            yield* Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore);
+            runtimeScope = undefined;
+          }
           yield* clientTerminals?.disposeAll ?? Effect.void;
           yield* spawnAcpRuntime(threadId);
           yield* wireAcpRuntimeHandlers(runtime, yield* Ref.get(runtimeCallbackGeneration));
@@ -11343,7 +11374,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           );
                           if (runtimeScope !== undefined) {
                             yield* Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore);
+                            runtimeScope = undefined;
                           }
+                          yield* clientTerminals?.disposeAll ?? Effect.void;
                         }
                       }
                       const stopped = yield* Deferred.await(context.completed).pipe(
