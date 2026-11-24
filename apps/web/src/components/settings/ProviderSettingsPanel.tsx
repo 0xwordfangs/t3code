@@ -670,9 +670,10 @@ export function EnvironmentProviderSettings({
     refreshingRef.current = true;
     setIsRefreshingProviders(true);
     void (async () => {
+      const canManageProviders = readEnvironmentScope(environmentId, AuthProvidersManageScope);
       const result = await refreshServerProviders({
         environmentId,
-        input: { refreshModels: true, reloadSecrets: true },
+        input: canManageProviders ? { refreshModels: true, reloadSecrets: true } : {},
       });
       refreshingRef.current = false;
       setIsRefreshingProviders(false);

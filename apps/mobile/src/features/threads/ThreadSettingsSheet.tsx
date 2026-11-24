@@ -6,7 +6,12 @@ import { T, useGT, useLocale, useMessages } from "gt-react-native";
 import * as Dialog from "../../components/ui/Dialog";
 import { createV5StackNavigator as createNativeStackNavigator } from "../../native/createV5StackNavigator";
 import { useSheetStackOptions } from "../layout/nested-stacks";
-import { DEFAULT_SERVER_SETTINGS, ProviderInstanceId } from "@t3tools/contracts";
+import {
+  AuthOrchestrationReadScope,
+  AuthProvidersManageScope,
+  DEFAULT_SERVER_SETTINGS,
+  ProviderInstanceId,
+} from "@t3tools/contracts";
 import {
   modelPreferencesMigrationPatch,
   resolveModelPreferences,
@@ -97,6 +102,7 @@ import { useSelectedThreadWorktree } from "../../state/use-selected-thread-workt
 import { providerWorkspaceSnapshotRefresh } from "../../state/provider-workspace-snapshot-refresh";
 import { threadAllowsProviderSwitch } from "../../state/thread-provider-switching";
 import { environmentServerConfigsAtom, serverEnvironment } from "../../state/server";
+import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
 import { mobilePreferencesAtom } from "../../state/preferences";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useNewTaskFlow } from "./new-task-flow-provider";
@@ -979,9 +985,13 @@ function ThreadSettingsMainContent(props: {
   });
   const refreshProviderCatalog = createProviderCatalogRefreshRunner(refreshProvidersCommand);
   const registry = use(RegistryContext);
+  const canRefreshProviders = useEnvironmentScope(
+    session.environmentId,
+    AuthOrchestrationReadScope,
+  );
   const refreshModelCatalog = useEffectEvent(() => {
     const environmentId = session.environmentId;
-    if (!environmentId) return;
+    if (!environmentId || !readEnvironmentScope(environmentId, AuthOrchestrationReadScope)) return;
     // An older server drops the field and probes every provider.
     const config = registry.get(environmentServerConfigsAtom).get(environmentId);
     if (config?.environment.capabilities.modelCatalogRefresh !== true) return;
@@ -993,11 +1003,17 @@ function ThreadSettingsMainContent(props: {
   }, []);
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
   const refreshProviders = () => {
-    if (!session.environmentId || isRefreshingProviders) return;
-    setIsRefreshingProviders(true);
     const environmentId = session.environmentId;
+    if (
+      !environmentId ||
+      isRefreshingProviders ||
+      !readEnvironmentScope(environmentId, AuthOrchestrationReadScope)
+    )
+      return;
+    setIsRefreshingProviders(true);
     const workspaceScan = session.workspaceScan;
-    void refreshProviderCatalog(environmentId)
+    const canManageProviders = readEnvironmentScope(environmentId, AuthProvidersManageScope);
+    void refreshProviderCatalog(environmentId, { refreshModels: canManageProviders })
       .then(async (result) => {
         // A project's own models are read per folder, so the machine refresh alone keeps them stale.
         // A failed folder read keeps its previous models and retries, so only the machine result alerts.
@@ -1097,7 +1113,7 @@ function ThreadSettingsMainContent(props: {
       maintainVisibleContentPosition={THREAD_SETTINGS_MAINTAIN_VISIBLE_CONTENT_POSITION}
       recycleItems
       refreshControl={
-        session.environmentId ? (
+        session.environmentId && canRefreshProviders ? (
           <RefreshControl refreshing={isRefreshingProviders} onRefresh={refreshProviders} />
         ) : undefined
       }

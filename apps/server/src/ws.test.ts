@@ -30,6 +30,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
+  RpcScopeAuthorization,
   RunId,
   ScheduledTaskId,
   SourceControlRepositoryError,
@@ -3966,6 +3967,253 @@ it.effect(
       }
       assert.equal(retriedCount, 1);
       assert.equal(dispatchedCount, 10);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+        ),
+      ),
+    ),
+);
+
+it.effect(
+  "enforces providers:manage for server.refreshProviders with refreshModels or reloadSecrets end-to-end and in handler defense-in-depth",
+  () =>
+    Effect.gen(function* () {
+      const instanceId = ProviderInstanceId.make("antigravity");
+      const provider: ServerProvider = {
+        instanceId,
+        driver: ProviderDriverKind.make("antigravity"),
+        enabled: true,
+        installed: true,
+        version: "1.0.0",
+        status: "ready",
+        auth: { status: "authenticated" },
+        checkedAt: "2026-11-24T00:00:00.000Z",
+        models: [],
+        slashCommands: [],
+        skills: [],
+      };
+      let invalidateModelCachesCount = 0;
+      let invalidateSecretsCount = 0;
+      let reloadSecretsCount = 0;
+      let refreshCount = 0;
+      let refreshModelCatalogCount = 0;
+      let instanceRefreshModelsCount = 0;
+
+      const services = Layer.mergeAll(
+        layerUnusedConfigRpcServices,
+        Layer.mock(SecretResolver.SecretResolver)({
+          invalidate: () =>
+            Effect.sync(() => {
+              invalidateSecretsCount += 1;
+            }),
+        }),
+        Layer.mock(ExternalLauncher.ExternalLauncher)({
+          resolveAvailableEditors: () => Effect.succeed([]),
+          resolveFileManagerRevealKind: () => Effect.undefined,
+        }),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({
+          getProviders: Effect.succeed([provider]),
+          streamChanges: Stream.empty,
+          invalidateModelCaches: () =>
+            Effect.sync(() => {
+              invalidateModelCachesCount += 1;
+            }),
+          refreshModelCatalog: Effect.sync(() => {
+            refreshModelCatalogCount += 1;
+          }),
+          refresh: () =>
+            Effect.sync(() => {
+              refreshCount += 1;
+              return [provider];
+            }),
+          refreshInstance: () => Effect.succeed([provider]),
+          reloadSecretsAndRefresh: () =>
+            Effect.sync(() => {
+              reloadSecretsCount += 1;
+              return [provider];
+            }),
+          refreshWorkspaceSnapshot: () => Effect.succeed([provider]),
+        }),
+        Layer.mock(ProjectService.ProjectService)({
+          workspaceScanDirectory: (cwd) => Effect.succeed(cwd),
+        }),
+        Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+          listInstances: Effect.succeed([
+            {
+              instanceId,
+              driverKind: ProviderDriverKind.make("antigravity"),
+              enabled: true,
+              refreshModels: () =>
+                Effect.sync(() => {
+                  instanceRefreshModelsCount += 1;
+                }),
+            } as never,
+          ]),
+          getInstance: () => Effect.undefined,
+        }),
+        Layer.mock(UsageLimitSources.UsageLimitSources)({
+          current: Effect.succeed([]),
+          streamChanges: Stream.make([]),
+          refresh: Effect.void,
+        }),
+        Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({
+          resolveTargets: () => Effect.succeed([]),
+        }),
+        Layer.mock(DirectEndpoints.DirectEndpoints)({
+          resolve: () => Effect.succeed([]),
+          resolveAvailable: () => Effect.succeed([]),
+        }),
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+          scratchRoot: Effect.succeedNone,
+          namedProjectsRoot: process.cwd(),
+        }),
+        Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({
+          getDescriptor: Effect.succeed({
+            environmentId: EnvironmentId.make("refresh-scope-test"),
+            label: "Refresh scope test",
+            platform: { os: "linux", arch: "x64" },
+            serverVersion: "0.0.0",
+            capabilities: { repositoryIdentity: false },
+          }),
+        }),
+        Layer.mock(EnvironmentAuth.EnvironmentAuth)({
+          getDescriptor: () =>
+            Effect.succeed({
+              policy: "loopback-browser",
+              bootstrapMethods: [],
+              sessionMethods: ["browser-session-cookie"],
+              sessionCookieName: "refresh-scope-session",
+            }),
+        }),
+      );
+
+      const makeClient = (
+        scopes: ReadonlyArray<AuthEnvironmentScope>,
+        id: string,
+        bypassMiddleware = false,
+      ) =>
+        Effect.gen(function* () {
+          const exits = yield* Queue.unbounded<Exit.Exit<unknown, unknown>>();
+          const authLayer = bypassMiddleware
+            ? Layer.succeed(RpcScopeAuthorization)((effect) => effect)
+            : RpcAuthorization.layer(scopes);
+          const server = yield* RpcServer.makeNoSerialization(WsRpcGroup, {
+            ...WS_RPC_SERVER_OPTIONS,
+            onFromServer: (response) =>
+              response._tag === "Exit" ? Queue.offer(exits, response.exit) : Effect.void,
+          }).pipe(
+            Effect.provide(
+              layerWsRpc(
+                {
+                  sessionId: AuthSessionId.make(`refresh-scope:${id}`),
+                  subject: id,
+                  method: "browser-session-cookie",
+                  scopes,
+                },
+                {},
+                yield* ServerBrowser.ServerBrowser,
+                () => Effect.void,
+                { secretReferences: true },
+              ).pipe(Layer.provide(services), Layer.merge(authLayer)),
+            ),
+          );
+          let seq = 0;
+          return (payload: Record<string, unknown>) =>
+            Effect.gen(function* () {
+              seq += 1;
+              yield* server.write(0, {
+                _tag: "Request",
+                id: RpcMessage.RequestId(`${id}:${seq}`),
+                tag: WS_METHODS.serverRefreshProviders,
+                payload,
+                headers: Headers.empty,
+              });
+              return yield* Queue.take(exits);
+            });
+        });
+
+      const readerCall = yield* makeClient([AuthOrchestrationReadScope], "reader");
+      const readerDirectHandlerCall = yield* makeClient(
+        [AuthOrchestrationReadScope],
+        "reader-direct",
+        true,
+      );
+      const managerOnlyCall = yield* makeClient([AuthProvidersManageScope], "manager-only");
+      const managerOnlyDirectCall = yield* makeClient(
+        [AuthProvidersManageScope],
+        "manager-only-direct",
+        true,
+      );
+      const managerCall = yield* makeClient(
+        [AuthOrchestrationReadScope, AuthProvidersManageScope],
+        "manager",
+      );
+
+      // Read-only refreshes succeed for orchestration:read.
+      assert.isTrue(Exit.isSuccess(yield* readerCall({})));
+      assert.isTrue(Exit.isSuccess(yield* readerCall({ modelCatalogOnly: true })));
+      assert.equal(refreshCount, 1);
+      assert.equal(refreshModelCatalogCount, 1);
+
+      // Privileged flags fail for orchestration:read both via middleware and via handler defense-in-depth.
+      const privilegedPayloads = [
+        { refreshModels: true },
+        { reloadSecrets: true },
+        { refreshModels: true, modelCatalogOnly: true },
+        { refreshModels: true, reloadSecrets: true },
+      ] as const;
+      for (const call of [readerCall, readerDirectHandlerCall]) {
+        for (const payload of privilegedPayloads) {
+          const exit = yield* call(payload);
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isFailure(exit)) {
+            assert.deepInclude(Cause.squash(exit.cause) as object, {
+              _tag: "EnvironmentAuthorizationError",
+              requiredPermission: AuthProvidersManageScope,
+            });
+          }
+        }
+      }
+      // A providers:manage-only session (without orchestration:read) fails middleware for all payloads,
+      // and fails handler defense-in-depth for privileged payloads.
+      for (const payload of [{}, ...privilegedPayloads] as const) {
+        const exit = yield* managerOnlyCall(payload);
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          assert.deepInclude(Cause.squash(exit.cause) as object, {
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthOrchestrationReadScope,
+          });
+        }
+      }
+      for (const payload of privilegedPayloads) {
+        const exit = yield* managerOnlyDirectCall(payload);
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          assert.deepInclude(Cause.squash(exit.cause) as object, {
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthOrchestrationReadScope,
+          });
+        }
+      }
+      assert.equal(invalidateModelCachesCount, 0);
+      assert.equal(invalidateSecretsCount, 0);
+      assert.equal(reloadSecretsCount, 0);
+      assert.equal(instanceRefreshModelsCount, 0);
+      assert.equal(refreshModelCatalogCount, 1);
+
+      // A session with both orchestration:read and providers:manage succeeds for refreshModels and reloadSecrets.
+      assert.isTrue(Exit.isSuccess(yield* managerCall({ refreshModels: true })));
+      assert.isTrue(Exit.isSuccess(yield* managerCall({ reloadSecrets: true })));
+      assert.equal(invalidateModelCachesCount, 1);
+      assert.equal(invalidateSecretsCount, 1);
+      assert.equal(instanceRefreshModelsCount, 1);
+      assert.equal(reloadSecretsCount, 1);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(

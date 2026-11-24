@@ -46,4 +46,25 @@ describe("mobile provider catalog refresh", () => {
     expect(providerCatalogRefreshError(await refresh(environmentId))).toBeNull();
     expect(refreshProviders).toHaveBeenCalledTimes(2);
   });
+
+  it("sends an empty input when refreshModels is disabled for read-only callers and keeps distinct keys separate", async () => {
+    const refreshProviders = vi.fn(async () => "refreshed");
+    const refresh = createProviderCatalogRefreshRunner(refreshProviders);
+    const environmentId = EnvironmentId.make("environment-mobile-readonly");
+
+    const readOnlyPromise = refresh(environmentId, { refreshModels: false });
+    const privilegedPromise = refresh(environmentId, { refreshModels: true });
+    expect(privilegedPromise).not.toBe(readOnlyPromise);
+    await expect(readOnlyPromise).resolves.toBe("refreshed");
+    await expect(privilegedPromise).resolves.toBe("refreshed");
+    expect(refreshProviders).toHaveBeenCalledTimes(2);
+    expect(refreshProviders).toHaveBeenNthCalledWith(1, {
+      environmentId,
+      input: {},
+    });
+    expect(refreshProviders).toHaveBeenNthCalledWith(2, {
+      environmentId,
+      input: { refreshModels: true },
+    });
+  });
 });

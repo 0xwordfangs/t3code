@@ -368,10 +368,17 @@ export const AntigravityDriver: ProviderDriver<
     const makeDisposableRuntime = Effect.fn("AntigravityDriver.makeDisposableRuntime")(function* (
       input: Pick<AntigravityAcpRuntimeInput, "onAuthorizationUrl"> & {
         readonly profileDirectoryOverride?: string;
-        readonly linkUserPlugins?: boolean;
       },
     ) {
-      const effectiveProfileDirectory = input.profileDirectoryOverride ?? profileDirectory;
+      const effectiveProfileDirectory =
+        input.profileDirectoryOverride ??
+        (yield* prepareAntigravityTextGenerationProfile({
+          profileDirectory,
+          platform,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        ));
       const cwd = yield* fileSystem
         .makeTempDirectoryScoped({ prefix: "t3-antigravity-setup-" })
         .pipe(
@@ -399,10 +406,9 @@ export const AntigravityDriver: ProviderDriver<
         cwd,
         mcpServers: [],
         ...(input.onAuthorizationUrl ? { onAuthorizationUrl: input.onAuthorizationUrl } : {}),
-        ...(input.profileDirectoryOverride !== undefined
-          ? { profileDirectoryOverride: input.profileDirectoryOverride }
-          : {}),
-        ...(input.linkUserPlugins !== undefined ? { linkUserPlugins: input.linkUserPlugins } : {}),
+        profileDirectoryOverride: effectiveProfileDirectory,
+        linkUserPlugins: false,
+        notifyAuthRequiredOnStartError: input.profileDirectoryOverride === undefined,
       });
       return {
         ...runtime,
@@ -585,13 +591,12 @@ export const AntigravityDriver: ProviderDriver<
         makeRuntime: (
           runtimeInput?: Omit<
             Parameters<typeof makeDisposableRuntime>[0],
-            "profileDirectoryOverride" | "linkUserPlugins"
+            "profileDirectoryOverride"
           >,
         ) =>
           makeDisposableRuntime({
             ...runtimeInput,
             profileDirectoryOverride: stagingProfileDirectory,
-            linkUserPlugins: false,
           }),
         commit,
         cleanup,

@@ -109,6 +109,15 @@ export function clientRpcRequiredScopes(
     )
       return [AuthSourceControlWriteScope, AuthOrchestrationReadScope];
   }
+  if (method === WS_METHODS.serverRefreshProviders && typeof input === "object" && input !== null) {
+    const payload = input as {
+      readonly refreshModels?: unknown;
+      readonly reloadSecrets?: unknown;
+    };
+    if (payload.refreshModels === true || payload.reloadSecrets === true) {
+      return [AuthOrchestrationReadScope, AuthProvidersManageScope];
+    }
+  }
   return Object.hasOwn(CLIENT_GUARDED_RPC_SCOPES, method)
     ? [CLIENT_GUARDED_RPC_SCOPES[method as ClientGuardedRpcTag]]
     : [];

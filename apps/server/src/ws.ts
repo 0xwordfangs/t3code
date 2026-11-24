@@ -31,6 +31,7 @@ import {
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
   AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthProvidersManageScope,
   type AuthEnvironmentScope,
   type ScheduledTaskListResult,
@@ -2611,6 +2612,14 @@ export const layerWsRpc = (
         [WS_METHODS.serverRefreshProviders]:
           /* Request instrumentation already owns the span; keep this helper in that context. */
           Effect.fnUntraced(function* (input) {
+            if (input.refreshModels === true || input.reloadSecrets === true) {
+              if (!currentSession.scopes.includes(AuthOrchestrationReadScope)) {
+                return yield* rpcAuthorizationError(AuthOrchestrationReadScope);
+              }
+              if (!canManageProviders) {
+                return yield* rpcAuthorizationError(AuthProvidersManageScope);
+              }
+            }
             if (input.modelCatalogOnly === true) {
               yield* providerRegistry.refreshModelCatalog;
               return { providers: [] };

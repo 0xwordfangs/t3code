@@ -351,9 +351,13 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                       void run("refresh", async () => {
                         if (!readEnvironmentScope(environmentId, AuthOrchestrationReadScope))
                           return;
+                        const canReloadSecrets = readEnvironmentScope(
+                          environmentId,
+                          AuthProvidersManageScope,
+                        );
                         const result = await refreshProviders({
                           environmentId,
-                          input: { reloadSecrets: true },
+                          input: canReloadSecrets ? { reloadSecrets: true } : {},
                         });
                         if (AsyncResult.isFailure(result)) throw squashAtomCommandFailure(result);
                         setNotice(gt("Provider status refreshed."));

@@ -11,20 +11,28 @@ import { m } from "../../i18n/messages";
 
 type RefreshProvidersTarget = {
   readonly environmentId: EnvironmentId;
-  readonly input: { readonly refreshModels: true };
+  readonly input: { readonly refreshModels?: true };
 };
 
 export function createProviderCatalogRefreshRunner<Result>(
   refreshProviders: (target: RefreshProvidersTarget) => Promise<Result>,
 ) {
-  let pending: Promise<Result> | null = null;
+  const pending = new Map<string, Promise<Result>>();
 
-  return (environmentId: EnvironmentId): Promise<Result> => {
-    if (pending) return pending;
-    pending = refreshProviders({ environmentId, input: { refreshModels: true } }).finally(() => {
-      pending = null;
+  return (
+    environmentId: EnvironmentId,
+    options?: { readonly refreshModels?: boolean },
+  ): Promise<Result> => {
+    const refreshModels = options?.refreshModels !== false;
+    const key = `${environmentId}:${refreshModels ? "1" : "0"}`;
+    const existing = pending.get(key);
+    if (existing) return existing;
+    const input = refreshModels ? { refreshModels: true as const } : {};
+    const next = refreshProviders({ environmentId, input }).finally(() => {
+      pending.delete(key);
     });
-    return pending;
+    pending.set(key, next);
+    return next;
   };
 }
 

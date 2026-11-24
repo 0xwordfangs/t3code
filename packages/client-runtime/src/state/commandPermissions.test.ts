@@ -101,6 +101,77 @@ describe("command permissions", () => {
     }),
   );
 
+  it.effect(
+    "requires providers:manage for server.refreshProviders with refreshModels or reloadSecrets while keeping plain refreshes on orchestration:read",
+    () =>
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const refresh = createCommandPermissions(runtime, WS_METHODS.serverRefreshProviders);
+
+        registry.set(
+          sessions(env),
+          AsyncResult.success({
+            ...grant(false),
+            scopes: [AuthOrchestrationReadScope],
+            permissions: [AuthOrchestrationReadScope],
+          }),
+        );
+        expect(registry.get(refresh.permissionAtom(env))).toBe(true);
+        expect(registry.get(refresh.permissionAtom(env, {}))).toBe(true);
+        expect(registry.get(refresh.permissionAtom(env, { modelCatalogOnly: true }))).toBe(true);
+        expect(registry.get(refresh.permissionAtom(env, { refreshModels: true }))).toBe(false);
+        expect(registry.get(refresh.permissionAtom(env, { reloadSecrets: true }))).toBe(false);
+        yield* refresh.authorize(registry, env, undefined);
+        yield* refresh.authorize(registry, env, {});
+        for (const payload of [
+          { refreshModels: true },
+          { reloadSecrets: true },
+          { refreshModels: true, reloadSecrets: true },
+        ] as const) {
+          expect(yield* refresh.authorize(registry, env, payload).pipe(Effect.flip)).toMatchObject({
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthProvidersManageScope,
+          });
+        }
+
+        registry.set(
+          sessions(env),
+          AsyncResult.success({
+            ...grant(false),
+            scopes: [AuthProvidersManageScope],
+            permissions: [AuthProvidersManageScope],
+          }),
+        );
+        expect(registry.get(refresh.permissionAtom(env, { refreshModels: true }))).toBe(false);
+        expect(registry.get(refresh.permissionAtom(env, { reloadSecrets: true }))).toBe(false);
+        for (const payload of [
+          {},
+          { refreshModels: true },
+          { reloadSecrets: true },
+          { refreshModels: true, reloadSecrets: true },
+        ] as const) {
+          expect(yield* refresh.authorize(registry, env, payload).pipe(Effect.flip)).toMatchObject({
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthOrchestrationReadScope,
+          });
+        }
+
+        registry.set(
+          sessions(env),
+          AsyncResult.success({
+            ...grant(false),
+            scopes: [AuthOrchestrationReadScope, AuthProvidersManageScope],
+            permissions: [AuthOrchestrationReadScope, AuthProvidersManageScope],
+          }),
+        );
+        expect(registry.get(refresh.permissionAtom(env, { refreshModels: true }))).toBe(true);
+        expect(registry.get(refresh.permissionAtom(env, { reloadSecrets: true }))).toBe(true);
+        yield* refresh.authorize(registry, env, { refreshModels: true });
+        yield* refresh.authorize(registry, env, { reloadSecrets: true });
+        yield* refresh.authorize(registry, env, { refreshModels: true, reloadSecrets: true });
+      }),
+  );
+
   it.effect("requires the destination preview grant to close a browser tab", () =>
     Effect.gen(function* () {
       const registry = yield* setup;

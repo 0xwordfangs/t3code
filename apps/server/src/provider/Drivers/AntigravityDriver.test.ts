@@ -354,7 +354,9 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         ]);
         for (const launch of nativeLaunches) {
           expect(launch.args).toEqual(hostPlatform === "linux" ? ["--uid="] : []);
-          expect(launch.profileDirectory).toBe(h.profileDirectory);
+          expect(launch.profileDirectory).toBe(
+            antigravityTextGenerationProfileDirectory(h.path, h.profileDirectory),
+          );
           expect(launch.forceFileStorage).toBe("1");
           expect(launch.extendEnv).toBe(false);
         }
@@ -1092,17 +1094,65 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           "verify:absent",
         ]);
 
-        // 2. Even with ~/.gemini/config/plugins/rtk/hooks.json active, supportsTextGeneration stays true
-        // and text generation runs on `<profile>-textgen` (sharing antigravity-acp, without config/plugins).
+        // 2. Model refresh runs on `<profile>-textgen` (plugin-free) and does not link or touch
+        // `<profile>/config/plugins`; interactive sessions still link user plugins onto `<profile>`
+        // and keep that link across subsequent refreshes.
+        const textGenProfile = antigravityTextGenerationProfileDirectory(path, h.profileDirectory);
         h.controls.selected = h.first;
+        const launchesBeforeRefresh = h.launches.length;
         yield* h.refresh();
         const readySnapshot = yield* h.instance.snapshot.getSnapshot;
         expect(readySnapshot.supportsTextGeneration).toBe(true);
+        const refreshLaunch = h.launches
+          .slice(launchesBeforeRefresh)
+          .find((launch) => launch.harnessPath !== undefined);
+        expect(refreshLaunch?.profileDirectory).toBe(textGenProfile);
+        expect(yield* fs.exists(path.join(textGenProfile, "config", "plugins"))).toBe(false);
+        expect(
+          yield* fs.readLink(path.join(textGenProfile, "config", "plugins")).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          ),
+        ).toBe(false);
+        expect(yield* fs.exists(path.join(h.profileDirectory, "config", "plugins"))).toBe(false);
+
+        const launchesBeforeInteractive = h.launches.length;
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const workspace = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-plugins-chat-" });
+            const threadId = ThreadId.make("thread-antigravity-interactive-plugins");
+            const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              cwd: workspace,
+            });
+            const modelSelection = { instanceId: h.instance.instanceId, model: "gemini-test-low" };
+            const session = yield* h.instance.orchestrationAdapter.openSession({
+              threadId,
+              providerSessionId: ProviderSessionId.make(
+                "provider-session-antigravity-interactive-plugins",
+              ),
+              modelSelection,
+              runtimePolicy,
+            });
+            yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+          }),
+        );
+        const interactiveLaunch = h.launches
+          .slice(launchesBeforeInteractive)
+          .find((launch) => launch.harnessPath !== undefined);
+        expect(interactiveLaunch?.profileDirectory).toBe(h.profileDirectory);
         expect(yield* fs.readLink(path.join(h.profileDirectory, "config", "plugins"))).toBe(
           path.join(fakeHome, ".gemini", "config", "plugins"),
         );
 
-        const textGenProfile = antigravityTextGenerationProfileDirectory(path, h.profileDirectory);
+        // A subsequent refreshModels must leave the interactive session's main-profile plugin link intact.
+        yield* h.refresh();
+        expect(yield* fs.readLink(path.join(h.profileDirectory, "config", "plugins"))).toBe(
+          path.join(fakeHome, ".gemini", "config", "plugins"),
+        );
+        expect(yield* fs.exists(path.join(textGenProfile, "config", "plugins"))).toBe(false);
+
         const launchesBeforeTextGen = h.launches.length;
         yield* h.instance.textGeneration
           .generateThreadTitle({
@@ -1140,6 +1190,274 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         expect(unauthenticatedSnapshot.auth.status).toBe("unauthenticated");
         expect(unauthenticatedSnapshot.models).toEqual([]);
         yield* h.assertClosed;
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "keeps user plugins absent for refreshModels (whole-dir and config-filtered), auth.logout, and non-codeLogin auth.start",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const fakeHome = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-non-interactive-" });
+        const userConfigDir = path.join(fakeHome, ".gemini", "config");
+        const enabledPluginDir = path.join(userConfigDir, "plugins", "rtk");
+        const disabledPluginDir = path.join(userConfigDir, "plugins", "disabled-plugin");
+        yield* fs.makeDirectory(enabledPluginDir, { recursive: true });
+        yield* fs.makeDirectory(disabledPluginDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(enabledPluginDir, "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"rtk"}]}}',
+        );
+        yield* fs.writeFileString(
+          path.join(disabledPluginDir, "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"disabled"}]}}',
+        );
+
+        const assertPluginsAbsentOnProfile = (profile: string) =>
+          Effect.gen(function* () {
+            const pluginsPath = path.join(profile, "config", "plugins");
+            expect(yield* fs.exists(pluginsPath)).toBe(false);
+            expect(
+              yield* fs.readLink(pluginsPath).pipe(
+                Effect.as(true),
+                Effect.orElseSucceed(() => false),
+              ),
+            ).toBe(false);
+          });
+
+        const makePluginProbeExecutable = (
+          base: AntigravityInstallation.AntigravityExecutable,
+          name: string,
+          probeLog: string,
+          options: {
+            readonly harnessPath: string | null;
+            readonly genericAuth?: boolean;
+          },
+        ) =>
+          Effect.gen(function* () {
+            const probeDir = path.join(path.dirname(base.executablePath), name);
+            const probeExecutable = path.join(probeDir, "agy-probe");
+            yield* fs.makeDirectory(probeDir, { recursive: true });
+            yield* fs.writeFileString(
+              probeExecutable,
+              [
+                "#!/bin/sh",
+                'plugins_state="absent"',
+                'if [ -e "$GEMINI_HOME/config/plugins" ] || [ -L "$GEMINI_HOME/config/plugins" ]; then plugins_state="present"; fi',
+                `printf '%s|%s\\n' "$GEMINI_HOME" "$plugins_state" >> ${shellQuote(probeLog)}`,
+                ...(options.genericAuth ? ["export T3_ACP_ANTIGRAVITY=0"] : []),
+                `exec ${shellQuote(base.executablePath)} "$@"`,
+                "",
+              ].join("\n"),
+            );
+            yield* fs.chmod(probeExecutable, 0o755);
+            return {
+              ...base,
+              executablePath: probeExecutable,
+              harnessPath: options.harnessPath,
+              version: name,
+            } satisfies AntigravityInstallation.AntigravityExecutable;
+          });
+
+        // 1. refreshModels (whole-dir & config.json-filtered) and auth.logout run on `<profile>-textgen`
+        // without config/plugins and preserve interactive session plugin links on `<profile>`.
+        const h = yield* makeHarness({
+          config: { authMethod: "oauth-personal" },
+          environment: [{ name: "HOME", value: fakeHome }],
+        });
+        const textGenProfile = antigravityTextGenerationProfileDirectory(path, h.profileDirectory);
+        const probeLog = path.join(path.dirname(h.first.executablePath), "non-interactive.log");
+        const probeExec = yield* makePluginProbeExecutable(h.first, "probe-refresh", probeLog, {
+          harnessPath: h.first.harnessPath,
+        });
+        h.controls.selected = probeExec;
+
+        // Whole-directory plugins mode (no config.json).
+        yield* h.refresh();
+        yield* assertPluginsAbsentOnProfile(textGenProfile);
+        expect(yield* fs.exists(path.join(h.profileDirectory, "config", "plugins"))).toBe(false);
+
+        // Filtered plugins mode (config.json disables disabled-plugin, keeps rtk).
+        yield* fs.writeFileString(
+          path.join(userConfigDir, "config.json"),
+          JSON.stringify({ plugins: { "disabled-plugin": { enabled: false } } }),
+        );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const workspace = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-filtered-chat-" });
+            const threadId = ThreadId.make("thread-antigravity-filtered-plugins");
+            const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              cwd: workspace,
+            });
+            const modelSelection = { instanceId: h.instance.instanceId, model: "gemini-test-low" };
+            const session = yield* h.instance.orchestrationAdapter.openSession({
+              threadId,
+              providerSessionId: ProviderSessionId.make(
+                "provider-session-antigravity-filtered-plugins",
+              ),
+              modelSelection,
+              runtimePolicy,
+            });
+            yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+          }),
+        );
+        expect(yield* fs.readLink(path.join(h.profileDirectory, "config", "plugins", "rtk"))).toBe(
+          enabledPluginDir,
+        );
+        expect(
+          yield* fs.exists(path.join(h.profileDirectory, "config", "plugins", "disabled-plugin")),
+        ).toBe(false);
+
+        // refreshModels under filtered config.json must stay plugin-free and preserve main-profile links.
+        yield* h.refresh();
+        yield* assertPluginsAbsentOnProfile(textGenProfile);
+        expect(yield* fs.readLink(path.join(h.profileDirectory, "config", "plugins", "rtk"))).toBe(
+          enabledPluginDir,
+        );
+
+        // auth.logout must also run plugin-free on textGenProfile and preserve main-profile links.
+        const nodePath = yield* HostProcess.ExecutablePath;
+        const logoutDir = path.join(path.dirname(h.first.executablePath), "probe-logout");
+        const logoutAgentScript = path.join(logoutDir, "logout-agent.mjs");
+        const logoutExecutable = path.join(logoutDir, "agy-logout");
+        const logoutMethodsLog = path.join(logoutDir, "methods.log");
+        yield* fs.makeDirectory(logoutDir, { recursive: true });
+        yield* fs.writeFileString(
+          logoutAgentScript,
+          [
+            'import * as fs from "node:fs";',
+            'import * as readline from "node:readline";',
+            `const methodsLog = ${JSON.stringify(logoutMethodsLog)};`,
+            "const rl = readline.createInterface({ input: process.stdin });",
+            'rl.on("line", (line) => {',
+            "  const msg = JSON.parse(line);",
+            "  if (msg.method) fs.appendFileSync(methodsLog, `${msg.method}\\n`);",
+            '  if (msg.method === "initialize") {',
+            '    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { auth: { logout: {} } } } }) + "\\n");',
+            "  } else if (msg.id !== undefined) {",
+            '    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\\n");',
+            "  }",
+            "});",
+            "",
+          ].join("\n"),
+        );
+        yield* fs.writeFileString(
+          logoutExecutable,
+          [
+            "#!/bin/sh",
+            'plugins_state="absent"',
+            'if [ -e "$GEMINI_HOME/config/plugins" ] || [ -L "$GEMINI_HOME/config/plugins" ]; then plugins_state="present"; fi',
+            `printf '%s|%s\\n' "$GEMINI_HOME" "$plugins_state" >> ${shellQuote(probeLog)}`,
+            `exec ${shellQuote(nodePath)} ${shellQuote(logoutAgentScript)}`,
+            "",
+          ].join("\n"),
+        );
+        yield* fs.chmod(logoutExecutable, 0o755);
+        h.controls.selected = {
+          ...h.first,
+          executablePath: logoutExecutable,
+          harnessPath: null,
+          version: "1.5.13",
+        };
+        const auth = h.instance.auth;
+        if (!auth?.logout) return yield* Effect.die("Antigravity auth logout is missing.");
+        yield* auth.logout(Effect.void);
+        expect((yield* fs.readFileString(logoutMethodsLog)).trim().split("\n")).toContain("logout");
+        yield* assertPluginsAbsentOnProfile(textGenProfile);
+        expect(yield* fs.readLink(path.join(h.profileDirectory, "config", "plugins", "rtk"))).toBe(
+          enabledPluginDir,
+        );
+
+        const observedLines = (yield* fs.readFileString(probeLog)).trim().split("\n");
+        expect(observedLines).toEqual([
+          `${textGenProfile}|absent`,
+          `${h.profileDirectory}|present`,
+          `${textGenProfile}|absent`,
+          `${textGenProfile}|absent`,
+        ]);
+        yield* h.assertClosed;
+
+        // 2. Non-codeLogin auth.start flows (gemini-api-key, oauth-business, agent-platform,
+        // and legacy 1.4 harnessPath !== null oauth-personal) must run plugin-free on textGenProfile.
+        const nonCodeLoginCases = [
+          {
+            label: "gemini-api-key",
+            config: { authMethod: "gemini-api-key" as const, apiKey: "test-gemini-key" },
+            useLegacyHarness: false,
+            genericAuth: false,
+          },
+          {
+            label: "oauth-business",
+            config: {
+              authMethod: "oauth-business" as const,
+              gcpProject: "demo-project",
+              gcpLocation: "us-central1",
+            },
+            useLegacyHarness: false,
+            genericAuth: true,
+          },
+          {
+            label: "agent-platform",
+            config: { authMethod: "agent-platform" as const, apiKey: "test-platform-key" },
+            useLegacyHarness: false,
+            genericAuth: true,
+          },
+          {
+            label: "legacy-1.4-oauth-personal",
+            config: { authMethod: "oauth-personal" as const },
+            useLegacyHarness: true,
+            genericAuth: false,
+          },
+        ] as const;
+
+        for (const testCase of nonCodeLoginCases) {
+          const authHarness = yield* makeHarness({
+            config: testCase.config,
+            environment: [{ name: "HOME", value: fakeHome }],
+          });
+          const authTextGenProfile = antigravityTextGenerationProfileDirectory(
+            path,
+            authHarness.profileDirectory,
+          );
+          const authProbeLog = path.join(
+            path.dirname(authHarness.first.executablePath),
+            `auth-${testCase.label}.log`,
+          );
+          authHarness.controls.selected = yield* makePluginProbeExecutable(
+            authHarness.first,
+            `probe-${testCase.label}`,
+            authProbeLog,
+            {
+              harnessPath: testCase.useLegacyHarness ? authHarness.first.harnessPath : null,
+              genericAuth: testCase.genericAuth,
+            },
+          );
+          const caseAuth = authHarness.instance.auth;
+          if (!caseAuth) return yield* Effect.die(`Missing auth for ${testCase.label}.`);
+          const owner = `owner-${testCase.label}`;
+          yield* caseAuth.start(owner);
+          yield* caseAuth.subscribe(owner).pipe(
+            Stream.filter((state) => state.phase === "succeeded" || state.phase === "failed"),
+            Stream.runHead,
+            Effect.map(Option.getOrThrow),
+            Effect.tap((state) =>
+              Effect.sync(() => {
+                expect(state.phase).toBe("succeeded");
+              }),
+            ),
+          );
+          expect((yield* fs.readFileString(authProbeLog)).trim().split("\n")).toEqual([
+            `${authTextGenProfile}|absent`,
+          ]);
+          yield* assertPluginsAbsentOnProfile(authTextGenProfile);
+          expect(
+            yield* fs.exists(path.join(authHarness.profileDirectory, "config", "plugins")),
+          ).toBe(false);
+          yield* authHarness.assertClosed;
+        }
       }),
   );
 });

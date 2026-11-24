@@ -805,3 +805,95 @@ describe("logout prompt authorization", () => {
       }),
   );
 });
+
+describe("server.refreshProviders authorization", () => {
+  const group = WsRpcGroup.omit(
+    ...[...WsRpcGroup.requests.keys()].filter(
+      (
+        tag,
+      ): tag is Exclude<
+        keyof typeof RPC_REQUIRED_SCOPES,
+        typeof WS_METHODS.serverRefreshProviders
+      > => tag !== WS_METHODS.serverRefreshProviders,
+    ),
+  );
+
+  it.effect(
+    "keeps read-only provider refreshes under orchestration:read and requires providers:manage for refreshModels or reloadSecrets",
+    () =>
+      Effect.gen(function* () {
+        let handled = 0;
+        const handler = group.toLayerHandler(WS_METHODS.serverRefreshProviders, () =>
+          Effect.sync(() => {
+            handled += 1;
+            return { providers: [] };
+          }),
+        );
+        const reader = yield* RpcTest.makeClient(group).pipe(
+          Effect.provide(
+            Layer.merge(handler, RpcAuthorization.layer([AuthOrchestrationReadScope])),
+          ),
+        );
+        const managerOnly = yield* RpcTest.makeClient(group).pipe(
+          Effect.provide(Layer.merge(handler, RpcAuthorization.layer([AuthProvidersManageScope]))),
+        );
+        const readerAndManager = yield* RpcTest.makeClient(group).pipe(
+          Effect.provide(
+            Layer.merge(
+              handler,
+              RpcAuthorization.layer([AuthOrchestrationReadScope, AuthProvidersManageScope]),
+            ),
+          ),
+        );
+
+        const readOnlyPayloads = [
+          {},
+          { modelCatalogOnly: true },
+          { instanceId: ProviderInstanceId.make("codex") },
+          { instanceId: ProviderInstanceId.make("codex"), cwd: "/repo", fresh: true },
+          { refreshModels: false, reloadSecrets: false },
+        ] as const;
+        for (const payload of readOnlyPayloads) {
+          expect(yield* reader[WS_METHODS.serverRefreshProviders](payload)).toEqual({
+            providers: [],
+          });
+        }
+        expect(handled).toBe(readOnlyPayloads.length);
+
+        const privilegedPayloads = [
+          { refreshModels: true },
+          { reloadSecrets: true },
+          { refreshModels: true, modelCatalogOnly: true },
+          { refreshModels: true, reloadSecrets: true },
+          { instanceId: ProviderInstanceId.make("codex"), cwd: "/repo", reloadSecrets: true },
+        ] as const;
+        for (const payload of privilegedPayloads) {
+          expect(
+            yield* reader[WS_METHODS.serverRefreshProviders](payload).pipe(Effect.flip),
+          ).toMatchObject({
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthProvidersManageScope,
+          });
+        }
+        expect(handled).toBe(readOnlyPayloads.length);
+
+        // Sessions with only providers:manage (without orchestration:read) cannot bypass read scope.
+        for (const payload of [{}, ...privilegedPayloads] as const) {
+          expect(
+            yield* managerOnly[WS_METHODS.serverRefreshProviders](payload).pipe(Effect.flip),
+          ).toMatchObject({
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthOrchestrationReadScope,
+          });
+        }
+        expect(handled).toBe(readOnlyPayloads.length);
+
+        for (const payload of privilegedPayloads) {
+          expect(yield* readerAndManager[WS_METHODS.serverRefreshProviders](payload)).toEqual({
+            providers: [],
+          });
+        }
+        expect(handled).toBe(readOnlyPayloads.length + privilegedPayloads.length);
+      }),
+  );
+});

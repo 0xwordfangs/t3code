@@ -481,6 +481,26 @@ describe("EnvironmentProviderSettings provider list", () => {
 
     await expect.element(select).toHaveAttribute("aria-pressed", "true");
   });
+
+  it("sends refreshModels and reloadSecrets only when providers:manage is granted", async () => {
+    await setup();
+    await setProviders([provider()]);
+    await using screen = await render(panel());
+
+    await userEvent.click(page.getByRole("button", { name: /Refresh provider status/ }));
+    expect(state.refresh).toHaveBeenLastCalledWith({
+      environmentId,
+      input: { refreshModels: true, reloadSecrets: true },
+    });
+
+    state.canManageProviders = false;
+    await screen.rerender(panel());
+    await userEvent.click(page.getByRole("button", { name: /Refresh provider status/ }));
+    expect(state.refresh).toHaveBeenLastCalledWith({
+      environmentId,
+      input: {},
+    });
+  });
 });
 
 describe("EnvironmentProviderSettings instance removal", () => {

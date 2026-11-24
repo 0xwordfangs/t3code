@@ -1,4 +1,5 @@
 import {
+  AuthProvidersManageScope,
   type EnvironmentId,
   type ProviderInstanceId,
   type ServerProvider,
@@ -13,6 +14,7 @@ import { m, type MessageResolver } from "../../i18n/messages";
 import { formatProviderDriverKindLabel } from "../../providerModels";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { serverEnvironment } from "../../state/server";
+import { readEnvironmentScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { RefreshIcon } from "../ui/refresh-icon";
 
@@ -160,9 +162,12 @@ export const ProviderStatusBanner = memo(function ProviderStatusBanner({
     if (!status || !canRefresh || refreshingRef.current) return;
     refreshingRef.current = true;
     setIsRefreshing(true);
+    const canManageProviders = readEnvironmentScope(environmentId, AuthProvidersManageScope);
     await refreshProviders({
       environmentId,
-      input: { instanceId: status.instanceId, refreshModels: true },
+      input: canManageProviders
+        ? { instanceId: status.instanceId, refreshModels: true }
+        : { instanceId: status.instanceId },
     });
     refreshingRef.current = false;
     setIsRefreshing(false);
