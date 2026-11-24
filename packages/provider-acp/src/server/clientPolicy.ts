@@ -19,12 +19,18 @@ export function unknownRecord(value: unknown): Record<string, unknown> | undefin
     : undefined;
 }
 
-function resolveAcpPermissionPath(path: string, cwd: string | null): string | undefined {
-  const trimmed = path.trim();
-  if (trimmed.length === 0) return undefined;
-  if (NodePath.isAbsolute(trimmed)) return trimmed;
+function resolveAcpPermissionPath(
+  path: string,
+  cwd: string | null,
+  options?: { readonly allowEdgeWhitespace?: boolean },
+): string | undefined {
+  if (path.trim().length === 0) return undefined;
+  if (options?.allowEdgeWhitespace !== true && path !== path.trim()) {
+    return undefined;
+  }
+  if (NodePath.isAbsolute(path)) return path;
   if (cwd === null || cwd.trim().length === 0) return undefined;
-  return `${cwd}${cwd.endsWith(NodePath.sep) ? "" : NodePath.sep}${trimmed}`;
+  return `${cwd}${cwd.endsWith(NodePath.sep) ? "" : NodePath.sep}${path}`;
 }
 
 function acpPathIsWithinRoot(path: string, root: string): boolean {
@@ -75,7 +81,9 @@ function acpCanonicalPathForContainment(path: string): string | undefined {
 
     const parent = stripTrailingSeparators(NodePath.dirname(candidate));
     if (parent === candidate) return undefined;
-    missingSuffix.unshift(NodePath.basename(candidate));
+    const segment = NodePath.basename(candidate);
+    if (segment === "..") return undefined;
+    missingSuffix.unshift(segment);
     candidate = parent;
   }
 }
@@ -116,7 +124,9 @@ function acpWorkspaceWriteAllowsMutation(
 ): boolean {
   const cwd =
     typeof runtimePolicy.cwd === "string" && runtimePolicy.cwd.trim().length > 0
-      ? (resolveAcpPermissionPath(runtimePolicy.cwd, process.cwd()) ?? null)
+      ? (resolveAcpPermissionPath(runtimePolicy.cwd, process.cwd(), {
+          allowEdgeWhitespace: true,
+        }) ?? null)
       : null;
   const roots: Array<string> = [];
   if (cwd !== null) {
@@ -127,7 +137,9 @@ function acpWorkspaceWriteAllowsMutation(
   if (Array.isArray(writableRoots)) {
     for (const writableRoot of writableRoots) {
       if (typeof writableRoot !== "string") continue;
-      const resolved = resolveAcpPermissionPath(writableRoot, cwd);
+      const resolved = resolveAcpPermissionPath(writableRoot, cwd, {
+        allowEdgeWhitespace: true,
+      });
       if (resolved === undefined) continue;
       const canonicalRoot = acpCanonicalPathForContainment(resolved);
       if (canonicalRoot !== undefined) roots.push(canonicalRoot);

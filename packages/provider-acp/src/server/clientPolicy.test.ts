@@ -308,6 +308,284 @@ describe("acpPermissionDisposition", () => {
         }
       }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect(
+    "denies missing-ancestor parent traversal that could collapse onto unprobed symlinks while keeping legitimate paths writable (R4-CF-03)",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-r4-cf-03-workspace-",
+        });
+        const outside = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-r4-cf-03-outside-",
+        });
+        const outsideFile = path.join(outside, "secret.ts");
+        yield* fileSystem.writeFileString(outsideFile, "outside");
+        yield* fileSystem.writeFileString(path.join(workspace, "existing.ts"), "existing");
+        yield* fileSystem.makeDirectory(path.join(workspace, "existing-sub"), { recursive: true });
+        yield* fileSystem.symlink(outsideFile, path.join(workspace, "linked-file.ts"));
+        yield* fileSystem.symlink(outside, path.join(workspace, "linked-dir"));
+        yield* fileSystem.symlink(
+          path.join(outside, "missing-target"),
+          path.join(workspace, "dangling-link"),
+        );
+        yield* fileSystem.symlink(outsideFile, path.join(workspace, "existing-sub", "sub-link.ts"));
+
+        const policies: ReadonlyArray<AcpRuntimePolicy> = [
+          {
+            runtimeMode: "full-access",
+            cwd: workspace,
+            approvalPolicy: "never",
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [],
+              networkAccess: false,
+            },
+          },
+          {
+            runtimeMode: "auto-accept-edits",
+            cwd: workspace,
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [],
+              networkAccess: false,
+            },
+          },
+        ];
+
+        const escapingPaths = [
+          "missing/../linked-file.ts",
+          "missing/../linked-dir/new.txt",
+          "missing/../dangling-link",
+          "missing/../dangling-link/",
+          "a/b/../../linked-dir/new2.txt",
+          "existing-sub/missing/../sub-link.ts",
+          "missing/..",
+          "missing/../",
+          "missing/./../linked-file.ts",
+          `${workspace}/missing/../linked-file.ts`,
+          `/nonexistent-top-xyz/..${workspace}/linked-file.ts`,
+        ] as const;
+
+        const legitimatePaths = [
+          "existing.ts",
+          "src/new-file.ts",
+          "existing-sub/../new-file.ts",
+          "existing-sub/../existing.ts",
+          "new-dir/",
+        ] as const;
+
+        for (const realPolicy of policies) {
+          for (const candidate of escapingPaths) {
+            assert.equal(
+              acpClientWriteDisposition(realPolicy, candidate),
+              "deny",
+              `expected client write deny for ${candidate}`,
+            );
+            for (const kind of ["edit", "delete", "move"] as const) {
+              assert.equal(
+                acpPermissionDisposition(
+                  realPolicy,
+                  permissionRequest(kind, [{ path: candidate }]),
+                ),
+                "deny",
+                `expected permission ${kind} deny for ${candidate}`,
+              );
+            }
+          }
+
+          for (const candidate of legitimatePaths) {
+            assert.equal(
+              acpClientWriteDisposition(realPolicy, candidate),
+              "allow",
+              `expected client write allow for ${candidate}`,
+            );
+            for (const kind of ["edit", "delete", "move"] as const) {
+              assert.equal(
+                acpPermissionDisposition(
+                  realPolicy,
+                  permissionRequest(kind, [{ path: candidate }]),
+                ),
+                "allow",
+                `expected permission ${kind} allow for ${candidate}`,
+              );
+            }
+          }
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "denies whitespace-padded paths and escaping symlinks with edge whitespace while preserving trusted roots with trailing whitespace (R4-CF-04)",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-r4-cf-04-workspace-",
+        });
+        const outside = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-r4-cf-04-outside-",
+        });
+        const outsideFile = path.join(outside, "secret.ts");
+        yield* fileSystem.writeFileString(outsideFile, "outside");
+
+        const symlinkNames = [
+          "ws-trail ",
+          "ws-dangling ",
+          " ws-lead",
+          "ws-dir ",
+          "ws-tab\t",
+          "ws-nl\n",
+        ] as const;
+
+        yield* fileSystem.symlink(outsideFile, path.join(workspace, "ws-trail "));
+        yield* fileSystem.symlink(
+          path.join(outside, "missing-target"),
+          path.join(workspace, "ws-dangling "),
+        );
+        yield* fileSystem.symlink(outsideFile, path.join(workspace, " ws-lead"));
+        yield* fileSystem.symlink(outside, path.join(workspace, "ws-dir "));
+        yield* fileSystem.symlink(outsideFile, path.join(workspace, "ws-tab\t"));
+        yield* fileSystem.symlink(outsideFile, path.join(workspace, "ws-nl\n"));
+
+        const policies: ReadonlyArray<AcpRuntimePolicy> = [
+          {
+            runtimeMode: "full-access",
+            cwd: workspace,
+            approvalPolicy: "never",
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [],
+              networkAccess: false,
+            },
+          },
+          {
+            runtimeMode: "auto-accept-edits",
+            cwd: workspace,
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [],
+              networkAccess: false,
+            },
+          },
+        ];
+
+        const deniedPaths = [
+          ...symlinkNames,
+          ...symlinkNames.map((name) => `${workspace}/${name}`),
+          "ws-dangling /",
+          "ws-dir /new.txt",
+          `${workspace}/ws-dir /new.txt`,
+          " /etc/passwd",
+          "/etc/passwd ",
+          " ../outside.txt",
+          "../outside.txt ",
+          " src/file.ts",
+          "src/file.ts ",
+        ];
+
+        for (const realPolicy of policies) {
+          for (const candidate of deniedPaths) {
+            assert.equal(
+              acpClientWriteDisposition(realPolicy, candidate),
+              "deny",
+              `expected client write deny for ${JSON.stringify(candidate)}`,
+            );
+            for (const kind of ["edit", "delete", "move"] as const) {
+              assert.equal(
+                acpPermissionDisposition(
+                  realPolicy,
+                  permissionRequest(kind, [{ path: candidate }]),
+                ),
+                "deny",
+                `expected permission ${kind} deny for ${JSON.stringify(candidate)}`,
+              );
+            }
+          }
+        }
+
+        const rootParent = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-r4-cf-04-roots-",
+        });
+        const workspaceWithTrailingSpace = path.join(rootParent, "workspace ");
+        const writableRootWithTrailingSpace = path.join(rootParent, "extra-root ");
+        yield* fileSystem.makeDirectory(workspaceWithTrailingSpace, { recursive: true });
+        yield* fileSystem.makeDirectory(writableRootWithTrailingSpace, { recursive: true });
+
+        const trailingSpaceRootPolicies: ReadonlyArray<AcpRuntimePolicy> = [
+          {
+            runtimeMode: "full-access",
+            cwd: workspaceWithTrailingSpace,
+            approvalPolicy: "never",
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [writableRootWithTrailingSpace],
+              networkAccess: false,
+            },
+          },
+          {
+            runtimeMode: "auto-accept-edits",
+            cwd: workspaceWithTrailingSpace,
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [writableRootWithTrailingSpace],
+              networkAccess: false,
+            },
+          },
+        ];
+
+        for (const rootPolicy of trailingSpaceRootPolicies) {
+          for (const allowedPath of [
+            "src/file.ts",
+            `${workspaceWithTrailingSpace}/src/file.ts`,
+            `${writableRootWithTrailingSpace}/generated.ts`,
+          ]) {
+            assert.equal(
+              acpClientWriteDisposition(rootPolicy, allowedPath),
+              "allow",
+              `expected client write allow for ${JSON.stringify(allowedPath)}`,
+            );
+            for (const kind of ["edit", "delete", "move"] as const) {
+              assert.equal(
+                acpPermissionDisposition(
+                  rootPolicy,
+                  permissionRequest(kind, [{ path: allowedPath }]),
+                ),
+                "allow",
+                `expected permission ${kind} allow for ${JSON.stringify(allowedPath)}`,
+              );
+            }
+          }
+
+          for (const paddedPath of [
+            " src/file.ts",
+            "src/file.ts ",
+            "src/file.ts\n",
+            workspaceWithTrailingSpace,
+            writableRootWithTrailingSpace,
+          ]) {
+            assert.equal(
+              acpClientWriteDisposition(rootPolicy, paddedPath),
+              "deny",
+              `expected client write deny for ${JSON.stringify(paddedPath)}`,
+            );
+            for (const kind of ["edit", "delete", "move"] as const) {
+              assert.equal(
+                acpPermissionDisposition(
+                  rootPolicy,
+                  permissionRequest(kind, [{ path: paddedPath }]),
+                ),
+                "deny",
+                `expected permission ${kind} deny for ${JSON.stringify(paddedPath)}`,
+              );
+            }
+          }
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });
 
 describe("acpMcpToolApprovalElicitationDisposition", () => {
