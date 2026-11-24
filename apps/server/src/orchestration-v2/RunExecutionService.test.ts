@@ -35,6 +35,7 @@ import {
 } from "@t3tools/contracts";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
+import * as AcpRegistryRuntimeCoordinator from "@t3tools/provider-acp-registry/server/AcpRegistryRuntimeCoordinator";
 import { AcpRegistryAdapterV2Driver } from "@t3tools/provider-acp-registry/server";
 import { makeAcpRegistryAdapterV2 } from "@t3tools/provider-acp-registry/testing";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
@@ -53,6 +54,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -67,6 +69,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import { makeAntigravityAdapterV2 } from "./Adapters/AntigravityAdapterV2.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import type { PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
+import * as EffectWorker from "./EffectWorker.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -5316,7 +5319,7 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
     readonly sessionId: string;
     readonly makeRuntime: (runtimeInput: {
       readonly onOutgoingResponse?: ((requestId: string) => Effect.Effect<void>) | undefined;
-    }) => Effect.Effect<AcpSessionRuntime.AcpSessionRuntime["Service"]>;
+    }) => Effect.Effect<AcpSessionRuntime.AcpSessionRuntime["Service"], never, Scope.Scope>;
     readonly wrapAdapter: (
       adapter: ProviderAdapter.ProviderAdapterV2["Service"],
     ) => ProviderAdapter.ProviderAdapterV2["Service"];
@@ -5328,6 +5331,16 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
     readonly emitUpdate: (
       update: EffectAcpSchema.SessionUpdate,
     ) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+    readonly emitCopilotSessionEvent: (
+      type: string,
+      data?: Record<string, unknown>,
+    ) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+    readonly permissionHandler:
+      | Parameters<AcpSessionRuntime.AcpSessionRuntime["Service"]["handleRequestPermission"]>[0]
+      | undefined;
+    readonly elicitationHandler:
+      | Parameters<AcpSessionRuntime.AcpSessionRuntime["Service"]["handleElicitation"]>[0]
+      | undefined;
     readonly requestPermission: (
       toolCallId: string,
       requestId?: string,
@@ -5348,6 +5361,7 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
     readonly terminateProcessGroupCalled: Deferred.Deferred<void>;
     readonly closeSessionCalled: Deferred.Deferred<void>;
     readonly runtimeCreateCount: number;
+    readonly runtimeScopeCloseCount: number;
     readonly terminateProcessGroupCount: number;
     readonly closeSessionCount: number;
     readonly cancelCount: number;
@@ -5364,6 +5378,10 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
     type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
     let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
     let permissionHandler: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+    let elicitationHandler: Parameters<RuntimeService["handleElicitation"]>[0] | undefined;
+    let copilotSessionEventHandler:
+      | ((params: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>)
+      | undefined;
     let createTerminalHandler: Parameters<RuntimeService["handleCreateTerminal"]>[0] | undefined;
     let terminalOutputHandler: Parameters<RuntimeService["handleTerminalOutput"]>[0] | undefined;
     let onOutgoingResponse: ((requestId: string) => Effect.Effect<void>) | undefined;
@@ -5384,6 +5402,7 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
     const closeSessionCalled = yield* Deferred.make<void>();
     const interruptCalls: Array<ProviderAdapter.ProviderAdapterV2InterruptInput> = [];
     let runtimeCreateCount = 0;
+    let runtimeScopeCloseCount = 0;
     let terminateProcessGroupCount = 0;
     let closeSessionCount = 0;
     let cancelCount = 0;
@@ -5414,94 +5433,110 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
       makeRuntime: (runtimeInput) => {
         runtimeCreateCount += 1;
         onOutgoingResponse = runtimeInput.onOutgoingResponse;
-        return Effect.succeed({
-          handleRequestPermission: (handler) =>
+        return Effect.acquireRelease(
+          Effect.succeed({
+            handleRequestPermission: (handler) =>
+              Effect.sync(() => {
+                permissionHandler = handler;
+              }),
+            handleElicitation: (handler) =>
+              Effect.sync(() => {
+                elicitationHandler = handler;
+              }),
+            handleMcpConnect: () => Effect.void,
+            handleMcpMessage: () => Effect.void,
+            handleMcpDisconnect: () => Effect.void,
+            handleMcpNotification: () => Effect.void,
+            handleReadTextFile: () => Effect.void,
+            handleWriteTextFile: () => Effect.void,
+            handleCreateTerminal: (handler) =>
+              Effect.sync(() => {
+                createTerminalHandler = handler;
+              }),
+            handleTerminalOutput: (handler) =>
+              Effect.sync(() => {
+                terminalOutputHandler = handler;
+              }),
+            handleTerminalWaitForExit: () => Effect.void,
+            handleTerminalKill: () => Effect.void,
+            handleTerminalRelease: () => Effect.void,
+            handleSessionUpdate: (handler) =>
+              Effect.sync(() => {
+                sessionUpdateHandler = handler;
+              }),
+            handleElicitationComplete: () => Effect.void,
+            handleUnknownExtRequest: () => Effect.void,
+            handleUnknownExtNotification: () => Effect.void,
+            handleExtRequest: () => Effect.void,
+            handleExtNotification: (method, _schema, handler) =>
+              Effect.sync(() => {
+                if (method === "github.com/copilot/sessionEvent") {
+                  copilotSessionEventHandler = handler as (
+                    params: unknown,
+                  ) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+                }
+              }),
+            initialize: () => Effect.succeed(startResult.initializeResult),
+            start: () => Effect.succeed(startResult),
+            getEvents: () => Stream.empty,
+            drainEvents: Effect.void,
+            getModeState: Effect.undefined,
+            getConfigOptions: Effect.succeed([]),
+            configOptionChanges: Stream.empty,
+            loadSession: (requestedSessionId) =>
+              Effect.succeed({ ...startResult, sessionId: requestedSessionId }),
+            resumeSession: () => Effect.succeed(startResult),
+            forkSession: () => Effect.succeed(startResult),
+            listSessions: () => unsupported("session/list"),
+            closeSession: () =>
+              Effect.suspend(() => {
+                closeSessionCount += 1;
+                return Deferred.succeed(closeSessionCalled, undefined).pipe(Effect.as({}));
+              }),
+            deleteSession: () => unsupported("session/delete"),
+            listProviders: unsupported("provider/list"),
+            setProvider: () => unsupported("provider/set"),
+            disableProvider: () => unsupported("provider/disable"),
+            logout: unsupported("logout"),
+            prompt: (_payload, promptOptions) =>
+              Effect.gen(function* () {
+                if (promptOptions?.dispatched !== undefined) {
+                  yield* Deferred.succeed(promptOptions.dispatched, undefined);
+                }
+                yield* Deferred.succeed(promptStarted, undefined);
+                if (options.immediatePromptResult !== undefined) {
+                  return options.immediatePromptResult;
+                }
+                return yield* Deferred.await(promptGate);
+              }),
+            cancel: Effect.suspend(() => {
+              cancelCount += 1;
+              return options.cancelResolvesPrompt === true
+                ? Deferred.succeed(promptGate, { stopReason: "cancelled" }).pipe(Effect.asVoid)
+                : Effect.void;
+            }),
+            ...(options.supportsTerminateProcessGroup === true
+              ? {
+                  terminateProcessGroup: Effect.suspend(() => {
+                    terminateProcessGroupCount += 1;
+                    return Deferred.succeed(terminateProcessGroupCalled, undefined).pipe(
+                      Effect.asVoid,
+                    );
+                  }),
+                }
+              : {}),
+            setMode: () => Effect.succeed({}),
+            setSessionModel: () => Effect.succeed({}),
+            setConfigOption: () => Effect.succeed({ configOptions: [] }),
+            setModel: () => Effect.void,
+            request: (method) => unsupported(method),
+            notify: () => Effect.void,
+          } satisfies RuntimeService),
+          () =>
             Effect.sync(() => {
-              permissionHandler = handler;
+              runtimeScopeCloseCount += 1;
             }),
-          handleElicitation: () => Effect.void,
-          handleMcpConnect: () => Effect.void,
-          handleMcpMessage: () => Effect.void,
-          handleMcpDisconnect: () => Effect.void,
-          handleMcpNotification: () => Effect.void,
-          handleReadTextFile: () => Effect.void,
-          handleWriteTextFile: () => Effect.void,
-          handleCreateTerminal: (handler) =>
-            Effect.sync(() => {
-              createTerminalHandler = handler;
-            }),
-          handleTerminalOutput: (handler) =>
-            Effect.sync(() => {
-              terminalOutputHandler = handler;
-            }),
-          handleTerminalWaitForExit: () => Effect.void,
-          handleTerminalKill: () => Effect.void,
-          handleTerminalRelease: () => Effect.void,
-          handleSessionUpdate: (handler) =>
-            Effect.sync(() => {
-              sessionUpdateHandler = handler;
-            }),
-          handleElicitationComplete: () => Effect.void,
-          handleUnknownExtRequest: () => Effect.void,
-          handleUnknownExtNotification: () => Effect.void,
-          handleExtRequest: () => Effect.void,
-          handleExtNotification: () => Effect.void,
-          initialize: () => Effect.succeed(startResult.initializeResult),
-          start: () => Effect.succeed(startResult),
-          getEvents: () => Stream.empty,
-          drainEvents: Effect.void,
-          getModeState: Effect.undefined,
-          getConfigOptions: Effect.succeed([]),
-          configOptionChanges: Stream.empty,
-          loadSession: (requestedSessionId) =>
-            Effect.succeed({ ...startResult, sessionId: requestedSessionId }),
-          resumeSession: () => Effect.succeed(startResult),
-          forkSession: () => Effect.succeed(startResult),
-          listSessions: () => unsupported("session/list"),
-          closeSession: () =>
-            Effect.suspend(() => {
-              closeSessionCount += 1;
-              return Deferred.succeed(closeSessionCalled, undefined).pipe(Effect.as({}));
-            }),
-          deleteSession: () => unsupported("session/delete"),
-          listProviders: unsupported("provider/list"),
-          setProvider: () => unsupported("provider/set"),
-          disableProvider: () => unsupported("provider/disable"),
-          logout: unsupported("logout"),
-          prompt: (_payload, promptOptions) =>
-            Effect.gen(function* () {
-              if (promptOptions?.dispatched !== undefined) {
-                yield* Deferred.succeed(promptOptions.dispatched, undefined);
-              }
-              yield* Deferred.succeed(promptStarted, undefined);
-              if (options.immediatePromptResult !== undefined) {
-                return options.immediatePromptResult;
-              }
-              return yield* Deferred.await(promptGate);
-            }),
-          cancel: Effect.suspend(() => {
-            cancelCount += 1;
-            return options.cancelResolvesPrompt === true
-              ? Deferred.succeed(promptGate, { stopReason: "cancelled" }).pipe(Effect.asVoid)
-              : Effect.void;
-          }),
-          ...(options.supportsTerminateProcessGroup === true
-            ? {
-                terminateProcessGroup: Effect.suspend(() => {
-                  terminateProcessGroupCount += 1;
-                  return Deferred.succeed(terminateProcessGroupCalled, undefined).pipe(
-                    Effect.asVoid,
-                  );
-                }),
-              }
-            : {}),
-          setMode: () => Effect.succeed({}),
-          setSessionModel: () => Effect.succeed({}),
-          setConfigOption: () => Effect.succeed({ configOptions: [] }),
-          setModel: () => Effect.void,
-          request: (method) => unsupported(method),
-          notify: () => Effect.void,
-        } satisfies RuntimeService);
+        );
       },
       wrapAdapter: (adapter) => ({
         ...adapter,
@@ -5554,6 +5589,14 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
         >();
       }),
       emitUpdate: (update) => sessionUpdateHandler!({ sessionId: options.sessionId, update }),
+      emitCopilotSessionEvent: (type, data = {}) =>
+        copilotSessionEventHandler!({ sessionId: options.sessionId, type, data }),
+      get permissionHandler() {
+        return permissionHandler;
+      },
+      get elicitationHandler() {
+        return elicitationHandler;
+      },
       requestPermission: (toolCallId, requestId = `perm-${toolCallId}`) =>
         permissionHandler!(
           {
@@ -5588,6 +5631,9 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
       closeSessionCalled,
       get runtimeCreateCount() {
         return runtimeCreateCount;
+      },
+      get runtimeScopeCloseCount() {
+        return runtimeScopeCloseCount;
       },
       get terminateProcessGroupCount() {
         return terminateProcessGroupCount;
@@ -6042,6 +6088,546 @@ describe("raced Stop after provider turn start containment (R3-CF-02)", () => {
               runEffectWorker: true,
               runContinuationWorker: true,
             }),
+          ),
+        );
+      }),
+  );
+
+  it.effect.each(["hermes", "github-copilot-cli"] as const)(
+    "R4-CF-02: %s raced turn-start Stop restarts runtime on Turn 2, closes Runtime #1 scope, and rejects stale Runtime #1 permission and URL elicitation",
+    (agent) =>
+      Effect.gen(function* () {
+        const controller = yield* makeRacedAcpRuntimeController({
+          sessionId: `sess-r4-cf02-race-${agent}`,
+          cancelResolvesPrompt: true,
+        });
+        const instanceId = ProviderInstanceId.make(`r4-cf02-race-${agent}`);
+        const coordinatorLayer = AcpRegistryRuntimeCoordinator.layer;
+        let continuationOffers = 0;
+
+        const registryLayer = ProviderAdapterRegistry.layerFromAdaptersEffect(
+          Effect.gen(function* () {
+            const continuationRequests =
+              yield* ProviderContinuationRequests.ProviderContinuationRequests;
+            const adapter = yield* makeAcpRegistryAdapterV2({
+              instanceId,
+              selfInvocation: yield* resolveSelfInvocation(),
+              settings: yield* decodeAcpRegistrySettings(
+                agent === "hermes"
+                  ? { source: "local", commandPath: "hermes", commandArgs: ["acp"] }
+                  : { agentId: "github-copilot-cli" },
+              ).pipe(Effect.orDie),
+              environment: {},
+              makeRuntime: controller.makeRuntime,
+              continuationRequests: {
+                offer: (request) =>
+                  Effect.sync(() => {
+                    continuationOffers += 1;
+                  }).pipe(Effect.andThen(continuationRequests.offer(request))),
+              },
+            });
+            return [controller.wrapAdapter(adapter)];
+          }),
+        ).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              layerHost,
+              layerMockCatalog,
+              coordinatorLayer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+              IdAllocator.layer,
+            ),
+          ),
+        );
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const coordinator = yield* AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator;
+          const threadId = ThreadId.make(`thread-r4-cf02-race-${agent}`);
+          const modelSelection = { instanceId, model: "default" } as const;
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`create-r4-cf02-${agent}`),
+            threadId,
+            projectId: ProjectId.make(`project-r4-cf02-${agent}`),
+            title: `R4-CF-02 raced stop ${agent}`,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: process.cwd(),
+            createdBy: "user",
+            creationSource: "web",
+          });
+
+          const turn1Race = yield* controller.holdNextTurnEvent;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`msg-1-${agent}`),
+            threadId,
+            messageId: MessageId.make(`message-1-${agent}`),
+            text: "Start turn 1",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(turn1Race.held);
+
+          const stalePermissionHandler = controller.permissionHandler!;
+          const staleElicitationHandler = controller.elicitationHandler!;
+
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make(`stop-r4-cf02-${agent}`),
+            threadId,
+          });
+          yield* Deferred.succeed(turn1Race.release, undefined);
+
+          const interruptCall = yield* Deferred.await(controller.interruptCompleted);
+          assert.equal(interruptCall.requestRuntimeRestart, true);
+
+          // Post-Stop update must be quarantined and must not wake a new run.
+          yield* controller.emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "post-stop-wake-after-race" },
+          });
+          yield* Effect.yieldNow;
+          assert.equal(continuationOffers, 0);
+          assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 1);
+
+          // Next explicit user turn must restart onto Runtime #2 and close Runtime #1's scope.
+          yield* controller.resetPrompt;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`msg-2-${agent}`),
+            threadId,
+            messageId: MessageId.make(`message-2-${agent}`),
+            text: "Start turn 2",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Deferred.await(controller.promptStarted);
+          assert.equal(controller.runtimeCreateCount, 2);
+          assert.equal(controller.runtimeScopeCloseCount, 1);
+
+          const stalePermFiber = yield* stalePermissionHandler(
+            {
+              sessionId: controller.sessionId,
+              toolCall: { toolCallId: "stale-race-perm", kind: "execute", title: "Stale command" },
+              options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+            },
+            { requestId: "stale-race-perm-req", method: "session/request_permission" },
+          ).pipe(Effect.forkScoped);
+          const staleUrlFiber = yield* staleElicitationHandler(
+            {
+              sessionId: controller.sessionId,
+              mode: "url",
+              elicitationId: "stale-race-url",
+              url: "https://example.test/stale-race-auth",
+              message: "Stale URL auth",
+            },
+            { requestId: "stale-race-url-req", method: "elicitation/create" },
+          ).pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          assert.isUndefined(stalePermFiber.pollUnsafe());
+          assert.isUndefined(staleUrlFiber.pollUnsafe());
+          assert.isTrue(Option.isNone(yield* coordinator.getUrlAuthAction(instanceId)));
+          yield* Fiber.interrupt(stalePermFiber);
+          yield* Fiber.interrupt(staleUrlFiber);
+
+          yield* Deferred.succeed(controller.promptGate, { stopReason: "end_turn" });
+          const afterTurn2 = yield* awaitRunStatus(orchestrator, threadId, 1, "completed");
+          assert.equal(afterTurn2.runs[1]?.status, "completed");
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              coordinatorLayer,
+              ProviderReplayHarness.layerWithRegistry(
+                { name: `r4-cf02-race-${agent}` },
+                registryLayer,
+                { runEffectWorker: true, runContinuationWorker: true },
+              ),
+            ),
+          ),
+        );
+      }),
+  );
+
+  it.effect.each(["thread.stop", "run.interrupt"] as const)(
+    "R4-CF-01: Antigravity pre-start Run 2 stopped via %s interrupts Run 1 background work, quarantines continuations, and blocks post-Stop Run 3 and auto-approval",
+    (stopKind) =>
+      Effect.gen(function* () {
+        const stopSlug = stopKind.replace(".", "-");
+        const controller = yield* makeRacedAcpRuntimeController({
+          sessionId: `sess-r4-cf01-agy-${stopSlug}`,
+          supportsTerminateProcessGroup: true,
+        });
+        const instanceId = ProviderInstanceId.make(`antigravity-r4-cf01-${stopSlug}`);
+        let continuationOffers = 0;
+
+        const registryLayer = ProviderAdapterRegistry.layerFromAdaptersEffect(
+          Effect.gen(function* () {
+            const continuationRequests =
+              yield* ProviderContinuationRequests.ProviderContinuationRequests;
+            const adapter = yield* makeAntigravityAdapterV2({
+              instanceId,
+              selfInvocation: yield* resolveSelfInvocation(),
+              makeRuntime: controller.makeRuntime,
+              withProcess: (_stop, task) => task,
+              defaultModel: Effect.undefined,
+              continuationRequests: {
+                offer: (request) =>
+                  Effect.sync(() => {
+                    continuationOffers += 1;
+                  }).pipe(Effect.andThen(continuationRequests.offer(request))),
+              },
+            });
+            return [controller.wrapAdapter(adapter)];
+          }),
+        ).pipe(
+          Layer.provide(
+            Layer.mergeAll(layerHost, NodeServices.layer, NodeCrypto.layer, IdAllocator.layer),
+          ),
+        );
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = ThreadId.make(`thread-r4-cf01-agy-${stopSlug}`);
+          const modelSelection = { instanceId, model: ANTIGRAVITY_DEFAULT_MODEL } as const;
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`create-r4-cf01-agy-${stopSlug}`),
+            threadId,
+            projectId: ProjectId.make(`project-r4-cf01-agy-${stopSlug}`),
+            title: "Antigravity pre-start stop",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: process.cwd(),
+            createdBy: "user",
+            creationSource: "web",
+          });
+
+          // Run 1 starts an open background execute command and settles while it stays detached.
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("agy-run-1"),
+            threadId,
+            messageId: MessageId.make("agy-msg-1"),
+            text: "Start background command",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const drainRun1 = yield* Effect.forkChild(worker.drain());
+          yield* Deferred.await(controller.promptStarted);
+          yield* controller.emitUpdate({
+            sessionUpdate: "tool_call",
+            toolCallId: "agy-bg-cmd-1",
+            kind: "execute",
+            title: "Run background server",
+            status: "in_progress",
+            rawInput: { CommandLine: "node server.js", IsDaemon: true },
+          });
+          yield* Deferred.succeed(controller.promptGate, { stopReason: "end_turn" });
+          yield* awaitRunStatus(orchestrator, threadId, 0, "waiting");
+          yield* Fiber.join(drainRun1);
+          yield* worker.drain();
+          yield* awaitRunStatus(orchestrator, threadId, 0, "completed");
+
+          const afterRun1 = yield* orchestrator.getThreadProjection(threadId);
+          const run1Turn = afterRun1.providerTurns[0]!;
+          assert.isNotEmpty(afterRun1.providerThreads[0]?.pendingBackgroundTasks ?? []);
+
+          // Dispatch Run 2 on the same providerThread without draining the effect worker,
+          // so Run 2 is in starting status with providerTurn === undefined.
+          yield* controller.resetPrompt;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("agy-run-2"),
+            threadId,
+            messageId: MessageId.make("agy-msg-2"),
+            text: "Follow up on Antigravity",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const beforeStop = yield* orchestrator.getThreadProjection(threadId);
+          const run2 = beforeStop.runs[1]!;
+          assert.equal(run2.status, "starting");
+          assert.equal(run2.providerThreadId, run1Turn.providerThreadId);
+          assert.isUndefined(
+            beforeStop.providerTurns.find(
+              (candidate) => candidate.runAttemptId === run2.activeAttemptId,
+            ),
+          );
+
+          // Stop Run 2 before its provider turn starts.
+          yield* orchestrator.dispatch(
+            stopKind === "thread.stop"
+              ? {
+                  type: "thread.stop",
+                  commandId: CommandId.make("agy-stop-prestart"),
+                  threadId,
+                }
+              : {
+                  type: "run.interrupt",
+                  commandId: CommandId.make("agy-stop-prestart"),
+                  threadId,
+                  runId: run2.id,
+                },
+          );
+          yield* worker.drain();
+
+          const interruptCall = yield* Deferred.await(controller.interruptCompleted);
+          assert.equal(interruptCall.providerTurnId, run1Turn.id);
+          assert.equal(interruptCall.requestRuntimeRestart, true);
+          yield* Deferred.await(controller.terminateProcessGroupCalled);
+          assert.equal(controller.terminateProcessGroupCount, 1);
+
+          // Late updates must not offer a continuation or create Run 3, and late permission
+          // requests must not be auto-approved under full-access.
+          const stalePermFiber = yield* controller
+            .requestPermission("agy-post-stop-perm")
+            .pipe(Effect.forkScoped);
+          yield* controller.emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Late Antigravity background wake" },
+          });
+          yield* Effect.yieldNow;
+          assert.isUndefined(stalePermFiber.pollUnsafe());
+          yield* Fiber.interrupt(stalePermFiber);
+          assert.equal(continuationOffers, 0);
+
+          const afterStop = yield* orchestrator.getThreadProjection(threadId);
+          assert.lengthOf(afterStop.runs, 2);
+          assert.equal(afterStop.runs[1]?.status, "interrupted");
+          assert.deepEqual(afterStop.providerThreads[0]?.pendingBackgroundTasks, []);
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              { name: `r4-cf01-agy-${stopSlug}` },
+              registryLayer,
+              { runEffectWorker: false, runContinuationWorker: true },
+            ),
+          ),
+        );
+      }),
+  );
+
+  it.effect.each(["thread.stop", "run.interrupt"] as const)(
+    "R4-CF-01: GitHub Copilot CLI pre-start Run 2 stopped via %s interrupts Run 1 background work, quarantines continuations, blocks post-Stop Run 3 / auto-approval, and restarts on next turn",
+    (stopKind) =>
+      Effect.gen(function* () {
+        const stopSlug = stopKind.replace(".", "-");
+        const controller = yield* makeRacedAcpRuntimeController({
+          sessionId: `sess-r4-cf01-copilot-${stopSlug}`,
+          cancelResolvesPrompt: true,
+        });
+        const instanceId = ProviderInstanceId.make(`copilot-r4-cf01-${stopSlug}`);
+        let continuationOffers = 0;
+
+        const registryLayer = ProviderAdapterRegistry.layerFromAdaptersEffect(
+          Effect.gen(function* () {
+            const continuationRequests =
+              yield* ProviderContinuationRequests.ProviderContinuationRequests;
+            const adapter = yield* makeAcpRegistryAdapterV2({
+              instanceId,
+              selfInvocation: yield* resolveSelfInvocation(),
+              settings: yield* decodeAcpRegistrySettings({
+                agentId: "github-copilot-cli",
+              }).pipe(Effect.orDie),
+              environment: {},
+              makeRuntime: controller.makeRuntime,
+              continuationRequests: {
+                offer: (request) =>
+                  Effect.sync(() => {
+                    continuationOffers += 1;
+                  }).pipe(Effect.andThen(continuationRequests.offer(request))),
+              },
+            });
+            return [controller.wrapAdapter(adapter)];
+          }),
+        ).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              layerHost,
+              layerMockCatalog,
+              NodeServices.layer,
+              NodeCrypto.layer,
+              IdAllocator.layer,
+            ),
+          ),
+        );
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = ThreadId.make(`thread-r4-cf01-copilot-${stopSlug}`);
+          const modelSelection = { instanceId, model: "default" } as const;
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`create-r4-cf01-copilot-${stopSlug}`),
+            threadId,
+            projectId: ProjectId.make(`project-r4-cf01-copilot-${stopSlug}`),
+            title: "Copilot pre-start stop",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: process.cwd(),
+            createdBy: "user",
+            creationSource: "web",
+          });
+
+          // Run 1 starts a background Copilot subagent and settles on assistant.idle while it runs.
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("copilot-run-1"),
+            threadId,
+            messageId: MessageId.make("copilot-msg-1"),
+            text: "Launch background Copilot subagent",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const drainRun1 = yield* Effect.forkChild(worker.drain());
+          yield* Deferred.await(controller.promptStarted);
+          yield* controller.emitCopilotSessionEvent("assistant.turn_start");
+          yield* controller.emitUpdate({
+            sessionUpdate: "tool_call",
+            toolCallId: "copilot-bg-agent-1",
+            kind: "other",
+            title: "Explore repo",
+            status: "in_progress",
+            rawInput: {
+              agent_type: "explore",
+              prompt: "Inspect repo in background",
+              mode: "background",
+            },
+          });
+          yield* controller.emitCopilotSessionEvent("assistant.idle");
+          yield* Deferred.succeed(controller.promptGate, { stopReason: "end_turn" });
+          yield* awaitRunStatus(orchestrator, threadId, 0, "waiting");
+          yield* Fiber.join(drainRun1);
+          yield* worker.drain();
+          yield* awaitRunStatus(orchestrator, threadId, 0, "completed");
+
+          const afterRun1 = yield* orchestrator.getThreadProjection(threadId);
+          const run1Turn = afterRun1.providerTurns[0]!;
+          assert.isTrue(
+            afterRun1.turnItems.some(
+              (item) => item.type === "subagent" && item.status === "running",
+            ),
+          );
+
+          // Dispatch Run 2 on the same providerThread without draining the effect worker.
+          yield* controller.resetPrompt;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("copilot-run-2"),
+            threadId,
+            messageId: MessageId.make("copilot-msg-2"),
+            text: "Follow up on Copilot",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const beforeStop = yield* orchestrator.getThreadProjection(threadId);
+          const run2 = beforeStop.runs[1]!;
+          assert.equal(run2.status, "starting");
+          assert.equal(run2.providerThreadId, run1Turn.providerThreadId);
+          assert.isUndefined(
+            beforeStop.providerTurns.find(
+              (candidate) => candidate.runAttemptId === run2.activeAttemptId,
+            ),
+          );
+
+          // Stop Run 2 before its provider turn starts.
+          yield* orchestrator.dispatch(
+            stopKind === "thread.stop"
+              ? {
+                  type: "thread.stop",
+                  commandId: CommandId.make("copilot-stop-prestart"),
+                  threadId,
+                }
+              : {
+                  type: "run.interrupt",
+                  commandId: CommandId.make("copilot-stop-prestart"),
+                  threadId,
+                  runId: run2.id,
+                },
+          );
+          yield* worker.drain();
+
+          const interruptCall = yield* Deferred.await(controller.interruptCompleted);
+          assert.equal(interruptCall.providerTurnId, run1Turn.id);
+          assert.equal(interruptCall.requestRuntimeRestart, true);
+
+          // Late Copilot background wake must be quarantined (no continuation offer, no Run 3)
+          // and late permission requests must be cancelled instead of auto-approved.
+          yield* controller.emitCopilotSessionEvent("assistant.turn_start");
+          yield* controller.emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Late Copilot background agent finished" },
+          });
+          yield* Effect.yieldNow;
+          assert.equal(continuationOffers, 0);
+          assert.deepEqual(yield* controller.requestPermission("copilot-post-stop-perm"), {
+            outcome: { outcome: "cancelled" },
+          });
+
+          const afterStop = yield* orchestrator.getThreadProjection(threadId);
+          assert.lengthOf(afterStop.runs, 2);
+          assert.equal(afterStop.runs[1]?.status, "interrupted");
+          assert.isTrue(
+            afterStop.turnItems.some(
+              (item) => item.type === "subagent" && item.status === "interrupted",
+            ),
+          );
+
+          // Next explicit user turn (Run 3) restarts Runtime #1 -> Runtime #2 cleanly.
+          yield* controller.resetPrompt;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("copilot-run-3"),
+            threadId,
+            messageId: MessageId.make("copilot-msg-3"),
+            text: "Explicit follow-up after stop",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const drainRun3 = yield* Effect.forkChild(worker.drain());
+          yield* Deferred.await(controller.promptStarted);
+          assert.equal(controller.runtimeCreateCount, 2);
+          assert.equal(controller.runtimeScopeCloseCount, 1);
+          yield* Deferred.succeed(controller.promptGate, { stopReason: "end_turn" });
+          yield* awaitRunStatus(orchestrator, threadId, 2, "waiting");
+          yield* Fiber.join(drainRun3);
+          yield* worker.drain();
+          yield* awaitRunStatus(orchestrator, threadId, 2, "completed");
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              { name: `r4-cf01-copilot-${stopSlug}` },
+              registryLayer,
+              { runEffectWorker: false, runContinuationWorker: true },
+            ),
           ),
         );
       }),

@@ -8606,8 +8606,24 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         });
 
         const restartAcpRuntime = Effect.fnUntraced(function* (threadId: ThreadId | null) {
+          if ((yield* Ref.get(activeTurn)) !== null) {
+            yield* cancelPendingRuntimeRequests();
+          }
           yield* runtimeCallbackPermit.withPermit(
             Effect.gen(function* () {
+              const lingering = yield* Ref.get(activeTurn);
+              if (lingering !== null && !lingering.finalized) {
+                if (lingering.interrupted !== true) {
+                  yield* terminalizeOpenForegroundTools(lingering, "failed");
+                }
+                yield* finalizeTurn(
+                  lingering,
+                  lingering.interrupted === true ? "interrupted" : "failed",
+                  lingering.interrupted === true
+                    ? undefined
+                    : makeProviderFailure({ class: "transport_error" }),
+                );
+              }
               const previousGeneration = yield* Ref.get(runtimeCallbackGeneration);
               yield* quarantineNativeTransportAtGeneration(previousGeneration);
               yield* advanceRuntimeCallbackGeneration;
@@ -9893,7 +9909,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
             yield* awaitRuntimeTeardown();
             const existing = yield* Ref.get(activeTurn);
-            if (existing !== null) {
+            if (existing !== null && !(yield* Ref.get(runtimeRestartRequired))) {
               return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                 driver,
                 detail: `ACP provider turn ${existing.providerTurnId} is still active`,
@@ -9907,6 +9923,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             const restartAfterInterrupt = yield* restartRuntimeAfterTeardownIfRequired(
               turnInput.threadId,
             );
+            const remainingActive = yield* Ref.get(activeTurn);
+            if (remainingActive !== null) {
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver,
+                detail: `ACP provider turn ${remainingActive.providerTurnId} is still active`,
+                reason: "previous_turn_active",
+              });
+            }
             const needsSessionActivation =
               (yield* Ref.get(activeSessionId)) !== requestedSessionId || restartAfterInterrupt;
             if (needsSessionActivation) {
@@ -11272,20 +11296,35 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         yield* Ref.set(runtimeTeardownState, { _tag: "Idle" });
                         yield* Deferred.succeed(teardownBarrier!, undefined).pipe(Effect.ignore);
                       } else {
-                        // Settled soft interrupts have no prompt to cancel; cancel could kill background subagents.
-                        if (
+                        const isPostSettleContinuationStop =
                           !settledSoftInterrupt &&
-                          (shouldCloseRuntimeOnStop || (yield* promptStillRunsAfterHold(context)))
-                        ) {
-                          yield* shouldCloseRuntimeOnStop
-                            ? runtime.cancel.pipe(Effect.timeoutOption("1 second"), Effect.ignore)
-                            : runtime.cancel;
-                        }
+                          turnInput.requestRuntimeRestart === true &&
+                          postSettleContinuationEnabled &&
+                          !followsAgentWorkState &&
+                          acpIsProviderContinuationMessage(context.input.message);
                         if (
-                          (restartRuntime && flavor.restartRuntimeAfterInterrupt === true) ||
+                          (restartRuntime &&
+                            (flavor.restartRuntimeAfterInterrupt === true ||
+                              postSettleContinuationEnabled)) ||
                           shouldCloseRuntimeOnStop
                         ) {
                           yield* Ref.set(runtimeRestartRequired, true);
+                        }
+                        // Settled soft interrupts have no prompt to cancel; cancel could kill background subagents.
+                        if (
+                          !settledSoftInterrupt &&
+                          (shouldCloseRuntimeOnStop ||
+                            isPostSettleContinuationStop ||
+                            (yield* promptStillRunsAfterHold(context)))
+                        ) {
+                          yield* shouldCloseRuntimeOnStop || isPostSettleContinuationStop
+                            ? runtime.cancel.pipe(Effect.timeoutOption("1 second"), Effect.ignore)
+                            : runtime.cancel;
+                        }
+                        if (isPostSettleContinuationStop && !context.finalized) {
+                          yield* runtimeCallbackPermit.withPermit(
+                            finalizeTurn(context, "interrupted"),
+                          );
                         }
                         if (shouldCloseRuntimeOnStop) {
                           yield* runtimeCallbackPermit.withPermit(

@@ -12787,6 +12787,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       turnItems: input.projection.turnItems,
       runs: input.projection.runs,
     })) {
+      if (item.type === "subagent" && item.origin === "app_owned") continue;
       const itemRunOrdinal = item.runId === null ? undefined : runOrdinals.get(item.runId);
       if (itemRunOrdinal !== undefined && itemRunOrdinal > input.throughRunOrdinal) continue;
       const providerThreadId = item.providerThreadId ?? null;
@@ -13718,43 +13719,155 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       message: command.reason ?? RunExecutionService.USER_STOP_REASON,
     };
 
+    const isPreProviderStartActiveRun =
+      providerTurn === undefined &&
+      (run.status === "preparing" || run.status === "starting" || run.status === "running");
+    const backgroundTurnItems = pendingBackgroundTurnItems({
+      turnItems: projection.turnItems,
+      runs: projection.runs,
+    }).filter((item) => !(item.type === "subagent" && item.origin === "app_owned"));
+    const backgroundTaskProviderThreads = projection.providerThreads.filter(
+      (candidate) => (candidate.pendingBackgroundTasks?.length ?? 0) > 0,
+    );
+    const preProviderStartOwnBackgroundWork =
+      isPreProviderStartActiveRun &&
+      ((providerThread.pendingBackgroundTasks?.length ?? 0) > 0 ||
+        backgroundTurnItems.some((item) => {
+          const turn = projection.providerTurns.find(
+            (candidate) => candidate.id === item.providerTurnId,
+          );
+          return turn?.providerThreadId === providerThread.id;
+        }));
     const otherProviderInterrupts: Array<PendingOrchestrationEffectV2> = [];
-    if (hasBackgroundWork || command.holdQueue === true) {
+    const otherProviderInterruptRunOrdinals = new Map<
+      OrchestrationV2ProviderThread["id"],
+      number
+    >();
+    const deadSessionBackgroundThreads = new Map<OrchestrationV2ProviderThread["id"], number>();
+    if (hasBackgroundWork || command.holdQueue === true || preProviderStartOwnBackgroundWork) {
       const runOrdinals = new Map(
         projection.runs.map((candidate) => [candidate.id, candidate.ordinal]),
       );
+      const attemptRunIds = new Map(
+        projection.attempts.map((candidate) => [candidate.id, candidate.runId]),
+      );
+      const providerTurnIndices = new Map(
+        projection.providerTurns.map((candidate, index) => [candidate.id, index]),
+      );
       const runOrdinalOf = (item: (typeof projection.turnItems)[number]) =>
         item.runId === null ? -1 : (runOrdinals.get(item.runId) ?? -1);
+      const runOrdinalOfTurn = (
+        turn: (typeof projection.providerTurns)[number],
+      ): number | undefined => {
+        if (turn.runAttemptId === null) return undefined;
+        const turnRunId = attemptRunIds.get(turn.runAttemptId);
+        return turnRunId === undefined ? undefined : runOrdinals.get(turnRunId);
+      };
+      type BackgroundTurnCandidate = {
+        readonly turn: (typeof projection.providerTurns)[number];
+        readonly runOrdinal: number;
+        readonly resolvable: boolean;
+        readonly turnIndex: number;
+      };
+      const isBetterBackgroundTurn = (
+        latest: BackgroundTurnCandidate | undefined,
+        next: BackgroundTurnCandidate,
+      ): boolean => {
+        if (latest === undefined) return true;
+        if (next.resolvable !== latest.resolvable) return next.resolvable;
+        if (next.runOrdinal !== latest.runOrdinal) return next.runOrdinal > latest.runOrdinal;
+        return next.turnIndex >= latest.turnIndex;
+      };
       // Interrupt each provider thread at its latest pending turn so settlement covers all its work.
       // Use the item's provider turn: native subagent items name the child thread but the parent turn,
       // and interrupting the parent turn reaches the subagent.
       const latestTurnByProviderThread = new Map<
         OrchestrationV2ProviderThread["id"],
-        { readonly turn: (typeof projection.providerTurns)[number]; readonly runOrdinal: number }
+        BackgroundTurnCandidate
       >();
-      for (const item of pendingBackgroundTurnItems({
-        turnItems: projection.turnItems,
-        runs: projection.runs,
-      })) {
+      for (const item of backgroundTurnItems) {
         const turn = projection.providerTurns.find(
           (candidate) => candidate.id === item.providerTurnId,
         );
-        if (turn === undefined || turn.providerThreadId === providerThread.id) continue;
-        const runOrdinal = runOrdinalOf(item);
-        const latest = latestTurnByProviderThread.get(turn.providerThreadId);
-        if (latest === undefined || runOrdinal > latest.runOrdinal) {
-          latestTurnByProviderThread.set(turn.providerThreadId, { turn, runOrdinal });
+        if (turn === undefined) continue;
+        if (providerTurn !== undefined && turn.providerThreadId === providerThread.id) continue;
+        if (
+          turn.providerThreadId !== providerThread.id &&
+          !(hasBackgroundWork || command.holdQueue === true)
+        ) {
+          continue;
+        }
+        const resolvedRunOrdinal = runOrdinalOfTurn(turn);
+        const nextCandidate: BackgroundTurnCandidate = {
+          turn,
+          runOrdinal: resolvedRunOrdinal ?? runOrdinalOf(item),
+          resolvable: resolvedRunOrdinal !== undefined,
+          turnIndex: providerTurnIndices.get(turn.id) ?? -1,
+        };
+        if (
+          isBetterBackgroundTurn(
+            latestTurnByProviderThread.get(turn.providerThreadId),
+            nextCandidate,
+          )
+        ) {
+          latestTurnByProviderThread.set(turn.providerThreadId, nextCandidate);
         }
       }
-      for (const { turn } of latestTurnByProviderThread.values()) {
+      for (const candidateThread of backgroundTaskProviderThreads) {
+        if (candidateThread.id === providerThread.id) {
+          if (providerTurn !== undefined) continue;
+        } else if (command.holdQueue !== true) {
+          continue;
+        }
+        let bestCandidate: BackgroundTurnCandidate | undefined;
+        for (const candidate of projection.providerTurns) {
+          if (candidate.providerThreadId !== candidateThread.id) continue;
+          const resolvedRunOrdinal = runOrdinalOfTurn(candidate);
+          const nextCandidate: BackgroundTurnCandidate = {
+            turn: candidate,
+            runOrdinal: resolvedRunOrdinal ?? candidateThread.lastRunOrdinal ?? -1,
+            resolvable: resolvedRunOrdinal !== undefined,
+            turnIndex: providerTurnIndices.get(candidate.id) ?? -1,
+          };
+          if (isBetterBackgroundTurn(bestCandidate, nextCandidate)) {
+            bestCandidate = nextCandidate;
+          }
+        }
+        if (bestCandidate === undefined) {
+          deadSessionBackgroundThreads.set(
+            candidateThread.id,
+            Math.max(run.ordinal, candidateThread.lastRunOrdinal ?? -1),
+          );
+          continue;
+        }
+        if (
+          isBetterBackgroundTurn(latestTurnByProviderThread.get(candidateThread.id), bestCandidate)
+        ) {
+          latestTurnByProviderThread.set(candidateThread.id, bestCandidate);
+        }
+      }
+      for (const { turn, runOrdinal } of latestTurnByProviderThread.values()) {
         const owner = projection.providerThreads.find(
           (candidate) => candidate.id === turn.providerThreadId,
         );
-        if (owner === undefined || owner.providerSessionId === null) continue;
+        if (owner === undefined || owner.providerSessionId === null) {
+          deadSessionBackgroundThreads.set(
+            turn.providerThreadId,
+            Math.max(run.ordinal, runOrdinal, owner?.lastRunOrdinal ?? -1),
+          );
+          continue;
+        }
         const ownerSession = yield* providerSessions
           .get(owner.providerSessionId)
           .pipe(Effect.orElseSucceed(() => Option.none()));
-        if (Option.isNone(ownerSession)) continue;
+        if (Option.isNone(ownerSession)) {
+          deadSessionBackgroundThreads.set(
+            owner.id,
+            Math.max(run.ordinal, runOrdinal, owner.lastRunOrdinal ?? -1),
+          );
+          continue;
+        }
+        otherProviderInterruptRunOrdinals.set(owner.id, runOrdinal);
         otherProviderInterrupts.push({
           id: `effect:${command.commandId}:provider-turn.interrupt:${turn.id}`,
           commandId: command.commandId,
@@ -13769,10 +13882,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     }
 
-    if (
-      providerTurn === undefined &&
-      (run.status === "preparing" || run.status === "starting" || run.status === "running")
-    ) {
+    if (isPreProviderStartActiveRun) {
       const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
       if (attempt === undefined) {
         return yield* new OrchestratorDispatchError({
@@ -13899,21 +14009,98 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         )
       ) {
         const id = `effect:${command.commandId}:provider-turn.interrupt:${supersededTurn.id}`;
-        if (!otherProviderInterrupts.some((effect) => effect.id === id)) {
-          otherProviderInterrupts.push({
-            id,
-            commandId: command.commandId,
-            threadId: command.threadId,
-            request: {
-              type: "provider-turn.interrupt",
-              providerSessionId: supersededOwner.providerSessionId,
-              providerThreadId: supersededOwner.id,
-              providerTurnId: supersededTurn.id,
-            },
-          });
+        const existingIndex = otherProviderInterrupts.findIndex(
+          (effect) =>
+            effect.id === id ||
+            (effect.request.type === "provider-turn.interrupt" &&
+              effect.request.providerThreadId === supersededOwner.id),
+        );
+        const supersededEffect: PendingOrchestrationEffectV2 = {
+          id,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          request: {
+            type: "provider-turn.interrupt",
+            providerSessionId: supersededOwner.providerSessionId,
+            providerThreadId: supersededOwner.id,
+            providerTurnId: supersededTurn.id,
+          },
+        };
+        if (existingIndex === -1) {
+          otherProviderInterruptRunOrdinals.set(supersededOwner.id, run.ordinal);
+          otherProviderInterrupts.push(supersededEffect);
+          deadSessionBackgroundThreads.delete(supersededOwner.id);
+        } else {
+          const existing = otherProviderInterrupts[existingIndex]!;
+          const existingRequest = existing.request;
+          const existingTurn =
+            existingRequest.type === "provider-turn.interrupt"
+              ? projection.providerTurns.find(
+                  (candidate) => candidate.id === existingRequest.providerTurnId,
+                )
+              : undefined;
+          const existingRunOrdinal =
+            existingRequest.type === "provider-turn.interrupt"
+              ? (otherProviderInterruptRunOrdinals.get(existingRequest.providerThreadId) ?? -1)
+              : -1;
+          if (
+            existing.id !== id &&
+            (existingTurn?.status !== "running" || run.ordinal >= existingRunOrdinal)
+          ) {
+            otherProviderInterruptRunOrdinals.set(supersededOwner.id, run.ordinal);
+            otherProviderInterrupts[existingIndex] = supersededEffect;
+          }
+          deadSessionBackgroundThreads.delete(supersededOwner.id);
         }
       }
       yield* stopRemainingWork();
+      const maxDeadThroughRunOrdinal =
+        deadSessionBackgroundThreads.size === 0
+          ? run.ordinal
+          : Math.max(...deadSessionBackgroundThreads.values());
+      for (const [deadProviderThreadId] of deadSessionBackgroundThreads) {
+        if (
+          otherProviderInterrupts.some(
+            (effect) =>
+              effect.request.type === "provider-turn.interrupt" &&
+              effect.request.providerThreadId === deadProviderThreadId,
+          )
+        ) {
+          continue;
+        }
+        const pendingEvents = yield* Ref.get(events);
+        const settledItemIds = new Set(
+          pendingEvents.flatMap((event) =>
+            event.type === "turn-item.updated" && !isOrchestrationV2WorkActive(event.payload.status)
+              ? [event.payload.id]
+              : [],
+          ),
+        );
+        const clearedProviderThreadIds = new Set(
+          pendingEvents.flatMap((event) =>
+            event.type === "provider-thread.updated" &&
+            (event.payload.pendingBackgroundTasks?.length ?? 0) === 0
+              ? [event.payload.id]
+              : [],
+          ),
+        );
+        yield* settleBackgroundWork({
+          command,
+          events,
+          projection: {
+            ...projection,
+            turnItems: projection.turnItems.filter((item) => !settledItemIds.has(item.id)),
+            providerThreads: projection.providerThreads.map((candidate) =>
+              clearedProviderThreadIds.has(candidate.id)
+                ? { ...candidate, pendingBackgroundTasks: [] }
+                : candidate,
+            ),
+          },
+          stoppedProviderThreadId: deadProviderThreadId,
+          throughRunOrdinal: maxDeadThroughRunOrdinal,
+          now,
+        });
+      }
       yield* Ref.update(effects, (existing) => [...existing, ...otherProviderInterrupts]);
       return {
         effectTypes: ["provider-turn.start", "provider-turn.restart"],

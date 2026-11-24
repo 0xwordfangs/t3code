@@ -537,6 +537,12 @@ const makeHarness = Effect.fnUntraced(function* (options: {
         { sessionId: reqSessionId, terminalId },
         { requestId: `term-wait-${terminalId}`, method: "terminal/wait_for_exit" },
       ),
+    get permissionHandler() {
+      return permissionHandler;
+    },
+    get elicitationHandler() {
+      return elicitationHandler;
+    },
     get readTextFileHandler() {
       return readTextFileHandler;
     },
@@ -2319,6 +2325,452 @@ describe("AcpAdapterV2 URL elicitation admission and permit release (R2-CF-02)",
         yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
         while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
           // drain Turn 2 events
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+});
+
+describe("AcpAdapterV2 active-turn Stop runtime restart for post-settle continuation flavors (R4-CF-02)", () => {
+  it.effect.each([true, false] as const)(
+    "restarts runtime on next turn after active-turn Stop when post-settle continuation is enabled (deferFinalizeForBackgroundWork=%s) and rejects stale Runtime #1 callbacks",
+    (deferFinalizeForBackgroundWork) =>
+      Effect.gen(function* () {
+        let urlCalls = 0;
+        const harness = yield* makeHarness({
+          name: `r4-cf02-active-stop-defer-${deferFinalizeForBackgroundWork}`,
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork,
+          loadSession: true,
+          cancelResolvesPrompt: true,
+          onUrlElicitation: () =>
+            Effect.sync(() => {
+              urlCalls += 1;
+              return true;
+            }),
+        });
+
+        const stalePermissionHandler = harness.permissionHandler!;
+        const staleElicitationHandler = harness.elicitationHandler!;
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        yield* harness.session.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn1Id,
+          requestRuntimeRestart: true,
+        });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        // Next turn must restart onto Runtime #2 and close Runtime #1's scope.
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+        assert.equal(harness.runtimeScopeCloseCount, 1);
+
+        // Stale Runtime #1 permission and URL elicitation callbacks are rejected by generation
+        // even under full-access during an active Turn 2.
+        const stalePermFiber = yield* stalePermissionHandler(
+          {
+            sessionId: harness.sessionId,
+            toolCall: { toolCallId: "stale-perm-1", kind: "execute", title: "Stale command" },
+            options: [
+              { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+              { optionId: "deny", name: "Deny", kind: "reject_once" },
+            ],
+          },
+          { requestId: "stale-perm-req-1", method: "session/request_permission" },
+        ).pipe(Effect.forkScoped);
+        const staleUrlFiber = yield* staleElicitationHandler(
+          {
+            sessionId: harness.sessionId,
+            mode: "url",
+            elicitationId: "stale-url-1",
+            url: "https://example.com/stale-auth",
+            message: "Stale URL auth",
+          },
+          { requestId: "stale-url-req-1", method: "elicitation/create" },
+        ).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        assert.isUndefined(stalePermFiber.pollUnsafe());
+        assert.isUndefined(staleUrlFiber.pollUnsafe());
+        assert.equal(urlCalls, 0);
+        yield* Fiber.interrupt(stalePermFiber);
+        yield* Fiber.interrupt(staleUrlFiber);
+
+        // Runtime #2 callbacks still work normally during Turn 2.
+        const freshPerm = yield* harness.requestPermission("fresh-perm-2");
+        assert.deepEqual(freshPerm, {
+          outcome: { outcome: "selected", optionId: "allow_once" },
+        });
+        const freshUrl = yield* harness.elicitUrl("fresh-url-2");
+        assert.deepEqual(freshUrl, { action: "accept" });
+        assert.equal(urlCalls, 1);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "restarts runtime on next turn after active continuation-turn Stop and rejects stale Runtime #1 callbacks",
+    () =>
+      Effect.gen(function* () {
+        let urlCalls = 0;
+        const harness = yield* makeHarness({
+          name: "r4-cf02-active-continuation-stop",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+          loadSession: true,
+          cancelResolvesPrompt: true,
+          onUrlElicitation: () =>
+            Effect.sync(() => {
+              urlCalls += 1;
+              return true;
+            }),
+        });
+
+        const stalePermissionHandler = harness.permissionHandler!;
+        const staleElicitationHandler = harness.elicitationHandler!;
+
+        yield* harness.settleTurn1;
+        yield* harness.emitUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Background process woke root" },
+        });
+        const offered = yield* Queue.take(harness.continuationOffered);
+        yield* offered.dispatchIfCurrent!(Effect.void);
+
+        yield* harness.session.startTurn(harness.makeTurn(2, { continuation: true }));
+        const turn2Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        // Stop while the continuation turn is actively open awaiting deferred finalize.
+        yield* harness.session.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: turn2Id,
+          requestRuntimeRestart: true,
+        });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
+        }
+
+        // Subsequent explicit user turn restarts onto Runtime #2 and closes Runtime #1's scope.
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(3)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+        assert.equal(harness.runtimeScopeCloseCount, 1);
+
+        const stalePermFiber = yield* stalePermissionHandler(
+          {
+            sessionId: harness.sessionId,
+            toolCall: { toolCallId: "stale-cont-perm", kind: "execute", title: "Stale command" },
+            options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+          },
+          { requestId: "stale-cont-perm-req", method: "session/request_permission" },
+        ).pipe(Effect.forkScoped);
+        const staleUrlFiber = yield* staleElicitationHandler(
+          {
+            sessionId: harness.sessionId,
+            mode: "url",
+            elicitationId: "stale-cont-url",
+            url: "https://example.com/stale-cont-auth",
+            message: "Stale URL auth",
+          },
+          { requestId: "stale-cont-url-req", method: "elicitation/create" },
+        ).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        assert.isUndefined(stalePermFiber.pollUnsafe());
+        assert.isUndefined(staleUrlFiber.pollUnsafe());
+        assert.equal(urlCalls, 0);
+        yield* Fiber.interrupt(stalePermFiber);
+        yield* Fiber.interrupt(staleUrlFiber);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 3
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["post-settle-continuation", "restart-after-interrupt"] as const)(
+    "marks runtimeRestartRequired before runtime.cancel so a failing cancel still restarts runtime on the next turn (%s)",
+    (mode) =>
+      Effect.gen(function* () {
+        let urlCalls = 0;
+        const harness = yield* makeHarness({
+          name: `r4-cf02-cancel-fails-${mode}`,
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: mode === "post-settle-continuation",
+          deferFinalizeForBackgroundWork: mode === "post-settle-continuation",
+          restartRuntimeAfterInterrupt: mode === "restart-after-interrupt",
+          loadSession: true,
+          cancelResolvesPrompt: false,
+          cancelEffect: Effect.fail(EffectAcpErrors.AcpRequestError.internalError("cancel failed")),
+          onUrlElicitation: () =>
+            Effect.sync(() => {
+              urlCalls += 1;
+              return true;
+            }),
+        });
+
+        const stalePermissionHandler = harness.permissionHandler!;
+        const staleElicitationHandler = harness.elicitationHandler!;
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        const interruptExit = yield* harness.session
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Id,
+            requestRuntimeRestart: true,
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(interruptExit));
+
+        // Even though runtime.cancel failed, once Turn 1 finishes the next turn must restart Runtime #1.
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+        assert.equal(harness.runtimeScopeCloseCount, 1);
+
+        const stalePermFiber = yield* stalePermissionHandler(
+          {
+            sessionId: harness.sessionId,
+            toolCall: { toolCallId: "stale-fail-perm", kind: "execute", title: "Stale command" },
+            options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+          },
+          { requestId: "stale-fail-perm-req", method: "session/request_permission" },
+        ).pipe(Effect.forkScoped);
+        const staleUrlFiber = yield* staleElicitationHandler(
+          {
+            sessionId: harness.sessionId,
+            mode: "url",
+            elicitationId: "stale-fail-url",
+            url: "https://example.com/stale-fail-auth",
+            message: "Stale URL auth",
+          },
+          { requestId: "stale-fail-url-req", method: "elicitation/create" },
+        ).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        assert.isUndefined(stalePermFiber.pollUnsafe());
+        assert.isUndefined(staleUrlFiber.pollUnsafe());
+        assert.equal(urlCalls, 0);
+        yield* Fiber.interrupt(stalePermFiber);
+        yield* Fiber.interrupt(staleUrlFiber);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("does not restart runtime on soft steer interrupt without requestRuntimeRestart", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        name: "r4-cf02-soft-steer-no-restart",
+        runtimeMode: "full-access",
+        enablePostSettleContinuation: true,
+        deferFinalizeForBackgroundWork: true,
+        loadSession: true,
+        cancelResolvesPrompt: true,
+      });
+
+      yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+      yield* Deferred.await(harness.promptStarted);
+      const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+      // Soft steer interrupt omits requestRuntimeRestart: true.
+      yield* harness.session.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: turn1Id,
+      });
+      while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+        // drain Turn 1
+      }
+
+      yield* harness.resetPrompt;
+      yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+      yield* Deferred.await(harness.promptStarted);
+      assert.equal(harness.runtimeCreateCount, 1);
+      assert.equal(harness.runtimeScopeCloseCount, 0);
+
+      yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+      while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+        // drain Turn 2
+      }
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "resumeThread after failing runtime.cancel finalizes lingering activeTurn so startTurn is never wedged with previous_turn_active",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "r4-cf02-cancel-fails-resume-no-wedge",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+          loadSession: true,
+          cancelResolvesPrompt: false,
+          cancelEffect: Effect.fail(EffectAcpErrors.AcpRequestError.internalError("cancel failed")),
+        });
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        const interruptExit = yield* harness.session
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Id,
+            requestRuntimeRestart: true,
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(interruptExit));
+
+        // Without resolving Turn 1's hung promptGate, resumeThread triggers restartAcpRuntime.
+        // It must finalize lingering Turn 1 before advancing callback generation so Turn 2 succeeds.
+        yield* harness.session.resumeThread({
+          providerThread: harness.providerThread,
+        });
+        assert.equal(harness.runtimeCreateCount, 2);
+        assert.equal(harness.runtimeScopeCloseCount, 1);
+
+        let sawTurn1Interrupted = false;
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal" && event.providerTurnId === turn1Id) {
+            assert.equal(event.status, "interrupted");
+            sawTurn1Interrupted = true;
+            break;
+          }
+        }
+        assert.isTrue(sawTurn1Interrupted);
+
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "does not pre-finalize non-continuation turns carrying provider-continuation metadata before runtime.cancel",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "r4-cf02-non-continuation-provider-msg-confirm",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: false,
+          loadSession: true,
+          cancelResolvesPrompt: false,
+          cancelEffect: Effect.fail(EffectAcpErrors.AcpRequestError.internalError("cancel failed")),
+        });
+
+        // On a non-continuation flavor, a provider-originated message still runs runtime.prompt
+        // and must NOT finalize before runtime.cancel runs.
+        yield* harness.session
+          .startTurn({
+            ...harness.makeTurn(1),
+            message: {
+              ...harness.makeTurn(1).message,
+              createdBy: "agent",
+              creationSource: "provider",
+            },
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        const interruptExit = yield* harness.session
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Id,
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(interruptExit));
+
+        // Turn 1 must NOT have emitted turn.terminal prematurely while promptGate is still pending.
+        const queued = yield* Queue.takeAll(harness.events);
+        assert.isFalse(queued.some((event) => event.type === "turn.terminal"));
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 1
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "direct startTurn after failing runtime.cancel restarts runtime and finalizes lingering activeTurn without previous_turn_active",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          name: "r4-cf02-cancel-fails-direct-startturn-no-wedge",
+          runtimeMode: "full-access",
+          enablePostSettleContinuation: true,
+          deferFinalizeForBackgroundWork: true,
+          loadSession: true,
+          cancelResolvesPrompt: false,
+          cancelEffect: Effect.fail(EffectAcpErrors.AcpRequestError.internalError("cancel failed")),
+        });
+
+        yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        const turn1Id = yield* awaitRunningProviderTurnId(harness.events);
+
+        const interruptExit = yield* harness.session
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Id,
+            requestRuntimeRestart: true,
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(interruptExit));
+
+        // Call startTurn directly (matching ProviderSessionManager skipping resumeThread
+        // on a cached loaded thread) without resolving Turn 1's hung promptGate.
+        yield* harness.resetPrompt;
+        yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+        yield* Deferred.await(harness.promptStarted);
+        assert.equal(harness.runtimeCreateCount, 2);
+        assert.equal(harness.runtimeScopeCloseCount, 1);
+
+        let sawTurn1Interrupted = false;
+        while (true) {
+          const event = yield* Queue.take(harness.events);
+          if (event.type === "turn.terminal" && event.providerTurnId === turn1Id) {
+            assert.equal(event.status, "interrupted");
+            sawTurn1Interrupted = true;
+            break;
+          }
+        }
+        assert.isTrue(sawTurn1Interrupted);
+
+        yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+        while ((yield* Queue.take(harness.events)).type !== "turn.terminal") {
+          // drain Turn 2
         }
       }).pipe(Effect.provide(layerTest)),
   );

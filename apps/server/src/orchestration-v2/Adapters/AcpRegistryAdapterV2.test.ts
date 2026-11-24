@@ -4924,4 +4924,576 @@ describe("AcpRegistryAdapterV2", () => {
         }).pipe(Effect.scoped, Effect.provide(layerTest)),
     );
   });
+
+  describe("Hermes and GitHub Copilot CLI active-turn Stop runtime restart (R4-CF-02)", () => {
+    const layerCoordinatorTest = Layer.mergeAll(layerTest, AcpRegistryRuntimeCoordinator.layer);
+
+    const makePostSettleRestartHarness = Effect.fnUntraced(function* (options: {
+      readonly name: string;
+      readonly agent: "hermes" | "github-copilot-cli";
+      readonly cancelEffect?: Effect.Effect<void, EffectAcpErrors.AcpError>;
+      readonly cancelResolvesPrompt?: boolean;
+      readonly onCancel?: () => Effect.Effect<void, EffectAcpErrors.AcpError>;
+    }) {
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let permissionHandler: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+      let elicitationHandler: Parameters<RuntimeService["handleElicitation"]>[0] | undefined;
+      let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+      let copilotSessionEventHandler:
+        | ((params: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>)
+        | undefined;
+      let onOutgoingResponse: ((requestId: string) => Effect.Effect<void>) | undefined;
+      let runtimeCreateCount = 0;
+      let runtimeScopeCloseCount = 0;
+      let promptStarted = yield* Deferred.make<void>();
+      let promptGate = yield* Deferred.make<
+        EffectAcpSchema.PromptResponse,
+        EffectAcpErrors.AcpError
+      >();
+      const continuationOffered = yield* Queue.unbounded<ProviderContinuationRequest>();
+      const sessionId = `sess-r4-cf02-${options.agent}-${options.name}`;
+
+      const startResult: AcpSessionRuntime.AcpSessionRuntimeStartResult = {
+        sessionId,
+        initializeResult: {
+          protocolVersion: 1,
+          agentCapabilities: { loadSession: true },
+          authMethods: [],
+        },
+        sessionSetupResult: {},
+        modelConfigId: undefined,
+      };
+      const unsupported = (method: string) =>
+        Effect.fail(EffectAcpErrors.AcpRequestError.methodNotFound(method));
+
+      const instanceId = ProviderInstanceId.make(
+        `acp-registry-r4-cf02-${options.agent}-${options.name}`,
+      );
+      const coordinator = yield* AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator;
+      const settings = yield* decodeAcpRegistryAdapterSettings(
+        options.agent === "hermes"
+          ? { source: "local", commandPath: "hermes", commandArgs: ["acp"] }
+          : { agentId: "github-copilot-cli" },
+      );
+
+      const adapter = yield* makeAcpRegistryAdapterV2({
+        selfInvocation: yield* resolveSelfInvocation(),
+        instanceId,
+        settings,
+        environment: {},
+        continuationRequests: {
+          offer: (request) => Queue.offer(continuationOffered, request).pipe(Effect.asVoid),
+        },
+        makeRuntime: (runtimeInput) => {
+          runtimeCreateCount += 1;
+          onOutgoingResponse = runtimeInput.onOutgoingResponse;
+          return Effect.acquireRelease(
+            Effect.succeed({
+              handleRequestPermission: (handler) =>
+                Effect.sync(() => {
+                  permissionHandler = handler;
+                }),
+              handleElicitation: (handler) =>
+                Effect.sync(() => {
+                  elicitationHandler = handler;
+                }),
+              handleMcpConnect: () => Effect.void,
+              handleMcpMessage: () => Effect.void,
+              handleMcpDisconnect: () => Effect.void,
+              handleMcpNotification: () => Effect.void,
+              handleReadTextFile: () => Effect.void,
+              handleWriteTextFile: () => Effect.void,
+              handleCreateTerminal: () => Effect.void,
+              handleTerminalOutput: () => Effect.void,
+              handleTerminalWaitForExit: () => Effect.void,
+              handleTerminalKill: () => Effect.void,
+              handleTerminalRelease: () => Effect.void,
+              handleSessionUpdate: (handler) =>
+                Effect.sync(() => {
+                  sessionUpdateHandler = handler;
+                }),
+              handleElicitationComplete: () => Effect.void,
+              handleUnknownExtRequest: () => Effect.void,
+              handleUnknownExtNotification: () => Effect.void,
+              handleExtRequest: () => Effect.void,
+              handleExtNotification: (method, _schema, handler) =>
+                Effect.sync(() => {
+                  if (method === "github.com/copilot/sessionEvent") {
+                    copilotSessionEventHandler = handler as (
+                      params: unknown,
+                    ) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+                  }
+                }),
+              initialize: () => Effect.succeed(startResult.initializeResult),
+              start: () => Effect.succeed(startResult),
+              getEvents: () => Stream.empty,
+              drainEvents: Effect.void,
+              getModeState: Effect.undefined,
+              getConfigOptions: Effect.succeed([]),
+              configOptionChanges: Stream.empty,
+              loadSession: (requestedSessionId) =>
+                Effect.succeed({ ...startResult, sessionId: requestedSessionId }),
+              resumeSession: () => Effect.succeed(startResult),
+              forkSession: () => Effect.succeed(startResult),
+              listSessions: () => unsupported("session/list"),
+              closeSession: () => Effect.succeed({}),
+              deleteSession: () => unsupported("session/delete"),
+              listProviders: unsupported("provider/list"),
+              setProvider: () => unsupported("provider/set"),
+              disableProvider: () => unsupported("provider/disable"),
+              logout: unsupported("logout"),
+              prompt: (_payload, promptOptions) =>
+                Effect.gen(function* () {
+                  if (promptOptions?.dispatched !== undefined) {
+                    yield* Deferred.succeed(promptOptions.dispatched, undefined);
+                  }
+                  yield* Deferred.succeed(promptStarted, undefined);
+                  return yield* Deferred.await(promptGate);
+                }),
+              cancel: Effect.suspend(() =>
+                Effect.gen(function* () {
+                  if (options.cancelResolvesPrompt === true) {
+                    yield* Deferred.succeed(promptGate, { stopReason: "cancelled" }).pipe(
+                      Effect.ignore,
+                    );
+                  }
+                  if (options.onCancel !== undefined) {
+                    yield* options.onCancel();
+                  }
+                  if (options.cancelEffect !== undefined) {
+                    yield* options.cancelEffect;
+                  }
+                }),
+              ),
+              setMode: () => Effect.succeed({}),
+              setSessionModel: () => Effect.succeed({}),
+              setConfigOption: () => Effect.succeed({ configOptions: [] }),
+              setModel: () => Effect.void,
+              request: (method) => unsupported(method),
+              notify: () => Effect.void,
+            } satisfies RuntimeService),
+            () =>
+              Effect.sync(() => {
+                runtimeScopeCloseCount += 1;
+              }),
+          );
+        },
+      }).pipe(Effect.provide(layerInjectedRuntimeCatalog));
+
+      const threadId = ThreadId.make(`thread-r4-cf02-${options.agent}-${options.name}`);
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make(
+          `provider-session-r4-cf02-${options.agent}-${options.name}`,
+        ),
+        modelSelection,
+        runtimePolicy,
+      });
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* session.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const now = yield* DateTime.now;
+
+      const awaitRunningTurnId = Effect.gen(function* () {
+        while (true) {
+          const event = yield* Queue.take(events);
+          if (event.type === "provider_turn.updated" && event.providerTurn.status === "running") {
+            return event.providerTurn.id;
+          }
+        }
+      });
+
+      const drainUntilTerminal = Effect.gen(function* () {
+        while ((yield* Queue.take(events)).type !== "turn.terminal") {
+          // drain turn events
+        }
+      });
+
+      return {
+        instanceId,
+        sessionId,
+        session,
+        providerThread,
+        events,
+        coordinator,
+        continuationOffered,
+        awaitRunningTurnId,
+        drainUntilTerminal,
+        makeTurn: (ordinal: number, continuation = false) => {
+          const base = makeTurnInput({
+            threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now,
+            ordinal,
+            modelSelection,
+          });
+          return continuation
+            ? {
+                ...base,
+                message: {
+                  ...base.message,
+                  createdBy: "agent" as const,
+                  creationSource: "provider" as const,
+                  text: "Continuation wake",
+                },
+              }
+            : base;
+        },
+        emitUpdate: (update: EffectAcpSchema.SessionUpdate) =>
+          sessionUpdateHandler!({ sessionId, update }),
+        emitCopilotSessionEvent: (type: string, data: Record<string, unknown> = {}) =>
+          copilotSessionEventHandler!({ sessionId, type, data }),
+        get permissionHandler() {
+          return permissionHandler;
+        },
+        get elicitationHandler() {
+          return elicitationHandler;
+        },
+        requestPermission: (toolCallId: string, requestId = `perm-${toolCallId}`) =>
+          permissionHandler!(
+            {
+              sessionId,
+              toolCall: { toolCallId, kind: "execute", title: "Run shell command" },
+              options: [
+                { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+                { optionId: "deny", name: "Deny", kind: "reject_once" },
+              ],
+            },
+            { requestId, method: "session/request_permission" },
+          ).pipe(Effect.tap(() => onOutgoingResponse?.(requestId) ?? Effect.void)),
+        get promptStarted() {
+          return promptStarted;
+        },
+        get promptGate() {
+          return promptGate;
+        },
+        get runtimeCreateCount() {
+          return runtimeCreateCount;
+        },
+        get runtimeScopeCloseCount() {
+          return runtimeScopeCloseCount;
+        },
+        resetPrompt: Effect.gen(function* () {
+          promptStarted = yield* Deferred.make<void>();
+          promptGate = yield* Deferred.make<
+            EffectAcpSchema.PromptResponse,
+            EffectAcpErrors.AcpError
+          >();
+        }),
+      };
+    });
+
+    it.effect.each(["hermes", "github-copilot-cli"] as const)(
+      "%s active-turn Stop restarts runtime on next turn, closes Runtime #1 scope, and rejects stale Runtime #1 permission and URL elicitation",
+      (agent) =>
+        Effect.gen(function* () {
+          const harness = yield* makePostSettleRestartHarness({
+            name: "active-stop",
+            agent,
+            cancelResolvesPrompt: true,
+          });
+          const stalePermissionHandler = harness.permissionHandler!;
+          const staleElicitationHandler = harness.elicitationHandler!;
+
+          yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          const turn1Id = yield* harness.awaitRunningTurnId;
+
+          yield* harness.session.interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Id,
+            requestRuntimeRestart: true,
+          });
+          yield* harness.drainUntilTerminal;
+
+          yield* harness.resetPrompt;
+          yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          assert.equal(harness.runtimeCreateCount, 2);
+          assert.equal(harness.runtimeScopeCloseCount, 1);
+
+          const stalePermFiber = yield* stalePermissionHandler(
+            {
+              sessionId: harness.sessionId,
+              toolCall: { toolCallId: "stale-perm", kind: "execute", title: "Stale command" },
+              options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+            },
+            { requestId: "stale-perm-req", method: "session/request_permission" },
+          ).pipe(Effect.forkScoped);
+          const staleUrlFiber = yield* staleElicitationHandler(
+            {
+              sessionId: harness.sessionId,
+              mode: "url",
+              elicitationId: "stale-url-auth",
+              url: "https://example.test/stale-auth",
+              message: "Stale URL auth",
+            },
+            { requestId: "stale-url-req", method: "elicitation/create" },
+          ).pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          assert.isUndefined(stalePermFiber.pollUnsafe());
+          assert.isUndefined(staleUrlFiber.pollUnsafe());
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+          yield* Fiber.interrupt(stalePermFiber);
+          yield* Fiber.interrupt(staleUrlFiber);
+
+          // Runtime #2 auto-approves normally in full-access mode.
+          assert.deepEqual(yield* harness.requestPermission("fresh-perm"), {
+            outcome: { outcome: "selected", optionId: "allow_once" },
+          });
+
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          yield* harness.drainUntilTerminal;
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+
+    it.effect.each(["hermes", "github-copilot-cli"] as const)(
+      "%s active continuation-turn Stop restarts runtime on next turn, closes Runtime #1 scope, and rejects stale Runtime #1 callbacks",
+      (agent) =>
+        Effect.gen(function* () {
+          const harness = yield* makePostSettleRestartHarness({
+            name: "active-continuation-stop",
+            agent,
+            cancelResolvesPrompt: true,
+          });
+          const stalePermissionHandler = harness.permissionHandler!;
+          const staleElicitationHandler = harness.elicitationHandler!;
+
+          // Settle Turn 1.
+          yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          if (agent === "github-copilot-cli") {
+            yield* harness.emitCopilotSessionEvent("assistant.turn_start");
+            yield* harness.emitUpdate({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Background agent running." },
+            });
+            yield* harness.emitCopilotSessionEvent("assistant.idle");
+          }
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          yield* harness.drainUntilTerminal;
+
+          // Trigger a post-settle continuation wake and keep Turn 2 open.
+          if (agent === "github-copilot-cli") {
+            yield* harness.emitCopilotSessionEvent("assistant.turn_start");
+          }
+          yield* harness.emitUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Background work woke root" },
+          });
+          const offered = yield* Queue.take(harness.continuationOffered);
+          yield* offered.dispatchIfCurrent!(Effect.void);
+
+          yield* harness.session.startTurn(harness.makeTurn(2, true));
+          const turn2Id = yield* harness.awaitRunningTurnId;
+
+          yield* harness.session.interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn2Id,
+            requestRuntimeRestart: true,
+          });
+          yield* harness.drainUntilTerminal;
+
+          yield* harness.resetPrompt;
+          yield* harness.session.startTurn(harness.makeTurn(3)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          assert.equal(harness.runtimeCreateCount, 2);
+          assert.equal(harness.runtimeScopeCloseCount, 1);
+
+          const stalePermFiber = yield* stalePermissionHandler(
+            {
+              sessionId: harness.sessionId,
+              toolCall: { toolCallId: "stale-cont-perm", kind: "execute", title: "Stale command" },
+              options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+            },
+            { requestId: "stale-cont-perm-req", method: "session/request_permission" },
+          ).pipe(Effect.forkScoped);
+          const staleUrlFiber = yield* staleElicitationHandler(
+            {
+              sessionId: harness.sessionId,
+              mode: "url",
+              elicitationId: "stale-cont-url",
+              url: "https://example.test/stale-cont-auth",
+              message: "Stale URL auth",
+            },
+            { requestId: "stale-cont-url-req", method: "elicitation/create" },
+          ).pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          assert.isUndefined(stalePermFiber.pollUnsafe());
+          assert.isUndefined(staleUrlFiber.pollUnsafe());
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+          yield* Fiber.interrupt(stalePermFiber);
+          yield* Fiber.interrupt(staleUrlFiber);
+
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          yield* harness.drainUntilTerminal;
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+
+    it.effect.each(["hermes", "github-copilot-cli"] as const)(
+      "%s failing runtime.cancel during active-turn Stop still restarts runtime on next turn",
+      (agent) =>
+        Effect.gen(function* () {
+          const harness = yield* makePostSettleRestartHarness({
+            name: "cancel-failure",
+            agent,
+            cancelResolvesPrompt: false,
+            cancelEffect: Effect.fail(
+              EffectAcpErrors.AcpRequestError.internalError("cancel failed"),
+            ),
+          });
+          const stalePermissionHandler = harness.permissionHandler!;
+          const staleElicitationHandler = harness.elicitationHandler!;
+
+          yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          const turn1Id = yield* harness.awaitRunningTurnId;
+
+          const interruptExit = yield* harness.session
+            .interruptTurn({
+              providerThread: harness.providerThread,
+              providerTurnId: turn1Id,
+              requestRuntimeRestart: true,
+            })
+            .pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(interruptExit));
+
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          yield* harness.drainUntilTerminal;
+
+          yield* harness.resetPrompt;
+          yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          assert.equal(harness.runtimeCreateCount, 2);
+          assert.equal(harness.runtimeScopeCloseCount, 1);
+
+          const stalePermFiber = yield* stalePermissionHandler(
+            {
+              sessionId: harness.sessionId,
+              toolCall: {
+                toolCallId: "stale-cancel-perm",
+                kind: "execute",
+                title: "Stale command",
+              },
+              options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+            },
+            { requestId: "stale-cancel-perm-req", method: "session/request_permission" },
+          ).pipe(Effect.forkScoped);
+          const staleUrlFiber = yield* staleElicitationHandler(
+            {
+              sessionId: harness.sessionId,
+              mode: "url",
+              elicitationId: "stale-cancel-url",
+              url: "https://example.test/stale-cancel-auth",
+              message: "Stale URL auth",
+            },
+            { requestId: "stale-cancel-url-req", method: "elicitation/create" },
+          ).pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          assert.isUndefined(stalePermFiber.pollUnsafe());
+          assert.isUndefined(staleUrlFiber.pollUnsafe());
+          assert.isTrue(
+            Option.isNone(yield* harness.coordinator.getUrlAuthAction(harness.instanceId)),
+          );
+          yield* Fiber.interrupt(stalePermFiber);
+          yield* Fiber.interrupt(staleUrlFiber);
+
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          yield* harness.drainUntilTerminal;
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+
+    it.effect(
+      "Hermes soft steer interrupt without requestRuntimeRestart does not restart runtime",
+      () =>
+        Effect.gen(function* () {
+          const harness = yield* makePostSettleRestartHarness({
+            name: "soft-steer-control",
+            agent: "hermes",
+            cancelResolvesPrompt: true,
+          });
+
+          yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          const turn1Id = yield* harness.awaitRunningTurnId;
+
+          yield* harness.session.interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: turn1Id,
+          });
+          yield* harness.drainUntilTerminal;
+
+          yield* harness.resetPrompt;
+          yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          assert.equal(harness.runtimeCreateCount, 1);
+          assert.equal(harness.runtimeScopeCloseCount, 0);
+
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          yield* harness.drainUntilTerminal;
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+
+    it.effect.each(["hermes", "github-copilot-cli"] as const)(
+      "%s resumeThread after failing runtime.cancel finalizes lingering activeTurn and recovers onto Runtime #2",
+      (agent) =>
+        Effect.gen(function* () {
+          const harness = yield* makePostSettleRestartHarness({
+            name: "cancel-failure-resume",
+            agent,
+            cancelResolvesPrompt: false,
+            cancelEffect: Effect.fail(
+              EffectAcpErrors.AcpRequestError.internalError("cancel failed"),
+            ),
+          });
+
+          yield* harness.session.startTurn(harness.makeTurn(1)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          const turn1Id = yield* harness.awaitRunningTurnId;
+
+          const interruptExit = yield* harness.session
+            .interruptTurn({
+              providerThread: harness.providerThread,
+              providerTurnId: turn1Id,
+              requestRuntimeRestart: true,
+            })
+            .pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(interruptExit));
+
+          // Without resolving Turn 1's hung promptGate, resumeThread restarts the runtime
+          // and must finalize Turn 1 so Turn 2 starts cleanly without previous_turn_active.
+          yield* harness.session.resumeThread({
+            providerThread: harness.providerThread,
+          });
+          assert.equal(harness.runtimeCreateCount, 2);
+          assert.equal(harness.runtimeScopeCloseCount, 1);
+          yield* harness.drainUntilTerminal;
+
+          yield* harness.resetPrompt;
+          yield* harness.session.startTurn(harness.makeTurn(2)).pipe(Effect.forkScoped);
+          yield* Deferred.await(harness.promptStarted);
+          yield* Deferred.succeed(harness.promptGate, { stopReason: "end_turn" });
+          yield* harness.drainUntilTerminal;
+        }).pipe(Effect.provide(layerCoordinatorTest)),
+    );
+  });
 });
