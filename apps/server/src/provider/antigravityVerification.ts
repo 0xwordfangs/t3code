@@ -159,17 +159,8 @@ export function extractAntigravityVerificationRequired(
   if (!matched) return undefined;
   const verificationUrl = validationUrl ?? helpUrl;
   const rawMessage = validationMessage ?? nonEmptyString(error.message);
-  let boundedRawMessage = rawMessage;
-  if (rawMessage !== undefined && rawMessage.length > MAX_VERIFICATION_TEXT_CHARS) {
-    let cut = MAX_VERIFICATION_TEXT_CHARS;
-    const lastCodeUnit = rawMessage.charCodeAt(cut - 1);
-    if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
-      cut -= 1;
-    }
-    boundedRawMessage = rawMessage.slice(0, cut);
-  }
   const sanitizedMessage =
-    boundedRawMessage !== undefined ? sanitizeProviderFailureMessage(boundedRawMessage) : "";
+    rawMessage !== undefined ? sanitizeProviderFailureMessage(rawMessage) : "";
   const message =
     sanitizedMessage.length > 0 ? sanitizedMessage : ANTIGRAVITY_VERIFICATION_REQUIRED_MESSAGE;
   return {

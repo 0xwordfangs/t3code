@@ -383,4 +383,51 @@ describe("TraceDiagnostics", () => {
       assert.include(text, "%26code%3D<redacted>");
     }
   });
+
+  it("redacts HTML-entity ampersands, JSON-escaped fragments, and URL userinfo in trace diagnostics", () => {
+    const sample = [
+      "https://alice:secret@example.test/auth?foo=1&amp;plt=SECRET_HTML_PLT&#38;code=SECRET_DEC_CODE&#x26;token=SECRET_HEX_TOK",
+      '{"frag":"https://example.test/cb\\u0023access_token=SECRET_ESC_FRAG","nested":"https://example.test/cb\\\\u0023plt=SECRET_DBL_FRAG"}',
+      "continue%3Dhttps://TOKEN_ONLY@example.test/org/repo.git",
+      "contact=alice@example.com pkg=https://example.test/@scope/pkg",
+    ].join(" ");
+    const diagnostics = aggregateLines([
+      record({
+        name: "acp.prompt",
+        traceId: "trace-r4-cf09",
+        spanId: "span-r4-cf09",
+        startMs: 1_000,
+        durationMs: 100,
+        exit: { _tag: "Failure", cause: sample },
+        events: [
+          {
+            name: sample,
+            timeUnixNano: ns(1_050),
+            attributes: { "effect.logLevel": "Error" },
+          },
+        ],
+      }),
+    ]);
+
+    for (const text of [
+      diagnostics.latestFailures[0]?.cause ?? "",
+      diagnostics.commonFailures[0]?.cause ?? "",
+      diagnostics.latestWarningAndErrorLogs[0]?.message ?? "",
+    ]) {
+      assert.notInclude(text, "alice:secret");
+      assert.notInclude(text, "SECRET_HTML_PLT");
+      assert.notInclude(text, "SECRET_DEC_CODE");
+      assert.notInclude(text, "SECRET_HEX_TOK");
+      assert.notInclude(text, "SECRET_ESC_FRAG");
+      assert.notInclude(text, "SECRET_DBL_FRAG");
+      assert.notInclude(text, "TOKEN_ONLY");
+      assert.include(text, "https://<redacted>@example.test/auth");
+      assert.include(text, "&amp;plt=<redacted>&#38;code=<redacted>&#x26;token=<redacted>");
+      assert.include(text, "\\u0023access_token=<redacted>");
+      assert.include(text, "\\\\u0023plt=<redacted>");
+      assert.include(text, "continue%3Dhttps://<redacted>@example.test/org/repo.git");
+      assert.include(text, "contact=alice@example.com");
+      assert.include(text, "https://example.test/@scope/pkg");
+    }
+  });
 });

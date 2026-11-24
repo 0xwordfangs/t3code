@@ -218,7 +218,136 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
     }),
   );
 
-  it.effect("keeps a single unread raw notification that alone exceeds the budget", () =>
+  it.effect("terminates cleanly when a single notification exceeds the 16MiB stdout line cap", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const handled = yield* Queue.unbounded<number>();
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      const events: Array<AcpProtocol.AcpProtocolLogEvent> = [];
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        logIncoming: true,
+        logger: (event) =>
+          Effect.sync(() => {
+            if (event.stage === "decode_failed") {
+              events.push(event);
+            }
+          }),
+        onNotification: (notification) =>
+          Queue.offer(handled, decodeIndex(notification.params).index).pipe(Effect.asVoid),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, largeNotification(0, 1));
+      assert.equal(yield* Queue.take(handled), 0);
+      yield* Queue.offer(input, largeNotification(1, 17 * MIB));
+
+      const error = yield* TestClock.withLive(
+        Deferred.await(terminated).pipe(Effect.timeout("5 seconds")),
+      );
+      assert.instanceOf(error, AcpError.AcpProtocolParseError);
+      assert.equal((error as AcpError.AcpProtocolParseError).operation, "decode-wire-message");
+      assert.notInclude(error.message, "xxxx");
+      assert.deepEqual(events, [
+        {
+          direction: "incoming",
+          stage: "decode_failed",
+          payload: {
+            operation: "decode-wire-message",
+          },
+        },
+      ]);
+
+      const retained = yield* transport.incoming.pipe(Stream.runCollect);
+      assert.deepEqual(
+        retained.map((notification) => decodeIndex(notification.params).index),
+        [0],
+      );
+      assert.equal(yield* Queue.size(handled), 0);
+    }),
+  );
+
+  it.effect("terminates immediately on an unterminated stdout line exceeding 16MiB", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      const events: Array<AcpProtocol.AcpProtocolLogEvent> = [];
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        logIncoming: true,
+        logger: (event) =>
+          Effect.sync(() => {
+            if (event.stage === "decode_failed") {
+              events.push(event);
+            }
+          }),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+
+      const chunkWithoutNewline = encoder.encode("s".repeat(9 * MIB));
+      yield* Queue.offer(input, chunkWithoutNewline);
+      yield* Queue.offer(input, chunkWithoutNewline);
+
+      const error = yield* TestClock.withLive(
+        Deferred.await(terminated).pipe(Effect.timeout("5 seconds")),
+      );
+      assert.instanceOf(error, AcpError.AcpProtocolParseError);
+      assert.equal((error as AcpError.AcpProtocolParseError).operation, "decode-wire-message");
+      assert.notInclude(error.message, "ssss");
+      assert.deepEqual(events, [
+        {
+          direction: "incoming",
+          stage: "decode_failed",
+          payload: {
+            operation: "decode-wire-message",
+          },
+        },
+      ]);
+    }),
+  );
+
+  it.effect(
+    "decodes a multi-line chunk totaling over 16MiB when each line stays within the cap",
+    () =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const handled = yield* Queue.unbounded<number>();
+        let terminated = false;
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(),
+          onNotification: (notification) =>
+            Queue.offer(handled, decodeIndex(notification.params).index).pipe(Effect.asVoid),
+          onTermination: () =>
+            Effect.sync(() => {
+              terminated = true;
+            }),
+        });
+
+        const first = largeNotification(0, 9 * MIB);
+        const second = largeNotification(1, 9 * MIB);
+        const combined = new Uint8Array(first.length + second.length);
+        combined.set(first, 0);
+        combined.set(second, first.length);
+        yield* Queue.offer(input, combined);
+
+        assert.equal(yield* Queue.take(handled), 0);
+        assert.equal(yield* Queue.take(handled), 1);
+        assert.isFalse(terminated);
+
+        // Both 9 MiB notifications cannot fit together under the 16 MiB raw backlog cap.
+        yield* Queue.end(input);
+        const retained = yield* transport.incoming.pipe(Stream.runCollect);
+        assert.deepEqual(
+          retained.map((notification) => decodeIndex(notification.params).index),
+          [1],
+        );
+      }),
+  );
+
+  it.effect("strictly enforces the 16MiB boundary for unread raw notifications and batches", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();
       const handled = yield* Queue.unbounded<number>();
@@ -229,13 +358,60 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
           Queue.offer(handled, decodeIndex(notification.params).index).pipe(Effect.asVoid),
       });
 
-      yield* Queue.offer(input, largeNotification(0, 1));
-      yield* Queue.take(handled);
-      yield* Queue.offer(input, largeNotification(1, 17 * MIB));
-      yield* Queue.take(handled);
+      const emptyFrameLength = encodeUnknownJsonString({
+        jsonrpc: "2.0",
+        method: "x/large",
+        params: { index: 0, text: "" },
+      }).length;
+      const exactBudgetLine = largeNotification(0, 16 * MIB - emptyFrameLength);
+      assert.equal(exactBudgetLine.length - 1, 16 * MIB);
 
-      const [retained] = yield* transport.incoming.pipe(Stream.take(1), Stream.runCollect);
-      assert.equal(decodeIndex(retained?.params).index, 1);
+      // Exact 16 MiB line fits on its own, then gets evicted as soon as another notification arrives.
+      yield* Queue.offer(input, exactBudgetLine);
+      assert.equal(yield* Queue.take(handled), 0);
+      yield* Queue.offer(input, largeNotification(1, 1));
+      assert.equal(yield* Queue.take(handled), 1);
+
+      // A single batch line (~9 MiB) charges both notifications its full line length, so only the newest stays.
+      const batchLine = encoder.encode(
+        `${encodeUnknownJsonString([
+          { jsonrpc: "2.0", method: "x/large", params: { index: 2, text: "a".repeat(4_500_000) } },
+          { jsonrpc: "2.0", method: "x/large", params: { index: 3, text: "b".repeat(4_500_000) } },
+        ])}\n`,
+      );
+      yield* Queue.offer(input, batchLine);
+      assert.equal(yield* Queue.take(handled), 2);
+      assert.equal(yield* Queue.take(handled), 3);
+
+      yield* Queue.end(input);
+      const retained = yield* transport.incoming.pipe(Stream.runCollect);
+      assert.deepEqual(
+        retained.map((notification) => decodeIndex(notification.params).index),
+        [3],
+      );
+    }),
+  );
+
+  it.effect("discards an oversized incomplete UTF-8 tail cleanly on stream end", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+
+      const payload = new Uint8Array(16 * MIB + 1);
+      payload.fill(0x61, 0, 16 * MIB);
+      payload[16 * MIB] = 0xe2; // Leading byte of an incomplete 3-byte UTF-8 sequence.
+      yield* Queue.offer(input, payload);
+      yield* Queue.end(input);
+
+      const error = yield* TestClock.withLive(
+        Deferred.await(terminated).pipe(Effect.timeout("5 seconds")),
+      );
+      assert.instanceOf(error, AcpError.AcpInputStreamEndedError);
     }),
   );
 

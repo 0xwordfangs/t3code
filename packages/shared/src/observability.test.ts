@@ -154,12 +154,308 @@ describe("redactUrlCredentials", () => {
     assert.strictEqual(redactUrlCredentials(clean), clean);
   });
 
-  it("stays linear on long runs of backslashes and percent sequences without quadratic backtracking", () => {
+  it("redacts HTML-entity ampersands, JSON-escaped fragments, and URL authority userinfo idempotently", () => {
+    const htmlEntities =
+      "https://accounts.google.com/v3/signin/continue?foo=1&amp;plt=SECRET_AMP&AMP;token=SECRET_UPPER_AMP&#38;code=SECRET_DEC&#0038;access_token=SECRET_DEC_PAD&#x26;id_token=SECRET_HEX&#X0026;refresh_token=SECRET_HEX_PAD&amp;state=ok";
+    const redactedHtml = redactUrlCredentials(htmlEntities);
+    assert.equal(
+      redactedHtml,
+      "https://accounts.google.com/v3/signin/continue?foo=1&amp;plt=<redacted>&AMP;token=<redacted>&#38;code=<redacted>&#0038;access_token=<redacted>&#x26;id_token=<redacted>&#X0026;refresh_token=<redacted>&amp;state=ok",
+    );
+    assert.equal(redactUrlCredentials(redactedHtml), redactedHtml);
+
+    const escapedFragments = [
+      '{"url":"https://example.test/cb\\u0023token=SECRET_FRAG_1\\u0026access_token=SECRET_FRAG_2"}',
+      '{"nested":"https://example.test/cb\\\\u0023plt\\\\u003dSECRET_FRAG_3\\\\u0026code\\\\u003dSECRET_FRAG_4"}',
+    ];
+    for (const input of escapedFragments) {
+      const redacted = redactUrlCredentials(input);
+      assert.notInclude(redacted, "SECRET_FRAG_");
+      assert.include(redacted, "<redacted>");
+      assert.equal(redactUrlCredentials(redacted), redacted);
+    }
+    assert.equal(
+      redactUrlCredentials(escapedFragments[0]!),
+      '{"url":"https://example.test/cb\\u0023token=<redacted>\\u0026access_token=<redacted>"}',
+    );
+    assert.equal(
+      redactUrlCredentials(escapedFragments[1]!),
+      '{"nested":"https://example.test/cb\\\\u0023plt\\\\u003d<redacted>\\\\u0026code\\\\u003d<redacted>"}',
+    );
+
+    const userinfoCases = [
+      ["https://alice:secret@example.test/path", "https://<redacted>@example.test/path"],
+      ["https://TOKEN@example.test/org/repo.git", "https://<redacted>@example.test/org/repo.git"],
+      ["https://user@corp:pass@example.test/path", "https://<redacted>@example.test/path"],
+      [
+        "continue%3Dhttps://user:pass@example.test/p",
+        "continue%3Dhttps://<redacted>@example.test/p",
+      ],
+      [
+        "postgres://admin:dbpass@db.internal:5432/app",
+        "postgres://<redacted>@db.internal:5432/app",
+      ],
+      [
+        "https://alice:secret@example.test/path?plt=SECRET_PLT&amp;code=SECRET_CODE",
+        "https://<redacted>@example.test/path?plt=<redacted>&amp;code=<redacted>",
+      ],
+      [
+        "+https://alice:secret@example.test/org/repo.git",
+        "+https://<redacted>@example.test/org/repo.git",
+      ],
+      [
+        "-https://alice:secret@example.test/org/repo.git",
+        "-https://<redacted>@example.test/org/repo.git",
+      ],
+      ["1-https://alice:secret@example.test/path", "1-https://<redacted>@example.test/path"],
+      [
+        "very-long-prefix-name-https://alice:secret@example.test/path",
+        "very-long-prefix-name-https://<redacted>@example.test/path",
+      ],
+      [
+        "postgresql+asyncpg://alice:SECRET@db.internal/app",
+        "postgresql+asyncpg://<redacted>@db.internal/app",
+      ],
+      [
+        '{"err":"\\u0022postgres+psycopg2://alice:SECRET@db.internal/app"}',
+        '{"err":"\\u0022postgres+psycopg2://<redacted>@db.internal/app"}',
+      ],
+    ] as const;
+    for (const [input, expected] of userinfoCases) {
+      const redacted = redactUrlCredentials(input);
+      assert.equal(redacted, expected);
+      assert.equal(redactUrlCredentials(redacted), redacted);
+    }
+
+    const preserved = [
+      "Contact alice@example.com for help",
+      "https://example.test/@scope/pkg",
+      "https://example.test/?email=a@b.com",
+      "https://foo@ ",
+      "https://foo@",
+      "refresh_token=[REDACTED]",
+      "access_token=[REDACTED],retry_after=30",
+      "access_token=[REDACTED];status=401",
+      "refresh_token=[REDACTED]) ok",
+      "refresh_token=[REDACTED])) ok",
+      "(https://example.test/cb?refresh_token=[REDACTED]) ok",
+    ];
+    for (const input of preserved) {
+      assert.strictEqual(redactUrlCredentials(input), input);
+    }
+    assert.equal(
+      redactUrlCredentials("refresh_token=[REDACTED]LEAK&plt=SECRET_AFTER_PLACEHOLDER"),
+      "refresh_token=<redacted>&plt=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("https://example.test/cb?access_token=[REDACTED],REAL_SECRET&state=ok"),
+      "https://example.test/cb?access_token=<redacted>&state=ok",
+    );
+    assert.equal(
+      redactUrlCredentials("https://example.test/cb?access_token=[REDACTED],,REAL_SECRET&state=ok"),
+      "https://example.test/cb?access_token=<redacted>&state=ok",
+    );
+    assert.equal(
+      redactUrlCredentials("https://example.test/cb?access_token=[REDACTED]);REAL_SECRET&state=ok"),
+      "https://example.test/cb?access_token=<redacted>&state=ok",
+    );
+    assert.equal(
+      redactUrlCredentials("https://example.test/cb?access_token=[REDACTED]),REAL_SECRET&state=ok"),
+      "https://example.test/cb?access_token=<redacted>&state=ok",
+    );
+    assert.equal(
+      redactUrlCredentials(
+        "https://example.test/cb?access_token=[REDACTED],<REAL_SECRET>&state=ok",
+      ),
+      "https://example.test/cb?access_token=<redacted>&state=ok",
+    );
+    assert.equal(
+      redactUrlCredentials("refresh_token=[REDACTED])LEAK_AFTER_PAREN"),
+      "refresh_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("refresh_token=[REDACTED]))LEAK_AFTER_DOUBLE_PAREN"),
+      "refresh_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],refresh_token=REAL_SECRET"),
+      "access_token=[REDACTED],refresh_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],plt=SECRET_PLT"),
+      "access_token=[REDACTED],plt=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],token=REAL_SECRET"),
+      "access_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],api_key=REAL_SECRET"),
+      "access_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],,REAL_SECRET"),
+      "access_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],token=[REDACTED]REAL_SECRET"),
+      "access_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],api_key=[REDACTED]REAL_SECRET"),
+      "access_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],secret=[REDACTED],,REAL_SECRET"),
+      "access_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],token=[REDACTED],REAL_SECRET"),
+      "access_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],token=[REDACTED]"),
+      "access_token=[REDACTED],token=[REDACTED]",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],error_code=invalid_grant"),
+      "access_token=[REDACTED],error_code=invalid_grant",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],auth_mode=oauth"),
+      "access_token=[REDACTED],auth_mode=oauth",
+    );
+    assert.equal(
+      redactUrlCredentials("https://example.test/cb?foo=1&#0000038;code=SECRET_MANY_ZEROS"),
+      "https://example.test/cb?foo=1&#0000038;code=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials(
+        "access_token=[REDACTED],url=https://accounts.google.com/v3/signin/continue?plt=REAL_PLT_SECRET",
+      ),
+      "access_token=[REDACTED],url=https://accounts.google.com/v3/signin/continue?plt=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials(
+        "access_token=[REDACTED],continue=https%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3DREAL_PLT_ENC",
+      ),
+      "access_token=[REDACTED],continue=https%3A%2F%2Faccounts.google.com%2Fv3%2Fsignin%2Fcontinue%3Fplt%3D<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials(
+        "access_token=[REDACTED],cb=https://example.test/cb?code=REAL_CODE_SECRET&plt=SECOND_PLT",
+      ),
+      "access_token=[REDACTED],cb=https://example.test/cb?code=<redacted>&plt=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED],url=https://a.test/?foo=1,api_key=REAL_SECRET"),
+      "access_token=<redacted>",
+    );
+    assert.equal(
+      redactUrlCredentials("access_token=[REDACTED]. Please retry."),
+      "access_token=[REDACTED]. Please retry.",
+    );
+    assert.equal(
+      redactUrlCredentials("Failed (access_token=[REDACTED]): unauthorized"),
+      "Failed (access_token=[REDACTED]): unauthorized",
+    );
+    assert.equal(redactUrlCredentials("access_token=[REDACTED].LEAK"), "access_token=<redacted>");
+
+    const round6Cases = [
+      [
+        "wss://example.test/ws?wsticket=part1\\u003cSECRET_PART2&foo=bar",
+        "wss://example.test/ws?wsticket=<redacted>&foo=bar",
+      ],
+      [
+        "https://example.test/?plt\\u003dabc\\u003eSECRET_TAIL\\u0026ok=1",
+        "https://example.test/?plt\\u003d<redacted>\\u0026ok=1",
+      ],
+      ["error%20access_token=SUPERSECRET%20ok=1", "error%20access_token=<redacted>%20ok=1"],
+      ["error%20plt=SUPERSECRET%20ok=1", "error%20plt=<redacted>%20ok=1"],
+      ["error%20code=403", "error%20code=403"],
+      ["https://example.test/?token=<reda…", "https://example.test/?token=<reda…"],
+      [
+        "https://example.test/?access_token=[REDACTED]…",
+        "https://example.test/?access_token=[REDACTED]…",
+      ],
+      ["access_token=FIRST_TOK,plt\\u003dSECRET_PLT", "access_token=<redacted>"],
+      [
+        '{"url":"wss://example.test/ws?wsticket=part1\\u003dSECRET_PART2"}',
+        '{"url":"wss://example.test/ws?wsticket=<redacted>"}',
+      ],
+      ["access_token=[REDACTED],bearer=SECRET_BEARER", "access_token=<redacted>"],
+      ["access_token=[REDACTED],cookie=SECRET_COOKIE", "access_token=<redacted>"],
+      ["access_token=[REDACTED],signature=SECRET_SIG", "access_token=<redacted>"],
+      ["access_token=[REDACTED],x=plt=SECRET_NESTED", "access_token=<redacted>"],
+      [
+        "access_token=[REDACTED],url=https://a.test/?foo=1,x=plt=SECRET_NESTED",
+        "access_token=<redacted>",
+      ],
+      ["access_token=[REDACTED],progress=100%,x=plt=SECRET_NESTED", "access_token=<redacted>"],
+      ["access_token=[REDACTED],x=a%21plt=SECRET_NESTED", "access_token=<redacted>"],
+      [
+        "access_token=[REDACTED],url=https://a.test/cb?x=plt=SECRET_NESTED",
+        "access_token=<redacted>",
+      ],
+      ["access_token=[REDACTED],x=plt\\u003dSECRET_NESTED", "access_token=<redacted>"],
+      [
+        JSON.stringify({ err: "line1\nplt=SUPERSECRET_PLT\nwsticket=SUPERSECRET_WS" }),
+        JSON.stringify({ err: "line1\nplt=<redacted>\nwsticket=<redacted>" }),
+      ],
+      [
+        JSON.stringify({ err: "exit code=1\nstatus code=403" }),
+        JSON.stringify({ err: "exit code=1\nstatus code=403" }),
+      ],
+    ] as const;
+    for (const [input, expected] of round6Cases) {
+      const redacted = redactUrlCredentials(input);
+      assert.equal(redacted, expected);
+      assert.equal(redactUrlCredentials(redacted), redacted);
+    }
+
+    // Nested JSON.stringify (3-backslash \\\" quote) must stay valid JSON and idempotent across sink redaction
+    const nestedRecord = JSON.stringify({
+      body: JSON.stringify({ url: "https://example.test/cb?plt=NESTED_JSON_SECRET" }),
+    });
+    const redactedNested = redactUrlCredentials(nestedRecord);
+    assert.notInclude(redactedNested, "NESTED_JSON_SECRET");
+    assert.equal(redactUrlCredentials(redactedNested), redactedNested);
+    const parsedOuter = JSON.parse(redactedNested) as { readonly body: string };
+    const parsedInner = JSON.parse(parsedOuter.body) as { readonly url: string };
+    assert.equal(parsedInner.url, "https://example.test/cb?plt=<redacted>");
+    const doublePassNested = redactUrlCredentials(
+      JSON.stringify({
+        body: redactUrlCredentials(
+          JSON.stringify({ url: "https://example.test/cb?plt=NESTED_JSON_SECRET" }),
+        ),
+      }),
+    );
+    assert.equal(redactUrlCredentials(doublePassNested), doublePassNested);
+    assert.doesNotThrow(() => JSON.parse(doublePassNested));
+  });
+
+  it("stays linear on long runs of backslashes, percent sequences, entities, and userinfo patterns without quadratic backtracking", () => {
     const adversarialBackslashes = `x=1 ${"\\".repeat(200_000)}x`;
     assert.strictEqual(redactUrlCredentials(adversarialBackslashes), adversarialBackslashes);
 
     const adversarialPercent = `${"%25".repeat(50_000)}&${"a".repeat(50_000)}`;
     assert.strictEqual(redactUrlCredentials(adversarialPercent), adversarialPercent);
+
+    const adversarialUserinfo = `https://${"a".repeat(100_000)}@`;
+    assert.strictEqual(redactUrlCredentials(adversarialUserinfo), adversarialUserinfo);
+    assert.strictEqual(
+      redactUrlCredentials(`https://${"@".repeat(100_000)}`),
+      `https://${"@".repeat(100_000)}`,
+    );
+    const adversarialEntities = `${"&amp;".repeat(50_000)}${"&#000038;".repeat(50_000)}=1`;
+    assert.strictEqual(redactUrlCredentials(adversarialEntities), adversarialEntities);
+
+    const repeatedPlaceholderQuery = "?plt=[REDACTED]),".repeat(16_000);
+    assert.equal(redactUrlCredentials(repeatedPlaceholderQuery), "?plt=<redacted>");
+    const repeatedPlaceholderKv = "plt=[REDACTED],".repeat(16_000);
+    assert.strictEqual(redactUrlCredentials(repeatedPlaceholderKv), repeatedPlaceholderKv);
+    const repeatedSafeSiblings = `access_token=[REDACTED]${",a=1".repeat(20_000)}`;
+    assert.strictEqual(redactUrlCredentials(repeatedSafeSiblings), repeatedSafeSiblings);
 
     const manyMatches = Array.from({ length: 10_000 }, (_, i) => `plt=secret${i}`).join("&");
     const redactedMany = redactUrlCredentials(manyMatches);

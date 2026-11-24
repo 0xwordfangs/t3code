@@ -183,12 +183,19 @@ const decodeElicitationComplete = Schema.decodeUnknownEffect(
   AcpSchema.CompleteElicitationNotification,
 );
 const parserFactory = RpcSerialization.ndJsonRpc();
+const MAX_INCOMING_LINE_LENGTH = 16 * 1024 * 1024;
 // ndJsonRpc skips lines that are not JSON. A malformed agent line has to end the
 // session, so frames are split here and each nonblank one goes through the strict codec.
 const makeStrictNdJsonRpcParser = () => {
   const codec = RpcSerialization.jsonRpc().makeUnsafe();
   const decoder = new TextDecoder();
   let buffer = "";
+  const assertLineLength = (length: number): void => {
+    if (length > MAX_INCOMING_LINE_LENGTH) {
+      buffer = "";
+      throw new Error(`ACP stdout line exceeded ${MAX_INCOMING_LINE_LENGTH} characters.`);
+    }
+  };
   const decodeLine = (line: string): ReadonlyArray<AcpDecodedWireMessage> =>
     codec.decode(line).map((message) => ({
       message: normalizeAcpJsonRpcError(
@@ -200,19 +207,38 @@ const makeStrictNdJsonRpcParser = () => {
     // Every message in a batch line is charged the whole line.
     decode: (bytes: Uint8Array | string): ReadonlyArray<AcpDecodedWireMessage> => {
       const chunk = typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
-      const lastNewline = chunk.lastIndexOf("\n");
-      // Splitting the whole buffer per chunk is quadratic for multi-megabyte lines.
-      if (lastNewline === -1) {
-        buffer += chunk;
-        return [];
+      const decoded: Array<AcpDecodedWireMessage> = [];
+      let start = 0;
+      while (start < chunk.length) {
+        const newline = chunk.indexOf("\n", start);
+        if (newline === -1) {
+          assertLineLength(buffer.length + (chunk.length - start));
+          const remainder = start === 0 ? chunk : chunk.slice(start);
+          buffer += remainder;
+          return decoded;
+        }
+        const fragmentLength = newline - start;
+        assertLineLength(buffer.length + fragmentLength);
+        const fragment = chunk.slice(start, newline);
+        const line = buffer.length === 0 ? fragment : buffer + fragment;
+        buffer = "";
+        if (line.trim() !== "") {
+          for (const entry of decodeLine(line)) {
+            decoded.push(entry);
+          }
+        }
+        start = newline + 1;
       }
-      const lines = (buffer + chunk.slice(0, lastNewline)).split("\n");
-      buffer = chunk.slice(lastNewline + 1);
-      return lines.flatMap((line) => (line.trim() === "" ? [] : decodeLine(line)));
+      return decoded;
     },
     // A truncated final line is left to the exit status, which explains a crash better.
     end: (): ReadonlyArray<AcpDecodedWireMessage> => {
-      const line = buffer + decoder.decode();
+      const tail = decoder.decode();
+      if (buffer.length + tail.length > MAX_INCOMING_LINE_LENGTH) {
+        buffer = "";
+        return [];
+      }
+      const line = buffer + tail;
       buffer = "";
       try {
         return line.trim() === "" ? [] : decodeLine(line);
@@ -257,9 +283,9 @@ function normalizeOutgoingFrame(frame: unknown): unknown {
   };
 }
 
-// Unread raw notifications are best-effort. The newest is always kept; older
-// ones are dropped once the backlog passes either limit. The length limit counts
-// JSON line characters (UTF-16 code units), not bytes or heap size.
+// Unread raw notifications are best-effort and strictly capped by both count and
+// total JSON line length (UTF-16 code units, not bytes or heap size). Older
+// entries — and any single entry that alone exceeds the length budget — are dropped.
 const MAX_BUFFERED_RAW_NOTIFICATIONS = 32;
 const MAX_BUFFERED_RAW_NOTIFICATION_JSON_LENGTH = 16 * 1024 * 1024;
 
@@ -512,7 +538,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       rawNotificationsJsonLength += lineLength;
       while (
         Queue.sizeUnsafe(rawNotifications) > MAX_BUFFERED_RAW_NOTIFICATIONS ||
-        (Queue.sizeUnsafe(rawNotifications) > 1 &&
+        (Queue.sizeUnsafe(rawNotifications) > 0 &&
           rawNotificationsJsonLength > MAX_BUFFERED_RAW_NOTIFICATION_JSON_LENGTH)
       ) {
         const dropped = Queue.takeUnsafe(rawNotifications);

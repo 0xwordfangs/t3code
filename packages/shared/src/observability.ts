@@ -420,12 +420,94 @@ const SENSITIVE_URL_PARAM_NAMES = new Set([
   "refresh_token",
 ]);
 const SENSITIVE_QUERY_PARAM_NAMES = new Set([...SENSITIVE_URL_PARAM_NAMES, "code", "token"]);
-// Linear-time prefix scan over literal, JSON-escaped (\u0026/\u003f/\u003d), and
-// single/multi percent-encoded delimiters, ASCII parameter keys, and equals signs.
+// Linear-time redaction for URL authority userinfo (scheme://user[:pass]@host) and
+// literal, HTML-entity (&amp;/&#38;/&#x26;), JSON-escaped (\u0026/\u0023/\u003f/\u003d),
+// and single/multi percent-encoded URL credential parameters.
+const URL_USERINFO_PATTERN =
+  /(?:(?<![A-Za-z0-9])|(?<=%(?:25){0,3}[0-9A-Fa-f]{2})|(?<=\\(?:[nrt]|u00(?:20|22|27|3[cCdDeE]))))([A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^\s/?#"'<>\\]+@(?=[^\s/?#"'<>\\@])/g;
 const URL_CREDENTIAL_KEY_PREFIX =
-  /(^|[?&#"'\s]|\\u0026|\\u003[fF]|%(?:25){0,3}(?:3[fF]|26|23))((?:[A-Za-z0-9_-]|%(?:25){0,3}(?:2[dD]|3[0-9]|4[1-9a-fA-F]|5[0-9aAfF]|6[1-9a-fA-F]|7[0-9aA])){2,32})(=|\\{1,2}u003[dD]|%(?:25){0,3}3[dD])/g;
+  /(^|&[aA][mM][pP];|&#0*38;|&#[xX]0*26;|[?&#"'\s,;]|\\{1,2}[nrt]|\\{1,2}u00(?:26|23|3[fF]|20|22|27|0[aAdD])|%(?:25){0,3}(?:3[fF]|26|23|20|22|27|0[aAdD]))((?:[A-Za-z0-9_-]|%(?:25){0,3}(?:2[dD]|3[0-9]|4[1-9a-fA-F]|5[0-9aAfF]|6[1-9a-fA-F]|7[0-9aA])){2,32})(=|\\{1,2}u003[dD]|%(?:25){0,3}3[dD])/g;
 const URL_CREDENTIAL_VALUE_END =
-  /[&#"'\\\s]|\\u00(?:26|23|22|27|20)|%(?:25){0,3}(?:26|23|22|27|20|0[aAdD]|5[cC])/g;
+  /[&#"'\s]|(?<!\\)\\+(?=["'nrt]|u00(?:26|23|22|27|20|0[aAdD]|3[fF])|$)|%(?:25){0,3}(?:26|23|22|27|20|0[aAdD]|5[cC])/g;
+const NON_QUERY_DELIM =
+  /^(?:["'\s,;]|\\{1,2}[nrt]|\\{1,2}u00(?:20|22|27|0[aAdD])|%(?:25){0,3}(?:20|22|27|0[aAdD]))$/u;
+const TRUNCATED_PLACEHOLDER_ELLIPSIS =
+  /^(?:<(?:r(?:e(?:d(?:a(?:c(?:t(?:e(?:d(?:>)?)?)?)?)?)?)?)?)?|\[(?:R(?:E(?:D(?:A(?:C(?:T(?:E(?:D(?:\])?)?)?)?)?)?)?)?)?)…$/u;
+const KV_AFTER_DELIMITER = /([A-Za-z_][A-Za-z0-9_.-]{0,63})=/y;
+const SENSITIVE_KV_KEY_HINT =
+  /token|secret|key|pass|cred|authorization|bearer|cookie|signature|jwt/i;
+
+function isSensitiveSiblingKey(key: string): boolean {
+  return key === "code" || SENSITIVE_KV_KEY_HINT.test(key);
+}
+
+function isBoundedRedactedValue(working: string, start: number, end: number): boolean {
+  if (!working.startsWith("[REDACTED]", start) && !working.startsWith("<redacted>", start)) {
+    return false;
+  }
+  let idx = start + 10;
+  while (idx < end && (working[idx] === ")" || working[idx] === "]" || working[idx] === "}")) {
+    idx += 1;
+  }
+  return idx === end;
+}
+
+function validateSafeKvTail(working: string, delimiterIndex: number, valueEnd: number): number {
+  let delimPos = delimiterIndex;
+  let firstNestedQueryIndex = -1;
+  while (delimPos < valueEnd) {
+    const pos = delimPos + 1;
+    if (pos >= valueEnd) {
+      return firstNestedQueryIndex !== -1 ? firstNestedQueryIndex : valueEnd;
+    }
+    KV_AFTER_DELIMITER.lastIndex = pos;
+    const kvMatch = KV_AFTER_DELIMITER.exec(working);
+    if (kvMatch === null || KV_AFTER_DELIMITER.lastIndex > valueEnd) {
+      return -1;
+    }
+    const kvKey = kvMatch[1]!.toLowerCase();
+    if (SENSITIVE_URL_PARAM_NAMES.has(kvKey)) {
+      return firstNestedQueryIndex !== -1 ? firstNestedQueryIndex : delimPos;
+    }
+    const kvValStart = KV_AFTER_DELIMITER.lastIndex;
+    let segEnd = kvValStart;
+    let segQuestionIndex = -1;
+    let queryPartEqualsCount = 0;
+    while (segEnd < valueEnd && working[segEnd] !== "," && working[segEnd] !== ";") {
+      const ch = working[segEnd]!;
+      if (ch === "\\") {
+        return -1;
+      }
+      if (ch === "?") {
+        if (segQuestionIndex === -1) {
+          segQuestionIndex = segEnd;
+          queryPartEqualsCount = 0;
+        }
+        if (firstNestedQueryIndex === -1) {
+          firstNestedQueryIndex = segEnd;
+        }
+      } else if (ch === "%") {
+        if (firstNestedQueryIndex === -1) {
+          firstNestedQueryIndex = segEnd;
+        }
+      } else if (ch === "=") {
+        if (segQuestionIndex === -1) {
+          return -1;
+        }
+        queryPartEqualsCount += 1;
+        if (queryPartEqualsCount > 1) {
+          return -1;
+        }
+      }
+      segEnd += 1;
+    }
+    if (isSensitiveSiblingKey(kvKey) && !isBoundedRedactedValue(working, kvValStart, segEnd)) {
+      return -1;
+    }
+    delimPos = segEnd;
+  }
+  return firstNestedQueryIndex !== -1 ? firstNestedQueryIndex : valueEnd;
+}
 
 function decodeParamKey(rawKey: string): string {
   let current = rawKey;
@@ -442,33 +524,90 @@ function decodeParamKey(rawKey: string): string {
 }
 
 export const redactUrlCredentials = (text: string): string => {
-  if (!text.includes("=") && !text.includes("%") && !text.includes("\\u003")) {
-    return text;
+  const working =
+    text.includes("://") && text.includes("@")
+      ? text.replace(URL_USERINFO_PATTERN, "$1<redacted>@")
+      : text;
+  if (!working.includes("=") && !working.includes("%") && !working.includes("\\u003")) {
+    return working;
   }
   URL_CREDENTIAL_KEY_PREFIX.lastIndex = 0;
   let out = "";
   let cursor = 0;
   let changed = false;
+  let cachedEndMatch: RegExpExecArray | null = null;
+  let cachedValueEnd = -1;
   let match: RegExpExecArray | null;
-  while ((match = URL_CREDENTIAL_KEY_PREFIX.exec(text)) !== null) {
+  while ((match = URL_CREDENTIAL_KEY_PREFIX.exec(working)) !== null) {
     const delim = match[1]!;
     const rawKey = match[2]!;
     const key = decodeParamKey(rawKey);
-    const isQueryDelim = delim !== "" && !/^["'\s]$/.test(delim);
+    const isQueryDelim = delim !== "" && !NON_QUERY_DELIM.test(delim);
     const shouldRedact = isQueryDelim
       ? SENSITIVE_QUERY_PARAM_NAMES.has(key)
       : SENSITIVE_URL_PARAM_NAMES.has(key);
     if (!shouldRedact) continue;
     const valueStart = URL_CREDENTIAL_KEY_PREFIX.lastIndex;
-    URL_CREDENTIAL_VALUE_END.lastIndex = valueStart;
-    const endMatch = URL_CREDENTIAL_VALUE_END.exec(text);
-    const valueEnd = endMatch === null ? text.length : endMatch.index;
-    out += `${text.slice(cursor, valueStart)}<redacted>`;
+    if (valueStart > cachedValueEnd) {
+      URL_CREDENTIAL_VALUE_END.lastIndex = valueStart;
+      cachedEndMatch = URL_CREDENTIAL_VALUE_END.exec(working);
+      cachedValueEnd = cachedEndMatch === null ? working.length : cachedEndMatch.index;
+    }
+    const valueEnd = cachedValueEnd;
+    if (
+      (valueEnd - valueStart === 10 &&
+        (working.startsWith("<redacted>", valueStart) ||
+          working.startsWith("[REDACTED]", valueStart))) ||
+      (valueEnd === working.length &&
+        valueEnd - valueStart <= 11 &&
+        working.endsWith("…") &&
+        TRUNCATED_PLACEHOLDER_ELLIPSIS.test(working.slice(valueStart, valueEnd)))
+    ) {
+      URL_CREDENTIAL_KEY_PREFIX.lastIndex = valueEnd;
+      continue;
+    }
+    const boundedPlaceholder = working.startsWith("[REDACTED]", valueStart)
+      ? "[REDACTED]"
+      : working.startsWith("<redacted>", valueStart)
+        ? "<redacted>"
+        : undefined;
+    if (boundedPlaceholder !== undefined) {
+      let idx = valueStart + boundedPlaceholder.length;
+      while (
+        idx < valueEnd &&
+        (working[idx] === ")" || working[idx] === "]" || working[idx] === "}")
+      ) {
+        idx += 1;
+      }
+      let nextScanIndex = -1;
+      if (isQueryDelim) {
+        if (idx === valueEnd && (cachedEndMatch === null || /^[\s"']$/.test(cachedEndMatch[0]))) {
+          nextScanIndex = idx;
+        }
+      } else if (
+        idx === valueEnd ||
+        (idx + 1 === valueEnd &&
+          (working[idx] === "." ||
+            working[idx] === "!" ||
+            working[idx] === "?" ||
+            working[idx] === ":") &&
+          (cachedEndMatch === null || /^[\s"']$/.test(cachedEndMatch[0])))
+      ) {
+        nextScanIndex = valueEnd;
+      } else if (working[idx] === "," || working[idx] === ";") {
+        nextScanIndex = validateSafeKvTail(working, idx, valueEnd);
+      }
+      if (nextScanIndex !== -1) {
+        URL_CREDENTIAL_KEY_PREFIX.lastIndex = nextScanIndex;
+        continue;
+      }
+    }
+    out += `${working.slice(cursor, valueStart)}<redacted>`;
     cursor = valueEnd;
     URL_CREDENTIAL_KEY_PREFIX.lastIndex = valueEnd;
     changed = true;
   }
-  return changed ? out + text.slice(cursor) : text;
+  return changed ? out + working.slice(cursor) : working;
 };
 
 function redactTraceValue(value: unknown, seen?: WeakSet<object>): unknown {
