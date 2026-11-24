@@ -473,6 +473,7 @@ export interface ThreadManagementServiceShape {
   }) => Effect.Effect<boolean>;
   /** Receipt replays start no work; skip enablement checks with the same command id so settings cannot reject accepted retries. */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
   readonly waitForThread: (
     input: ThreadManagementWaitInput,
   ) => Effect.Effect<ThreadManagementWaitResult, ThreadManagementError>;
@@ -652,6 +653,12 @@ const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => Option.none()),
       Effect.map(Option.isSome),
     );
+
+  const getCommandReceipt: ThreadManagementServiceShape["getCommandReceipt"] = Effect.fn(
+    "ThreadManagementService.getCommandReceipt",
+  )(function (commandId) {
+    return receipts.getByCommandId(commandId);
+  });
 
   const ensureLegacyTranscript = Effect.fn(
     "orchestrationV2.threadManagement.ensureLegacyTranscript",
@@ -1740,6 +1747,18 @@ const make = Effect.gen(function* () {
         // One with its result keeps it, but its thread there may run follow-up work.
         if (task.remoteChild === undefined) continue;
         const commandId = CommandId.make(`${input.commandId}:stop:${task.id}`);
+        const existingReceipt = yield* receipts
+          .getByCommandId(commandId)
+          .pipe(Effect.orElseSucceed(() => Option.none()));
+        if (
+          Option.isSome(existingReceipt) &&
+          existingReceipt.value.status === "accepted" &&
+          existingReceipt.value.threadId === input.threadId &&
+          (existingReceipt.value.commandType === "delegated_task.remote.complete" ||
+            existingReceipt.value.commandType === "delegated_task.remote.stop")
+        ) {
+          continue;
+        }
         yield* (input.remoteDispatch ?? dispatch)(
           task.result === null
             ? {
@@ -1760,13 +1779,21 @@ const make = Effect.gen(function* () {
                 taskId: task.id,
               },
         ).pipe(
-          Effect.catch((error) =>
-            Effect.logWarning("Unable to stop a delegated task", {
+          Effect.catch((error) => {
+            if (
+              error._tag === "OrchestratorCommandIdConflictError" &&
+              error.receiptThreadId === input.threadId &&
+              (error.receiptCommandType === "delegated_task.remote.complete" ||
+                error.receiptCommandType === "delegated_task.remote.stop")
+            ) {
+              return Effect.void;
+            }
+            return Effect.logWarning("Unable to stop a delegated task", {
               parentThreadId: input.threadId,
               taskId: task.id,
               error,
-            }).pipe(Effect.andThen(Effect.sync(() => failures.push(error)))),
-          ),
+            }).pipe(Effect.andThen(Effect.sync(() => failures.push(error))));
+          }),
         );
         continue;
       }
@@ -1890,6 +1917,7 @@ const make = Effect.gen(function* () {
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    getCommandReceipt,
     waitForThread,
     settleAfterRun,
     settleThread,

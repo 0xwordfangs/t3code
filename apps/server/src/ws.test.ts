@@ -13,6 +13,7 @@ import {
   AuthProvidersManageScope,
   AuthSessionId,
   AuthSourceControlWriteScope,
+  ChatAttachmentId,
   CommandId,
   GoogleAccountVerificationUrl,
   ORCHESTRATION_PROTOCOL_VERSION,
@@ -45,6 +46,7 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2ThreadLaunchInput,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadStreamItem,
@@ -65,6 +67,7 @@ import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
@@ -96,6 +99,7 @@ import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as NativeChildWorkQuery from "./orchestration-v2/NativeChildWorkQuery.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
+import * as CommandReceiptStore from "./orchestration-v2/CommandReceiptStore.ts";
 import * as CodexInstallation from "./provider/CodexInstallation.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
@@ -2991,6 +2995,7 @@ it.effect(
         }),
         Layer.mock(ThreadManagement.ThreadManagementService)({
           ensureLegacyTranscript: () => Effect.void,
+          getCommandReceipt: () => Effect.succeedNone,
           getThreadSnapshot: () =>
             Effect.succeed({ schemaVersion: 1, snapshotSequence: 1, projection }),
           getThreadSnapshotWindow: () =>
@@ -4214,6 +4219,512 @@ it.effect(
       assert.equal(invalidateSecretsCount, 1);
       assert.equal(instanceRefreshModelsCount, 1);
       assert.equal(reloadSecretsCount, 1);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+        ),
+      ),
+    ),
+);
+
+it.effect(
+  "requires providers:manage when orchestration.launchThread replays or targets a persisted /logout run and fails closed on lookup errors",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project:launch-persisted-logout");
+      const instanceId = ProviderInstanceId.make("codex");
+      const at = DateTime.makeUnsafe("2026-11-24T00:00:00.000Z");
+
+      const s1ThreadId = ThreadId.make("thread:launch-s1-defer-logout");
+      const s2ThreadId = ThreadId.make("thread:launch-s2-reuse-logout");
+      const s3ThreadId = ThreadId.make("thread:launch-s3-omit-thread-logout");
+      const queuedLogoutThreadId = ThreadId.make("thread:launch-queued-logout");
+      const benignPreparingThreadId = ThreadId.make("thread:launch-benign-preparing");
+      const attachedLogoutThreadId = ThreadId.make("thread:launch-attached-logout");
+      const freshMissingThreadId = ThreadId.make("thread:launch-fresh-missing");
+      const brokenRecordsThreadId = ThreadId.make("thread:launch-broken-records");
+      const brokenMessagesThreadId = ThreadId.make("thread:launch-broken-messages");
+
+      const s1CommandId = CommandId.make("cmd:launch-s1-defer-logout");
+      const s2BaseCommandId = CommandId.make("cmd:launch-s2-reuse-base");
+      const s2InitialMsgCommandId = CommandId.make(`${s2BaseCommandId}:initial-message`);
+      const s2InitialOnlyBaseCommandId = CommandId.make("cmd:launch-s2-initial-only-base");
+      const s2InitialOnlyMsgCommandId = CommandId.make(
+        `${s2InitialOnlyBaseCommandId}:initial-message`,
+      );
+      const s3CreateCommandId = CommandId.make("cmd:launch-s3-create-logout");
+      const benignCommandId = CommandId.make("cmd:launch-benign-preparing");
+      const brokenReceiptCommandId = CommandId.make("cmd:launch-broken-receipt");
+
+      const s1RunId = RunId.make("run:launch-s1-logout");
+      const s2RunId = RunId.make("run:launch-s2-logout");
+      const s3RunId = RunId.make("run:launch-s3-logout");
+      const queuedLogoutRunId = RunId.make("run:launch-queued-logout");
+      const benignRunId = RunId.make("run:launch-benign-preparing");
+      const attachedLogoutRunId = RunId.make("run:launch-attached-logout");
+      const brokenMessagesRunId = RunId.make("run:launch-broken-messages");
+
+      const s1MsgId = MessageId.make("msg:launch-s1-logout");
+      const s2MsgId = MessageId.make("msg:launch-s2-logout");
+      const s3MsgId = MessageId.make("msg:launch-s3-logout");
+      const queuedLogoutMsgId = MessageId.make("msg:launch-queued-logout");
+      const benignMsgId = MessageId.make("msg:launch-benign-preparing");
+      const attachedLogoutMsgId = MessageId.make("msg:launch-attached-logout");
+      const brokenMessagesMsgId = MessageId.make("msg:launch-broken-messages");
+
+      const makeRun = (
+        threadId: ThreadId,
+        id: RunId,
+        userMessageId: MessageId,
+        status: OrchestrationV2Run["status"],
+      ): OrchestrationV2Run => ({
+        id,
+        threadId,
+        ordinal: 1,
+        providerInstanceId: instanceId,
+        modelSelection: { instanceId, model: "gpt-5.4" },
+        providerThreadId: null,
+        userMessageId,
+        rootNodeId: null,
+        activeAttemptId: null,
+        status,
+        requestedAt: at,
+        startedAt: null,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+      });
+
+      const makeMessage = (
+        threadId: ThreadId,
+        id: MessageId,
+        runId: RunId,
+        text: string,
+        attachments: OrchestrationV2ConversationMessage["attachments"] = [],
+      ): OrchestrationV2ConversationMessage => ({
+        id,
+        threadId,
+        runId,
+        nodeId: null,
+        role: "user",
+        text,
+        attachments,
+        streaming: false,
+        createdBy: "user",
+        creationSource: "web",
+        createdAt: at,
+        updatedAt: at,
+      });
+
+      const makeReceipt = (
+        commandId: CommandId,
+        threadId: ThreadId,
+        commandType: string,
+      ): CommandReceiptStore.CommandReceiptV2 => ({
+        commandId,
+        threadId,
+        commandType,
+        acceptedAt: at,
+        resultSequence: 1,
+        status: "accepted",
+        error: null,
+      });
+
+      const receiptsByCommandId = new Map<CommandId, CommandReceiptStore.CommandReceiptV2>([
+        [s1CommandId, makeReceipt(s1CommandId, s1ThreadId, "message.dispatch")],
+        [s2BaseCommandId, makeReceipt(s2BaseCommandId, s2ThreadId, "thread.metadata.update")],
+        [s2InitialMsgCommandId, makeReceipt(s2InitialMsgCommandId, s2ThreadId, "message.dispatch")],
+        [
+          s2InitialOnlyMsgCommandId,
+          makeReceipt(s2InitialOnlyMsgCommandId, s2ThreadId, "message.dispatch"),
+        ],
+        [s3CreateCommandId, makeReceipt(s3CreateCommandId, s3ThreadId, "thread.create")],
+        [benignCommandId, makeReceipt(benignCommandId, benignPreparingThreadId, "thread.create")],
+      ]);
+
+      const runsByThread = new Map<ThreadId, ReadonlyArray<OrchestrationV2Run>>([
+        [s1ThreadId, [makeRun(s1ThreadId, s1RunId, s1MsgId, "preparing")]],
+        [s2ThreadId, [makeRun(s2ThreadId, s2RunId, s2MsgId, "preparing")]],
+        [s3ThreadId, [makeRun(s3ThreadId, s3RunId, s3MsgId, "preparing")]],
+        [
+          queuedLogoutThreadId,
+          [makeRun(queuedLogoutThreadId, queuedLogoutRunId, queuedLogoutMsgId, "queued")],
+        ],
+        [
+          benignPreparingThreadId,
+          [makeRun(benignPreparingThreadId, benignRunId, benignMsgId, "preparing")],
+        ],
+        [
+          attachedLogoutThreadId,
+          [makeRun(attachedLogoutThreadId, attachedLogoutRunId, attachedLogoutMsgId, "preparing")],
+        ],
+        [
+          brokenMessagesThreadId,
+          [makeRun(brokenMessagesThreadId, brokenMessagesRunId, brokenMessagesMsgId, "preparing")],
+        ],
+      ]);
+
+      const messagesById = new Map<MessageId, OrchestrationV2ConversationMessage>([
+        [s1MsgId, makeMessage(s1ThreadId, s1MsgId, s1RunId, "/logout")],
+        [s2MsgId, makeMessage(s2ThreadId, s2MsgId, s2RunId, " /LOGOUT \n")],
+        [s3MsgId, makeMessage(s3ThreadId, s3MsgId, s3RunId, "/logout")],
+        [
+          queuedLogoutMsgId,
+          makeMessage(queuedLogoutThreadId, queuedLogoutMsgId, queuedLogoutRunId, "/logout"),
+        ],
+        [
+          benignMsgId,
+          makeMessage(benignPreparingThreadId, benignMsgId, benignRunId, "hello normal task"),
+        ],
+        [
+          attachedLogoutMsgId,
+          makeMessage(attachedLogoutThreadId, attachedLogoutMsgId, attachedLogoutRunId, "/logout", [
+            {
+              type: "file",
+              id: ChatAttachmentId.make("att-logout-note"),
+              name: "note.txt",
+              mimeType: "text/plain",
+              sizeBytes: 4,
+            },
+          ]),
+        ],
+      ]);
+
+      const makeLaunchProjection = (threadId: ThreadId): OrchestrationV2ThreadProjection => ({
+        thread: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId,
+          title: "Launch test",
+          providerInstanceId: instanceId,
+          modelSelection: { instanceId, model: "gpt-5.4" },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: at,
+          updatedAt: at,
+          archivedAt: null,
+          deletedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+        },
+        runs: [],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        providerSessions: [],
+        providerThreads: [],
+        providerTurns: [],
+        runtimeRequests: [],
+        messages: [],
+        plans: [],
+        turnItems: [],
+        checkpointScopes: [],
+        checkpoints: [],
+        contextHandoffs: [],
+        contextTransfers: [],
+        visibleTurnItems: [],
+        updatedAt: at,
+      });
+
+      let checkWorktreeBaseCount = 0;
+      let launchCount = 0;
+
+      const services = Layer.mergeAll(
+        layerUnusedConfigRpcServices,
+        Layer.mock(AnalyticsService.AnalyticsService)({
+          record: () => Effect.void,
+        }),
+        Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+        Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+        Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),
+        Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+        Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+        Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
+          enqueueCommand: (effect) => effect,
+        }),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+          checkWorktreeBase: () =>
+            Effect.sync(() => {
+              checkWorktreeBaseCount += 1;
+            }),
+          launch: (input) =>
+            Effect.sync(() => {
+              launchCount += 1;
+              const resolvedThreadId =
+                input.threadId ?? ThreadId.make(`thread:launched:${launchCount}`);
+              return {
+                threadId: resolvedThreadId,
+                sequence: launchCount,
+                resumed: false,
+                projection: makeLaunchProjection(resolvedThreadId),
+              };
+            }),
+        }),
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          getCommandReceipt: (commandId) => {
+            if (commandId === brokenReceiptCommandId) {
+              return Effect.fail(
+                new CommandReceiptStore.CommandReceiptStoreReadError({
+                  commandId,
+                  cause: "SQLITE_BUSY",
+                }),
+              );
+            }
+            return Effect.succeed(Option.fromUndefinedOr(receiptsByCommandId.get(commandId)));
+          },
+          getThreadRecords: (threadId, _fields, filter) => {
+            if (threadId === brokenRecordsThreadId) {
+              return Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId,
+                  cause: new ProjectionStoreReadError({ threadId, cause: "SQLITE_BUSY" }),
+                }),
+              );
+            }
+            if (threadId === freshMissingThreadId) {
+              return Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId,
+                  cause: new ProjectionStoreThreadNotFoundError({ threadId }),
+                }),
+              );
+            }
+            return Effect.sync(() => {
+              const allRuns = runsByThread.get(threadId) ?? [];
+              const filtered = allRuns.filter(
+                (run) =>
+                  (filter?.runIds === undefined || filter.runIds.includes(run.id)) &&
+                  (filter?.runStatuses === undefined || filter.runStatuses.includes(run.status)),
+              );
+              return { runs: filtered } as never;
+            });
+          },
+          getMessagesById: (threadId, ids) => {
+            if (threadId === brokenMessagesThreadId) {
+              return Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId,
+                  cause: new ProjectionStoreReadError({ threadId, cause: "SQLITE_BUSY" }),
+                }),
+              );
+            }
+            return Effect.sync(() => {
+              const result = new Map<MessageId, OrchestrationV2ConversationMessage>();
+              for (const id of ids) {
+                const message = messagesById.get(id);
+                if (message !== undefined) result.set(id, message);
+              }
+              return result;
+            });
+          },
+        }),
+        Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
+      );
+
+      const makeClient = (scopes: ReadonlyArray<AuthEnvironmentScope>, id: string) =>
+        Effect.gen(function* () {
+          const exits = yield* Queue.unbounded<Exit.Exit<unknown, unknown>>();
+          const server = yield* RpcServer.makeNoSerialization(WsRpcGroup, {
+            ...WS_RPC_SERVER_OPTIONS,
+            onFromServer: (response) =>
+              response._tag === "Exit" ? Queue.offer(exits, response.exit) : Effect.void,
+          }).pipe(
+            Effect.provide(
+              layerWsRpc(
+                {
+                  sessionId: AuthSessionId.make(`launch-logout:${id}`),
+                  subject: id,
+                  method: "browser-session-cookie",
+                  scopes,
+                },
+                {},
+                yield* ServerBrowser.ServerBrowser,
+                () => Effect.void,
+                { secretReferences: true },
+              ).pipe(Layer.provide(services), Layer.merge(RpcAuthorization.layer(scopes))),
+            ),
+          );
+          let seq = 0;
+          return (payload: OrchestrationV2ThreadLaunchInput) =>
+            Effect.gen(function* () {
+              seq += 1;
+              yield* server.write(0, {
+                _tag: "Request",
+                id: RpcMessage.RequestId(`${id}:${seq}`),
+                tag: ORCHESTRATION_V2_WS_METHODS.launchThread,
+                payload,
+                headers: Headers.empty,
+              });
+              return yield* Queue.take(exits);
+            });
+        });
+
+      const makeLaunchPayload = (
+        overrides: Partial<OrchestrationV2ThreadLaunchInput> & {
+          readonly commandId: CommandId;
+        },
+      ): OrchestrationV2ThreadLaunchInput => ({
+        projectId,
+        title: "Benign Replay",
+        modelSelection: { instanceId, model: "gpt-5.4" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        workspaceStrategy: { type: "root" },
+        initialMessage: { text: "hello benign", attachments: [] },
+        ...overrides,
+      });
+
+      const operatorCall = yield* makeClient([AuthOrchestrationOperateScope], "operator");
+      const managerCall = yield* makeClient(
+        [AuthOrchestrationOperateScope, AuthProvidersManageScope],
+        "manager",
+      );
+
+      const deniedPayloads: ReadonlyArray<{
+        readonly label: string;
+        readonly payload: OrchestrationV2ThreadLaunchInput;
+      }> = [
+        // S1: message.dispatch(defer_start) /logout receipt replayed via launchThread with benign text.
+        {
+          label: "S1 defer_start cross-command-type replay",
+          payload: makeLaunchPayload({
+            commandId: s1CommandId,
+            threadId: s1ThreadId,
+          }),
+        },
+        // S2: reuseExistingThread replay with ${commandId}:initial-message /logout receipt.
+        {
+          label: "S2 reuseExistingThread replay",
+          payload: makeLaunchPayload({
+            commandId: s2BaseCommandId,
+            threadId: s2ThreadId,
+            reuseExistingThread: true,
+          }),
+        },
+        // S2 variant: only ${commandId}:initial-message receipt resolves the persisted /logout thread while threadId is omitted.
+        {
+          label: "S2 initial-message receipt lookup without threadId",
+          payload: makeLaunchPayload({
+            commandId: s2InitialOnlyBaseCommandId,
+          }),
+        },
+        // S3: thread.create /logout replay while omitting threadId (resolved via commandId receipt).
+        {
+          label: "S3 omit-threadId replay",
+          payload: makeLaunchPayload({
+            commandId: s3CreateCommandId,
+          }),
+        },
+        // Queued /logout run on target thread.
+        {
+          label: "queued /logout run on target thread",
+          payload: makeLaunchPayload({
+            commandId: CommandId.make("cmd:launch-fresh-into-queued-logout"),
+            threadId: queuedLogoutThreadId,
+            reuseExistingThread: true,
+          }),
+        },
+      ];
+
+      for (const { label, payload } of deniedPayloads) {
+        const exit = yield* operatorCall(payload);
+        assert.isTrue(Exit.isFailure(exit), `expected operator denial for ${label}`);
+        if (Exit.isFailure(exit)) {
+          assert.deepInclude(Cause.squash(exit.cause) as object, {
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthProvidersManageScope,
+          });
+        }
+      }
+
+      // Fail closed on receipt lookup errors and non-ThreadNotFound projection lookup errors.
+      const failClosedPayloads: ReadonlyArray<{
+        readonly label: string;
+        readonly payload: OrchestrationV2ThreadLaunchInput;
+      }> = [
+        {
+          label: "receipt lookup error",
+          payload: makeLaunchPayload({ commandId: brokenReceiptCommandId }),
+        },
+        {
+          label: "projection records read error",
+          payload: makeLaunchPayload({
+            commandId: CommandId.make("cmd:launch-broken-records"),
+            threadId: brokenRecordsThreadId,
+          }),
+        },
+        {
+          label: "projection messages read error",
+          payload: makeLaunchPayload({
+            commandId: CommandId.make("cmd:launch-broken-messages"),
+            threadId: brokenMessagesThreadId,
+          }),
+        },
+      ];
+      for (const { label, payload } of failClosedPayloads) {
+        const exit = yield* operatorCall(payload);
+        assert.isTrue(Exit.isFailure(exit), `expected fail-closed launch error for ${label}`);
+        if (Exit.isFailure(exit)) {
+          assert.deepInclude(Cause.squash(exit.cause) as object, {
+            _tag: "OrchestrationV2ThreadLaunchError",
+            commandId: payload.commandId,
+            projectId,
+            message: "Failed to verify persisted launch authorization",
+          });
+        }
+      }
+
+      // None of the denied or fail-closed requests may reach checkWorktreeBase or launchThread.
+      assert.equal(checkWorktreeBaseCount, 0);
+      assert.equal(launchCount, 0);
+
+      // Positive controls for operator without providers:manage:
+      // 1. Replaying a benign non-/logout preparing run succeeds.
+      // 2. ThreadNotFound on a fresh input.threadId does not block launching a new thread.
+      // 3. A persisted /logout message with attachments is not treated as an executable auth command.
+      const allowedOperatorPayloads: ReadonlyArray<OrchestrationV2ThreadLaunchInput> = [
+        makeLaunchPayload({
+          commandId: benignCommandId,
+          threadId: benignPreparingThreadId,
+        }),
+        makeLaunchPayload({
+          commandId: CommandId.make("cmd:launch-fresh-missing-thread"),
+          threadId: freshMissingThreadId,
+        }),
+        makeLaunchPayload({
+          commandId: CommandId.make("cmd:launch-attached-logout"),
+          threadId: attachedLogoutThreadId,
+        }),
+      ];
+      for (const payload of allowedOperatorPayloads) {
+        assert.isTrue(Exit.isSuccess(yield* operatorCall(payload)));
+      }
+      assert.equal(checkWorktreeBaseCount, 3);
+      assert.equal(launchCount, 3);
+
+      // Positive control for caller WITH providers:manage: S1, S2, S3 and queued /logout all succeed.
+      for (const { label, payload } of deniedPayloads) {
+        assert.isTrue(
+          Exit.isSuccess(yield* managerCall(payload)),
+          `expected manager success for ${label}`,
+        );
+      }
+      assert.equal(checkWorktreeBaseCount, 3 + deniedPayloads.length);
+      assert.equal(launchCount, 3 + deniedPayloads.length);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(

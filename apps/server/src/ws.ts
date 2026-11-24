@@ -65,7 +65,9 @@ import {
   OrchestrationV2DispatchCommandError,
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2GetThreadProjectionError,
+  type OrchestrationV2Run,
   OrchestrationV2ThreadLaunchError,
+  type OrchestrationV2ThreadLaunchInput,
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ShellStreamItem,
@@ -98,6 +100,7 @@ import {
   ChatAttachmentId,
   PersistChatAttachmentsError,
   RpcClientId,
+  type RunId,
   EnvironmentAuthorizationError,
   ThreadId,
   type TerminalMetadataStreamEvent,
@@ -1646,6 +1649,54 @@ export const layerWsRpc = (
           ? effect
           : Effect.fail(rpcAuthorizationError(requiredScope));
       const isProjectionStoreThreadNotFoundError = Schema.is(ProjectionStoreThreadNotFoundError);
+      const authorizePersistedLogoutRunsOnThread = Effect.fn(
+        "ws.authorizePersistedLogoutRunsOnThread",
+      )(function* (input: {
+        readonly threadId: ThreadId;
+        readonly runStatuses: ReadonlyArray<OrchestrationV2Run["status"]>;
+        readonly targetedRunId?: RunId | undefined;
+      }) {
+        const runs = yield* Effect.gen(function* () {
+          const matching = (yield* threadManagement.getThreadRecords(input.threadId, ["runs"], {
+            runStatuses: input.runStatuses,
+          })).runs;
+          if (
+            input.targetedRunId !== undefined &&
+            !matching.some((run) => run.id === input.targetedRunId)
+          ) {
+            const targeted = (yield* threadManagement.getThreadRecords(input.threadId, ["runs"], {
+              runIds: [input.targetedRunId],
+            })).runs;
+            return [...matching, ...targeted];
+          }
+          return matching;
+        }).pipe(
+          Effect.catchTags({
+            OrchestratorProjectionError: (error) =>
+              isProjectionStoreThreadNotFoundError(error.cause)
+                ? Effect.succeed([])
+                : Effect.fail(error),
+          }),
+        );
+        const messageIds = [...new Set(runs.map((run) => run.userMessageId))];
+        if (messageIds.length === 0) return;
+        const messages = yield* threadManagement.getMessagesById(input.threadId, messageIds).pipe(
+          Effect.catchTags({
+            OrchestratorProjectionError: (error) =>
+              isProjectionStoreThreadNotFoundError(error.cause)
+                ? Effect.succeed(new Map())
+                : Effect.fail(error),
+          }),
+        );
+        for (const message of messages.values()) {
+          if (
+            message.attachments.length === 0 &&
+            isLogoutPromptText(message.text, message.context)
+          ) {
+            return yield* rpcAuthorizationError(AuthProvidersManageScope);
+          }
+        }
+      });
       const authorizePersistedLogoutCommand = Effect.fn("ws.authorizePersistedLogoutCommand")(
         function* (command: OrchestrationV2Command) {
           if (canManageProviders) return;
@@ -1661,56 +1712,55 @@ export const layerWsRpc = (
           ) {
             return;
           }
-          const runs = yield* Effect.gen(function* () {
-            const queued = (yield* threadManagement.getThreadRecords(command.threadId, ["runs"], {
-              runStatuses: ["queued"],
-            })).runs;
-            const targetedRunId =
-              command.type === "prepared-run.release" ||
-              command.type === "prepared-run.retry" ||
-              command.type === "queued-run.start"
-                ? command.runId
-                : command.type === "queued-message.promote-to-steer"
-                  ? command.queuedRunId
-                  : undefined;
-            if (targetedRunId !== undefined && !queued.some((run) => run.id === targetedRunId)) {
-              const targeted = (yield* threadManagement.getThreadRecords(
-                command.threadId,
-                ["runs"],
-                {
-                  runIds: [targetedRunId],
-                },
-              )).runs;
-              return [...queued, ...targeted];
-            }
-            return queued;
-          }).pipe(
-            Effect.catchTags({
-              OrchestratorProjectionError: (error) =>
-                isProjectionStoreThreadNotFoundError(error.cause)
-                  ? Effect.succeed([])
-                  : Effect.fail(error),
-            }),
+          const targetedRunId =
+            command.type === "prepared-run.release" ||
+            command.type === "prepared-run.retry" ||
+            command.type === "queued-run.start"
+              ? command.runId
+              : command.type === "queued-message.promote-to-steer"
+                ? command.queuedRunId
+                : undefined;
+          return yield* authorizePersistedLogoutRunsOnThread({
+            threadId: command.threadId,
+            runStatuses: ["queued"],
+            targetedRunId,
+          });
+        },
+      );
+      const authorizePersistedLogoutLaunch = Effect.fn("ws.authorizePersistedLogoutLaunch")(
+        function* (input: OrchestrationV2ThreadLaunchInput) {
+          if (canManageProviders) return;
+          const toLaunchAuthError = (cause: unknown) =>
+            new OrchestrationV2ThreadLaunchError({
+              commandId: input.commandId,
+              projectId: input.projectId,
+              message: "Failed to verify persisted launch authorization",
+              cause,
+            });
+          const candidateCommandIds = [
+            input.commandId,
+            CommandId.make(`${input.commandId}:initial-message`),
+          ];
+          const candidateThreadIds = new Set<ThreadId>(
+            input.threadId === undefined ? [] : [input.threadId],
           );
-          const messageIds = [...new Set(runs.map((run) => run.userMessageId))];
-          if (messageIds.length === 0) return;
-          const messages = yield* threadManagement
-            .getMessagesById(command.threadId, messageIds)
-            .pipe(
-              Effect.catchTags({
-                OrchestratorProjectionError: (error) =>
-                  isProjectionStoreThreadNotFoundError(error.cause)
-                    ? Effect.succeed(new Map())
-                    : Effect.fail(error),
-              }),
-            );
-          for (const message of messages.values()) {
-            if (
-              message.attachments.length === 0 &&
-              isLogoutPromptText(message.text, message.context)
-            ) {
-              return yield* rpcAuthorizationError(AuthProvidersManageScope);
+          for (const commandId of candidateCommandIds) {
+            const receipt = yield* threadManagement
+              .getCommandReceipt(commandId)
+              .pipe(Effect.mapError(toLaunchAuthError));
+            if (Option.isSome(receipt)) {
+              candidateThreadIds.add(receipt.value.threadId);
             }
+          }
+          for (const threadId of candidateThreadIds) {
+            yield* authorizePersistedLogoutRunsOnThread({
+              threadId,
+              runStatuses: ["preparing", "queued"],
+            }).pipe(
+              Effect.mapError((cause) =>
+                isEnvironmentAuthorizationError(cause) ? cause : toLaunchAuthError(cause),
+              ),
+            );
           }
         },
       );
@@ -2301,49 +2351,53 @@ export const layerWsRpc = (
             Effect.andThen(
               startup
                 .enqueueCommand(
-                  threadLaunch
-                    .checkWorktreeBase({
-                      commandId: input.commandId,
-                      projectId: input.projectId,
-                      workspaceStrategy: input.workspaceStrategy,
-                    })
-                    .pipe(
-                      Effect.andThen(
-                        ThreadMessageIntake.launchThread({
+                  authorizePersistedLogoutLaunch(input).pipe(
+                    Effect.andThen(
+                      threadLaunch
+                        .checkWorktreeBase({
                           commandId: input.commandId,
-                          ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
-                          ...(input.reuseExistingThread === undefined
-                            ? {}
-                            : { reuseExistingThread: input.reuseExistingThread }),
                           projectId: input.projectId,
-                          title: input.title,
-                          ...(input.generateTitle === undefined
-                            ? {}
-                            : { generateTitle: input.generateTitle }),
-                          modelSelection: input.modelSelection,
-                          runtimeMode: input.runtimeMode,
-                          interactionMode: input.interactionMode,
                           workspaceStrategy: input.workspaceStrategy,
-                          ...(input.initialMessage === undefined
-                            ? {}
-                            : {
-                                initialMessage: {
-                                  ...(input.initialMessage.messageId === undefined
-                                    ? {}
-                                    : { messageId: input.initialMessage.messageId }),
-                                  text: input.initialMessage.text,
-                                  attachments: input.initialMessage.attachments,
-                                  ...(input.initialMessage.context === undefined
-                                    ? {}
-                                    : { context: input.initialMessage.context }),
-                                },
-                              }),
-                          createdBy: "user",
-                          creationSource: input.creationSource ?? "web",
-                        }),
-                      ),
-                      Effect.provide(intakeContext),
+                        })
+                        .pipe(
+                          Effect.andThen(
+                            ThreadMessageIntake.launchThread({
+                              commandId: input.commandId,
+                              ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+                              ...(input.reuseExistingThread === undefined
+                                ? {}
+                                : { reuseExistingThread: input.reuseExistingThread }),
+                              projectId: input.projectId,
+                              title: input.title,
+                              ...(input.generateTitle === undefined
+                                ? {}
+                                : { generateTitle: input.generateTitle }),
+                              modelSelection: input.modelSelection,
+                              runtimeMode: input.runtimeMode,
+                              interactionMode: input.interactionMode,
+                              workspaceStrategy: input.workspaceStrategy,
+                              ...(input.initialMessage === undefined
+                                ? {}
+                                : {
+                                    initialMessage: {
+                                      ...(input.initialMessage.messageId === undefined
+                                        ? {}
+                                        : { messageId: input.initialMessage.messageId }),
+                                      text: input.initialMessage.text,
+                                      attachments: input.initialMessage.attachments,
+                                      ...(input.initialMessage.context === undefined
+                                        ? {}
+                                        : { context: input.initialMessage.context }),
+                                    },
+                                  }),
+                              createdBy: "user",
+                              creationSource: input.creationSource ?? "web",
+                            }),
+                          ),
+                          Effect.provide(intakeContext),
+                        ),
                     ),
+                  ),
                 )
                 .pipe(
                   // A resumed launch is a retry of one already counted.

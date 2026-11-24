@@ -1050,12 +1050,14 @@ export const layer = Layer.effect(
 
         // A bound thread can move to another project (No project to a project) while
         // this fires. Follow it; one move needs at most two retries. Same ids replay safely.
+        let resolvedBoundProjectId = active.projectId;
         const sendBound = (
           threadId: ThreadId,
           projectId: ProjectId,
           retries: number,
-        ): ReturnType<typeof threadManagement.sendToThread> =>
-          threadManagement
+        ): ReturnType<typeof threadManagement.sendToThread> => {
+          resolvedBoundProjectId = projectId;
+          return threadManagement
             .sendToThread({
               projectId,
               commandId,
@@ -1084,41 +1086,54 @@ export const layer = Layer.effect(
                       ),
               }),
             );
+        };
+
+        const launchForRun = (projectId: ProjectId, threadId?: ThreadId) =>
+          threadLaunch
+            .launch({
+              ...(threadId === undefined ? {} : { threadId }),
+              commandId,
+              projectId,
+              title: active.title,
+              modelSelection: active.modelSelection,
+              runtimeMode: active.runtimeMode,
+              interactionMode: active.interactionMode,
+              workspaceStrategy: active.workspaceStrategy,
+              initialMessage: {
+                messageId,
+                scheduledTaskId: active.id,
+                text: prompt,
+                attachments: [],
+              },
+              createdBy: active.createdBy,
+              creationSource: active.creationSource,
+            })
+            .pipe(Effect.map((launched) => launched.threadId));
 
         // Capture defects and interrupts too so dispatch failures still reach markCompleted.
+        const boundThreadId = active.threadId === null ? null : ThreadId.make(active.threadId);
         const result =
-          active.threadId === null
+          boundThreadId === null
             ? yield* Effect.exit(
-                threadLaunch
-                  .launch({
-                    commandId,
-                    projectId: active.projectId,
-                    title: active.title,
-                    modelSelection: active.modelSelection,
-                    runtimeMode: active.runtimeMode,
-                    interactionMode: active.interactionMode,
-                    workspaceStrategy: active.workspaceStrategy,
-                    initialMessage: {
-                      messageId,
-                      scheduledTaskId: active.id,
-                      text: prompt,
-                      attachments: [],
-                    },
-                    createdBy: active.createdBy,
-                    creationSource: active.creationSource,
-                  })
-                  .pipe(
-                    Effect.map((launched) => launched.threadId),
-                    Effect.tap((threadId) =>
-                      threadMode === "new_thread" ? Effect.void : bindThread(active, threadId),
-                    ),
+                launchForRun(active.projectId).pipe(
+                  Effect.tap((threadId) =>
+                    threadMode === "new_thread" ? Effect.void : bindThread(active, threadId),
                   ),
+                ),
               )
             : yield* Effect.exit(
-                // The stored selection only seeds fresh threads. A bound run
-                // follows the thread's current provider, so it passes none.
-                sendBound(ThreadId.make(active.threadId), active.projectId, 2).pipe(
-                  Effect.as(ThreadId.make(active.threadId)),
+                // The stored selection only seeds fresh threads; a bound run follows the thread's
+                // current provider. On crash recovery after `bindThread`, replay the accepted
+                // `thread.create` launch instead of failing on the command-type conflict.
+                sendBound(boundThreadId, active.projectId, 2).pipe(
+                  Effect.as(boundThreadId),
+                  Effect.catchIf(
+                    (error) =>
+                      error._tag === "OrchestratorCommandIdConflictError" &&
+                      error.receiptThreadId === boundThreadId &&
+                      error.receiptCommandType === "thread.create",
+                    () => launchForRun(resolvedBoundProjectId, boundThreadId),
+                  ),
                 ),
               );
 

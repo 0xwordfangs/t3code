@@ -3,6 +3,7 @@ import {
   CommandId,
   EnvironmentId,
   MessageId,
+  NodeId,
   type OrchestrationV2Command,
   type OrchestrationV2Run,
   type OrchestrationV2ProviderThread,
@@ -209,6 +210,173 @@ it.effect(
       expect(dispatched).toEqual(["message.dispatch"]);
     }).pipe(Effect.provide(layerTest));
   },
+);
+
+it.effect(
+  "getCommandReceipt returns persisted thread receipts, none for missing or project receipts, and propagates store read errors",
+  () =>
+    Effect.gen(function* () {
+      const threadCommandId = CommandId.make("command:thread-management:receipt-thread");
+      const projectCommandId = CommandId.make("command:thread-management:receipt-project");
+      const missingCommandId = CommandId.make("command:thread-management:receipt-missing");
+      const threadId = ThreadId.make("thread:thread-management:receipt-thread");
+      const projectId = ProjectId.make("project:thread-management:receipt-project");
+      const acceptedAt = DateTime.makeUnsafe("2026-11-24T00:00:00.000Z");
+
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provideMerge(layerReceiptsTest),
+      );
+
+      yield* Effect.gen(function* () {
+        const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+
+        expect(Option.isNone(yield* threads.getCommandReceipt(missingCommandId))).toBe(true);
+
+        yield* receipts.insertIfAbsent({
+          commandId: threadCommandId,
+          threadId,
+          commandType: "message.dispatch",
+          acceptedAt,
+          resultSequence: 3,
+          status: "accepted",
+          error: null,
+        });
+        yield* receipts.insertIfAbsent({
+          commandId: projectCommandId,
+          projectId,
+          commandType: "project.create",
+          acceptedAt,
+          resultSequence: 1,
+          status: "accepted",
+          error: null,
+        });
+
+        const threadReceipt = yield* threads.getCommandReceipt(threadCommandId);
+        expect(Option.isSome(threadReceipt)).toBe(true);
+        if (Option.isSome(threadReceipt)) {
+          expect(threadReceipt.value).toMatchObject({
+            commandId: threadCommandId,
+            threadId,
+            commandType: "message.dispatch",
+            resultSequence: 3,
+            status: "accepted",
+          });
+        }
+        expect(Option.isNone(yield* threads.getCommandReceipt(projectCommandId))).toBe(true);
+      }).pipe(Effect.provide(layerTest));
+
+      // Unlike hasReceipt, getCommandReceipt must propagate read failures so callers can fail closed.
+      const failingCommandId = CommandId.make("command:thread-management:receipt-read-fail");
+      const failingLayer = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(
+          Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+            getByCommandId: (commandId) =>
+              Effect.fail(
+                new CommandReceiptStore.CommandReceiptStoreReadError({
+                  commandId,
+                  cause: "SQLITE_BUSY",
+                }),
+              ),
+          }),
+        ),
+      );
+
+      const error = yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        return yield* Effect.flip(threads.getCommandReceipt(failingCommandId));
+      }).pipe(Effect.provide(failingLayer));
+
+      expect(error).toBeInstanceOf(CommandReceiptStore.CommandReceiptStoreReadError);
+      expect(error.commandId).toBe(failingCommandId);
+    }),
+);
+
+it.effect(
+  "stopDelegatedTasks treats a same-thread remote stop/complete conflict as idempotent while still failing on unrelated command conflicts",
+  () =>
+    Effect.gen(function* () {
+      const parentThreadId = ThreadId.make("thread:thread-management:remote-stop-idempotent");
+      const otherThreadId = ThreadId.make("thread:thread-management:remote-stop-other");
+      const taskId = NodeId.make("node:thread-management:remote-stop-task");
+      const stopCommandId = CommandId.make("command:thread-management:remote-stop");
+      const remoteTask = {
+        id: taskId,
+        origin: "app_owned",
+        childThreadId: null,
+        result: "Stopped with its parent.",
+        remoteChild: {
+          environmentId: "env-remote",
+          threadId: ThreadId.make("thread:remote-child"),
+          stopCount: 0,
+        },
+      };
+
+      const makeServiceLayer = () =>
+        ThreadManagementService.layer.pipe(
+          Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+          Layer.provide(
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              getThreadRecords: () => Effect.succeed({ subagents: [remoteTask] } as never),
+            }),
+          ),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(layerReceiptsTest),
+        );
+
+      const expectedCommandId = CommandId.make(`${stopCommandId}:stop:${taskId}`);
+      const remoteCompleteConflict = new Orchestrator.OrchestratorCommandIdConflictError({
+        commandId: expectedCommandId,
+        commandType: "delegated_task.remote.stop",
+        receiptCommandType: "delegated_task.remote.complete",
+        receiptThreadId: parentThreadId,
+        commandThreadId: parentThreadId,
+      });
+
+      yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        yield* threads.stopDelegatedTasks({
+          threadId: parentThreadId,
+          commandId: stopCommandId,
+          remoteDispatch: () => Effect.fail(remoteCompleteConflict),
+        });
+      }).pipe(Effect.provide(makeServiceLayer()));
+
+      for (const unrelatedConflict of [
+        new Orchestrator.OrchestratorCommandIdConflictError({
+          commandId: expectedCommandId,
+          commandType: "delegated_task.remote.stop",
+          receiptCommandType: "message.dispatch",
+          receiptThreadId: parentThreadId,
+          commandThreadId: parentThreadId,
+        }),
+        new Orchestrator.OrchestratorCommandIdConflictError({
+          commandId: expectedCommandId,
+          commandType: "delegated_task.remote.stop",
+          receiptCommandType: "delegated_task.remote.complete",
+          receiptThreadId: otherThreadId,
+          commandThreadId: parentThreadId,
+        }),
+      ]) {
+        const failure = yield* Effect.gen(function* () {
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          return yield* Effect.flip(
+            threads.stopDelegatedTasks({
+              threadId: parentThreadId,
+              commandId: stopCommandId,
+              remoteDispatch: () => Effect.fail(unrelatedConflict),
+            }),
+          );
+        }).pipe(Effect.provide(makeServiceLayer()));
+        expect(failure).toBe(unrelatedConflict);
+      }
+    }),
 );
 
 it.effect.each([

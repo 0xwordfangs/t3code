@@ -2,12 +2,14 @@ import { vi } from "vite-plus/test";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -15,6 +17,7 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
@@ -36,6 +39,7 @@ const adapter = {
 const layerDatabase = SqlitePersistence.layerMemory;
 const layerTest = Layer.mergeAll(
   layerDatabase,
+  CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase)),
   ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
   ProviderReplayHarness.layerWithRegistry(
     { name: "receipt-race" },
@@ -100,6 +104,11 @@ it.effect("a command id reused concurrently for two threads succeeds for only on
         if (error.value._tag === "OrchestratorCommandIdConflictError") {
           assert.equal(error.value.receiptThreadId, threadIds[winner]);
           assert.equal(error.value.commandThreadId, threadIds[loser]);
+          assert.equal(error.value.receiptCommandType, "thread.model-selection.set");
+          assert.equal(
+            error.value.message,
+            `Command command:shared was already handled for thread ${threadIds[winner]} and cannot be replayed for ${threadIds[loser]}.`,
+          );
         }
       }
     }
@@ -165,4 +174,164 @@ it.effect("a command id reused concurrently for two threads succeeds for only on
       );
     }
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "rejects commandId reuse across different command types on the same thread in replay and concurrent commit",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      const threadId = ThreadId.make("thread:same-thread-type-conflict");
+
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("command:type-conflict:create"),
+        threadId,
+        projectId: ProjectId.make("project:receipt-race"),
+        title: "Type conflict thread",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+
+      // 1. Sequential replayCommandReceipt rejects cross-command-type reuse on the same thread.
+      const deferCommandId = CommandId.make("command:type-conflict:defer-logout");
+      const deferDispatch = {
+        type: "message.dispatch" as const,
+        commandId: deferCommandId,
+        threadId,
+        messageId: MessageId.make("message:type-conflict:defer-logout"),
+        text: "/logout",
+        attachments: [],
+        dispatchMode: {
+          type: "defer_start" as const,
+          workspaceStrategy: { type: "root" as const },
+        },
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+      };
+      const original = yield* orchestrator.dispatch(deferDispatch);
+
+      const sequentialConflict = yield* orchestrator
+        .dispatch({
+          type: "thread.create",
+          commandId: deferCommandId,
+          threadId,
+          projectId: ProjectId.make("project:receipt-race"),
+          title: "Replay with wrong command type",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(sequentialConflict._tag, "OrchestratorCommandIdConflictError");
+      if (sequentialConflict._tag === "OrchestratorCommandIdConflictError") {
+        assert.equal(sequentialConflict.commandId, deferCommandId);
+        assert.equal(sequentialConflict.commandType, "thread.create");
+        assert.equal(sequentialConflict.receiptCommandType, "message.dispatch");
+        assert.equal(sequentialConflict.receiptThreadId, threadId);
+        assert.equal(sequentialConflict.commandThreadId, threadId);
+        assert.equal(
+          sequentialConflict.message,
+          `Command ${deferCommandId} was already handled as message.dispatch on thread ${threadId} and cannot be replayed as thread.create.`,
+        );
+      }
+
+      // Same commandId with the matching commandType still replays cleanly.
+      const matchingReplay = yield* orchestrator.dispatch(deferDispatch);
+      assert.equal(matchingReplay.sequence, original.sequence);
+      assert.isTrue(matchingReplay.replayed);
+
+      // 2. Concurrent commit race in dispatchWithReceiptEffect rejects cross-command-type conflict on the same thread.
+      const raceCommandId = CommandId.make("command:type-conflict:concurrent-commit");
+      capabilityGate = Effect.gen(function* () {
+        yield* receipts
+          .insertIfAbsent({
+            commandId: raceCommandId,
+            threadId,
+            commandType: "message.dispatch",
+            acceptedAt: yield* DateTime.now,
+            resultSequence: original.sequence,
+            status: "accepted",
+            error: null,
+          })
+          .pipe(Effect.orDie);
+      });
+      const concurrentConflict = yield* orchestrator
+        .dispatch({
+          type: "thread.model-selection.set",
+          commandId: raceCommandId,
+          threadId,
+          modelSelection: { ...modelSelection, model: "gpt-6" },
+        })
+        .pipe(Effect.ensuring(Effect.sync(() => (capabilityGate = undefined))), Effect.flip);
+
+      assert.equal(concurrentConflict._tag, "OrchestratorCommandIdConflictError");
+      if (concurrentConflict._tag === "OrchestratorCommandIdConflictError") {
+        assert.equal(concurrentConflict.commandId, raceCommandId);
+        assert.equal(concurrentConflict.commandType, "thread.model-selection.set");
+        assert.equal(concurrentConflict.receiptCommandType, "message.dispatch");
+        assert.equal(concurrentConflict.receiptThreadId, threadId);
+        assert.equal(concurrentConflict.commandThreadId, threadId);
+        assert.equal(
+          concurrentConflict.message,
+          `Command ${raceCommandId} was already handled as message.dispatch on thread ${threadId} and cannot be replayed as thread.model-selection.set.`,
+        );
+      }
+
+      // The conflicting concurrent command must not have mutated thread state.
+      const shell = yield* projections.getThreadShell(threadId);
+      assert.equal(shell?.modelSelection.model, "gpt-5.1-codex");
+
+      // 3. Zero-event no-op concurrent race also rejects cross-command-type conflict via replayCommandReceipt.
+      const noOpRaceCommandId = CommandId.make("command:type-conflict:concurrent-noop");
+      const getThreadRecords = projections.getThreadRecords;
+      let injectedNoOpReceipt = false;
+      using _records = vi.spyOn(projections, "getThreadRecords").mockImplementation((...args) =>
+        Effect.gen(function* () {
+          if (!injectedNoOpReceipt) {
+            injectedNoOpReceipt = true;
+            yield* receipts
+              .insertIfAbsent({
+                commandId: noOpRaceCommandId,
+                threadId,
+                commandType: "message.dispatch",
+                acceptedAt: yield* DateTime.now,
+                resultSequence: original.sequence,
+                status: "accepted",
+                error: null,
+              })
+              .pipe(Effect.orDie);
+          }
+          return yield* getThreadRecords(...args);
+        }),
+      );
+      const noOpConflict = yield* orchestrator
+        .dispatch({
+          type: "thread.guest-share.close",
+          commandId: noOpRaceCommandId,
+          threadId,
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(noOpConflict._tag, "OrchestratorCommandIdConflictError");
+      if (noOpConflict._tag === "OrchestratorCommandIdConflictError") {
+        assert.equal(noOpConflict.commandId, noOpRaceCommandId);
+        assert.equal(noOpConflict.commandType, "thread.guest-share.close");
+        assert.equal(noOpConflict.receiptCommandType, "message.dispatch");
+        assert.equal(noOpConflict.receiptThreadId, threadId);
+        assert.equal(noOpConflict.commandThreadId, threadId);
+      }
+    }).pipe(Effect.provide(layerTest)),
 );

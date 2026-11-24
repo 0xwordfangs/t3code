@@ -364,11 +364,19 @@ export class OrchestratorCommandIdConflictError extends Schema.TaggedError<Orche
   {
     commandId: CommandId,
     commandType: Schema.String,
+    receiptCommandType: Schema.optional(Schema.String),
     receiptThreadId: ThreadId,
     commandThreadId: ThreadId,
   },
 ) {
   override get message(): string {
+    if (
+      this.receiptThreadId === this.commandThreadId &&
+      this.receiptCommandType !== undefined &&
+      this.receiptCommandType !== this.commandType
+    ) {
+      return `Command ${this.commandId} was already handled as ${this.receiptCommandType} on thread ${this.receiptThreadId} and cannot be replayed as ${this.commandType}.`;
+    }
     return `Command ${this.commandId} was already handled for thread ${this.receiptThreadId} and cannot be replayed for ${this.commandThreadId}.`;
   }
 }
@@ -16135,11 +16143,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     const dispatchThreadId = commandThreadId(command);
-    // Receipts only prove execution for the thread they were recorded against.
-    if (receipt.threadId !== dispatchThreadId) {
+    // Receipts only prove execution for the thread and command type they were recorded against.
+    if (receipt.threadId !== dispatchThreadId || receipt.commandType !== command.type) {
       return yield* new OrchestratorCommandIdConflictError({
         commandId: command.commandId,
         commandType: command.type,
+        receiptCommandType: receipt.commandType,
         receiptThreadId: receipt.threadId,
         commandThreadId: dispatchThreadId,
       });
@@ -16393,12 +16402,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         detail: committed.receipt.error ?? "Previously rejected.",
       });
     }
-    // A concurrent command with this id for another thread can commit first,
-    // under that thread's lock; its receipt is not this command's result.
-    if (committed.receipt.threadId !== commandThreadId(command)) {
+    // A concurrent command with this id for another thread or command type can commit first;
+    // its receipt is not this command's result.
+    if (
+      committed.receipt.threadId !== commandThreadId(command) ||
+      committed.receipt.commandType !== command.type
+    ) {
       return yield* new OrchestratorCommandIdConflictError({
         commandId: command.commandId,
         commandType: command.type,
+        receiptCommandType: committed.receipt.commandType,
         receiptThreadId: committed.receipt.threadId,
         commandThreadId: commandThreadId(command),
       });

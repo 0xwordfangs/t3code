@@ -63,6 +63,7 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -3511,3 +3512,99 @@ it.effect("replays an accepted send after the project disables the instance", ()
     }
   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
 });
+
+it.effect(
+  "refuses launchThread cross-command-type replay of a persisted message.dispatch(defer_start) receipt without releasing its preparing run",
+  () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+
+      const created = yield* launches.launch(
+        launchInput({
+          command: "launch:cross-type:create",
+          thread: "thread:cross-type:defer-logout",
+        }),
+      );
+
+      const deferCommandId = CommandId.make("command:cross-type:defer-logout");
+      yield* threads.dispatch({
+        type: "message.dispatch",
+        commandId: deferCommandId,
+        threadId: created.threadId,
+        messageId: MessageId.make("message:cross-type:defer-logout"),
+        text: "/logout",
+        attachments: [],
+        dispatchMode: {
+          type: "defer_start",
+          workspaceStrategy: { type: "root" },
+        },
+        createdBy: "user",
+        creationSource: "web",
+      });
+
+      const beforeProjection = yield* threads.getThreadProjection(created.threadId);
+      assert.equal(beforeProjection.runs.length, 1);
+      assert.equal(beforeProjection.runs[0]?.status, "preparing");
+
+      // Replaying the message.dispatch commandId via thread.create (reuseExistingThread omitted/false) must fail.
+      const createReplayError = yield* launches
+        .launch(
+          launchInput({
+            command: deferCommandId,
+            thread: created.threadId,
+            message: "hello benign",
+          }),
+        )
+        .pipe(Effect.flip);
+
+      const isCommandIdConflictError = Schema.is(Orchestrator.OrchestratorCommandIdConflictError);
+
+      assert.equal(createReplayError._tag, "ThreadLaunchError");
+      if (createReplayError._tag === "ThreadLaunchError") {
+        assert.equal(createReplayError.operation, "create-thread");
+        assert.isTrue(isCommandIdConflictError(createReplayError.cause));
+        if (isCommandIdConflictError(createReplayError.cause)) {
+          assert.equal(createReplayError.cause.commandId, deferCommandId);
+          assert.equal(createReplayError.cause.commandType, "thread.create");
+          assert.equal(createReplayError.cause.receiptCommandType, "message.dispatch");
+          assert.equal(createReplayError.cause.receiptThreadId, created.threadId);
+          assert.equal(createReplayError.cause.commandThreadId, created.threadId);
+        }
+      }
+
+      // Replaying the same message.dispatch commandId with reuseExistingThread: true (thread.metadata.update) must also fail.
+      const reuseReplayError = yield* launches
+        .launch({
+          ...launchInput({
+            command: deferCommandId,
+            thread: created.threadId,
+            message: "hello benign",
+          }),
+          reuseExistingThread: true,
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(reuseReplayError._tag, "ThreadLaunchError");
+      if (reuseReplayError._tag === "ThreadLaunchError") {
+        assert.equal(reuseReplayError.operation, "update-thread");
+        assert.isTrue(isCommandIdConflictError(reuseReplayError.cause));
+        if (isCommandIdConflictError(reuseReplayError.cause)) {
+          assert.equal(reuseReplayError.cause.commandId, deferCommandId);
+          assert.equal(reuseReplayError.cause.commandType, "thread.metadata.update");
+          assert.equal(reuseReplayError.cause.receiptCommandType, "message.dispatch");
+          assert.equal(reuseReplayError.cause.receiptThreadId, created.threadId);
+          assert.equal(reuseReplayError.cause.commandThreadId, created.threadId);
+        }
+      }
+
+      // The preparing /logout run must remain unreleased with no release effect enqueued.
+      assert.isEmpty(yield* outbox.listByCommandId(CommandId.make(`${deferCommandId}:release`)));
+      const afterProjection = yield* threads.getThreadProjection(created.threadId);
+      assert.equal(afterProjection.runs.length, 1);
+      assert.equal(afterProjection.runs[0]?.status, "preparing");
+    }).pipe(Effect.provide(harness.layer));
+  },
+);

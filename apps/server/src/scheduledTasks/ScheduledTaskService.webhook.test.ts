@@ -8,6 +8,7 @@ import {
   ScheduledTaskUpsertInput,
   ScheduledTaskWebhookDeliveryId,
   SecretRequestError,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -23,6 +24,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -176,6 +178,7 @@ const withService = <A, E>(
     readonly sql?: SqlClient.SqlClient;
     readonly workers?: Map<string, Effect.Effect<void>>;
     readonly policy?: ManagedPolicyDocument;
+    readonly sendToThread?: ThreadManagementService.ThreadManagementService["Service"]["sendToThread"];
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -240,7 +243,9 @@ const withService = <A, E>(
         namedProjectsRoot: "/projects",
         isScratchProject: () => Effect.succeed(false),
       }),
-      Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+      Layer.mock(ThreadManagementService.ThreadManagementService)(
+        options.sendToThread === undefined ? {} : { sendToThread: options.sendToThread },
+      ),
       Layer.mock(SecretRequests.SecretRequests)({
         consume: ({ ref }) => {
           const value = secretsByRef.get(ref);
@@ -2198,3 +2203,137 @@ it.effect("filters run before replay and coalescing without claiming ignored del
     { workers },
   );
 });
+
+it.effect(
+  "replays threadLaunch instead of failing when single-thread webhook crash recovery hits a thread.create commandId conflict",
+  () => {
+    const workers = new Map<string, Effect.Effect<void>>();
+    const completedLaunches = new Set<string>();
+    let sendConflictCount = 0;
+    const sendConflictMode: { current: "thread.create" | "message.dispatch" } = {
+      current: "thread.create",
+    };
+    return withService(
+      ({ service, sql, launches }) =>
+        Effect.gen(function* () {
+          const { task } = yield* service.upsert(
+            yield* webhookTaskInput({
+              threadMode: "fresh_session",
+              prompt: "{{body.value}}",
+              schedule: {
+                type: "webhook",
+                dedupe: {
+                  replayKey: "{{headers.delivery-id}}",
+                  coalesceKey: "{{headers.group}}",
+                  coalesceWindowSeconds: 10,
+                },
+              },
+            }),
+          );
+          const firstDelivery = yield* service.triggerWebhook(
+            requestFor(task, {
+              headers: { "delivery-id": "replay-single-thread-1", group: "G1" },
+              bodyText: '{"value":"hello"}',
+            }),
+          );
+          assert.equal(firstDelivery._tag, "accepted");
+
+          // Fail the completion bookkeeping UPDATE after threadLaunch.launch + bindThread succeed.
+          yield* sql`CREATE TRIGGER fail_single_thread_completion BEFORE UPDATE ON scheduled_tasks
+            WHEN NEW.last_run_status = 'succeeded' BEGIN SELECT RAISE(FAIL, 'bookkeeping crash'); END`;
+          yield* TestClock.adjust("10 seconds");
+          yield* drainPendingDispatch(workers);
+          const initialLaunch = yield* Queue.take(launches);
+          yield* sql`DROP TRIGGER fail_single_thread_completion`;
+
+          // Attempt 1 bound the single-thread task to "thread-1", while the pending row stayed running.
+          const [afterCrash] = yield* sql<{ readonly thread_id: string | null }>`
+            SELECT thread_id FROM scheduled_tasks WHERE task_id = ${task.id}
+          `;
+          assert.equal(afterCrash?.thread_id, "thread-1");
+          assert.equal(
+            (yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE state = 'running'`)
+              .length,
+            1,
+          );
+
+          // Recovery attempt sees active.threadId === "thread-1", calls sendToThread with the
+          // same commandId, receives OrchestratorCommandIdConflictError(thread.create), and
+          // replays threadLaunch.launch cleanly without releasing webhook replay dedupe.
+          const recoveredWorkers = new Map<string, Effect.Effect<void>>();
+          yield* withService(
+            ({ service: recovered, launches: recoveredLaunches }) =>
+              Effect.gen(function* () {
+                yield* drainPendingDispatch(recoveredWorkers);
+                assert.equal(sendConflictCount, 1);
+                assert.equal(yield* Queue.size(recoveredLaunches), 0);
+                assert.equal((yield* recovered.list()).tasks[0]!.runCount, 1);
+                assert.equal((yield* recovered.list()).tasks[0]!.lastRunStatus, "succeeded");
+                assert.equal((yield* sql`SELECT 1 FROM scheduled_task_webhook_pending`).length, 0);
+                // Replay key must still be retained after recovery succeeds.
+                const duplicate = yield* recovered.triggerWebhook(
+                  requestFor(task, {
+                    headers: { "delivery-id": "replay-single-thread-1", group: "G1" },
+                    bodyText: '{"value":"hello"}',
+                  }),
+                );
+                assert.deepInclude(duplicate, { _tag: "accepted", outcome: "duplicate" });
+              }),
+            {
+              sql,
+              workers: recoveredWorkers,
+              completedLaunches,
+              sendToThread: (input) => {
+                assert.equal(input.commandId, initialLaunch.commandId);
+                assert.equal(input.threadId, ThreadId.make("thread-1"));
+                sendConflictCount += 1;
+                return Effect.fail(
+                  new Orchestrator.OrchestratorCommandIdConflictError({
+                    commandId: input.commandId,
+                    commandType: "message.dispatch",
+                    receiptCommandType: sendConflictMode.current,
+                    receiptThreadId: input.threadId,
+                    commandThreadId: input.threadId,
+                  }),
+                );
+              },
+            },
+          );
+
+          // Negative control: an unrelated commandType conflict (not thread.create) must still fail.
+          sendConflictMode.current = "message.dispatch";
+          const failedWorkers = new Map<string, Effect.Effect<void>>();
+          yield* withService(
+            ({ service: failing }) =>
+              Effect.gen(function* () {
+                yield* failing.triggerWebhook(
+                  requestFor(task, {
+                    headers: { "delivery-id": "replay-single-thread-2", group: "G2" },
+                    bodyText: '{"value":"second"}',
+                  }),
+                );
+                yield* TestClock.adjust("10 seconds");
+                yield* drainPendingDispatch(failedWorkers);
+                assert.equal((yield* failing.list()).tasks[0]!.lastRunStatus, "failed");
+              }),
+            {
+              sql,
+              workers: failedWorkers,
+              completedLaunches,
+              sendToThread: (input) =>
+                Effect.fail(
+                  new Orchestrator.OrchestratorCommandIdConflictError({
+                    commandId: input.commandId,
+                    commandType: "message.dispatch",
+                    receiptCommandType: "message.dispatch",
+                    receiptThreadId: input.threadId,
+                    commandThreadId: input.threadId,
+                  }),
+                ),
+            },
+          );
+        }),
+      { workers, completedLaunches },
+    );
+  },
+);

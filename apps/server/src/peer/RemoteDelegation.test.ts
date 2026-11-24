@@ -2424,12 +2424,22 @@ it.effect("a parent stopped while the box is unreachable still stops its task th
       );
       const delegated = yield* delegateToBox(a);
       yield* Queue.take(retries.failed);
-      // The parent is stopped meanwhile.
+      // The parent is stopped meanwhile (including an idempotent retry with the same commandId
+      // after the first stop filled task.result via delegated_task.remote.complete).
+      const offlineStopCommandId = CommandId.make("command:stop:laptop-parent-offline");
       yield* a.threads.stopDelegatedTasks({
         threadId: parentThreadId,
-        commandId: CommandId.make("command:stop:laptop-parent-offline"),
+        commandId: offlineStopCommandId,
+      });
+      yield* a.threads.stopDelegatedTasks({
+        threadId: parentThreadId,
+        commandId: offlineStopCommandId,
       });
       expect(yield* taskResult(a, delegated.taskId)).toMatchObject({ status: "interrupted" });
+      const taskAfterRetry = (yield* a.orchestrator.getThreadRecords(parentThreadId, [
+        "subagents",
+      ])).subagents.find((entry) => entry.id === delegated.taskId);
+      expect(taskAfterRetry?.remoteChild?.stopCount ?? 0).toBe(0);
 
       // Once the box is back, the follower's next attempt stops the task there.
       yield* Ref.set(b.descriptor, box);
