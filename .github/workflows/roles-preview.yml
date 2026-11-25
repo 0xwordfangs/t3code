@@ -25,7 +25,7 @@ concurrency:
 jobs:
   check:
     name: Check
-    if: github.repository == '0xBreadguy/t3code'
+    if: github.repository == '0xwordfangs/t3code'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -72,7 +72,7 @@ jobs:
 
   test:
     name: Test
-    if: github.repository == '0xBreadguy/t3code'
+    if: github.repository == '0xwordfangs/t3code'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -139,7 +139,7 @@ jobs:
 
   test_web:
     name: Test Web ${{ matrix.shard }}
-    if: github.repository == '0xBreadguy/t3code'
+    if: github.repository == '0xwordfangs/t3code'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -189,7 +189,7 @@ jobs:
 
   test_server:
     name: Test Server ${{ matrix.shard }}
-    if: github.repository == '0xBreadguy/t3code'
+    if: github.repository == '0xwordfangs/t3code'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -248,7 +248,7 @@ jobs:
 
   version:
     name: Resolve version
-    if: github.repository == '0xBreadguy/t3code'
+    if: github.repository == '0xwordfangs/t3code'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -280,7 +280,7 @@ jobs:
 
   build:
     name: Build Linux x64
-    if: github.repository == '0xBreadguy/t3code'
+    if: github.repository == '0xwordfangs/t3code'
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -399,7 +399,7 @@ jobs:
 
   build_mac:
     name: Build macOS arm64
-    if: github.repository == '0xBreadguy/t3code'
+    if: github.repository == '0xwordfangs/t3code'
     needs: version
     runs-on: macos-26
     timeout-minutes: 60
